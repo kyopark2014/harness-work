@@ -1,0 +1,17 @@
+# AgentCore Harness: deployment scripts + React/FastAPI application
+# Install: pip install -r requirement.txt
+#
+# bedrock-agentcore-control APIs (e.g. ListHarnesses) need a recent botocore.
+# If calls fail: pip install -U boto3 (pulls a compatible botocore).
+
+boto3>=1.35.0
+bedrock-agentcore>=1.4.0
+
+# application/server.py (FastAPI + React SPA)
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic>=2.0
+requests>=2.31.0
+langchain-aws>=0.2.0
+pyyaml

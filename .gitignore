@@ -1,0 +1,16 @@
+.DS_Store
+**/.DS_Store
+**/__pycache__/
+*.pyc
+*.pyo
+.Python
+.venv/
+venv/
+.env
+.env.*
+application/web/node_modules/
+application/web/dist/
+application/web/tsconfig.tsbuildinfo
+application/.session_storage/
+application/data/
+application/config.json

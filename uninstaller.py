@@ -1,0 +1,927 @@
+#!/usr/bin/env python3
+"""
+AWS Infrastructure Uninstaller for harness-work.
+
+Deletes resources created by installer.py:
+  ECS Web UI, ALB, UI CloudFront, Harness, Memory, S3 Files, VPC/NAT,
+  project S3 / S3 CloudFront, IAM roles.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+import uuid
+from typing import Dict, List, Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
+from ecs_web import (
+    delete_alb_origin_header_secret,
+    delete_alb_resources,
+    delete_disabled_ui_cloudfront,
+    delete_ecs_iam_roles,
+    delete_ecs_resources,
+    delete_ui_cloudfront,
+)
+# Configuration (must match installer.py / s3_files_vpc.py)
+project_name = "harness-work"
+region = "us-west-2"
+
+WORKING_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(WORKING_DIR, "application", "config.json")
+
+DELETE_WAIT_TIMEOUT_SEC = int(os.environ.get("AGENTCORE_DELETE_WAIT_TIMEOUT_SEC", "600"))
+DELETE_POLL_INTERVAL_SEC = float(os.environ.get("AGENTCORE_DELETE_POLL_INTERVAL_SEC", "5"))
+
+sts_client = boto3.client("sts", region_name=region)
+account_id = str(sts_client.get_caller_identity()["Account"])
+
+s3_client = boto3.client("s3", region_name=region)
+iam_client = boto3.client("iam", region_name=region)
+ec2_client = boto3.client("ec2", region_name=region)
+s3files_client = boto3.client("s3files", region_name=region)
+cloudfront_client = boto3.client("cloudfront", region_name=region)
+agentcore_control_client = boto3.client(
+    "bedrock-agentcore-control",
+    region_name=region,
+)
+
+
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    return logging.getLogger(__name__)
+
+
+logger = setup_logging()
+
+
+def _bucket_name() -> str:
+    return f"storage-for-{project_name}-{account_id}-{region}"
+
+
+def _cloudfront_comment() -> str:
+    # S3 sharing CF (installer); UI CF is CloudFront-for-{project} in ecs_web.
+    return f"CloudFront-S3-for-{project_name}"
+
+
+def _oai_comment() -> str:
+    return f"OAI for {project_name}"
+
+
+def _vpc_name() -> str:
+    return f"vpc-for-{project_name}"
+
+
+def load_config() -> Dict:
+    global project_name, region, account_id
+    global s3_client, iam_client, ec2_client, s3files_client
+    global cloudfront_client, agentcore_control_client
+
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception as e:
+        logger.warning(f"Could not load {CONFIG_PATH}: {e}")
+        cfg = {}
+
+    # Script constant is authoritative — do not let a copied config.json rename the project.
+    region = cfg.get("region") or region
+    raw = cfg.get("accountId")
+    if raw is not None and str(raw).strip():
+        account_id = str(raw).strip()
+    else:
+        account_id = str(sts_client.get_caller_identity()["Account"])
+    cfg["projectName"] = project_name
+
+    s3_client = boto3.client("s3", region_name=region)
+    iam_client = boto3.client("iam", region_name=region)
+    ec2_client = boto3.client("ec2", region_name=region)
+    s3files_client = boto3.client("s3files", region_name=region)
+    cloudfront_client = boto3.client("cloudfront", region_name=region)
+    agentcore_control_client = boto3.client(
+        "bedrock-agentcore-control",
+        region_name=region,
+    )
+    return cfg
+
+
+def prompt_yes_no(question: str, default: bool = False) -> bool:
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    try:
+        answer = input(question + suffix).strip().lower()
+    except EOFError:
+        return default
+    if not answer:
+        return default
+    return answer in {"y", "yes"}
+
+
+# --- CloudFront --------------------------------------------------------------
+
+def _matches_cloudfront(dist: dict) -> bool:
+    return _cloudfront_comment() in dist.get("Comment", "")
+
+
+def disable_cloudfront_distributions():
+    logger.info("[1/8] Disabling CloudFront distributions")
+    try:
+        distributions = cloudfront_client.list_distributions()
+        for dist in distributions.get("DistributionList", {}).get("Items", []):
+            if not _matches_cloudfront(dist):
+                continue
+            if not dist.get("Enabled", True):
+                logger.info(f"  Already disabled: {dist['Id']}")
+                continue
+            dist_id = dist["Id"]
+            logger.info(f"  Disabling: {dist_id}")
+            cfg_resp = cloudfront_client.get_distribution_config(Id=dist_id)
+            cfg = cfg_resp["DistributionConfig"]
+            cfg["Enabled"] = False
+            cloudfront_client.update_distribution(
+                Id=dist_id,
+                DistributionConfig=cfg,
+                IfMatch=cfg_resp["ETag"],
+            )
+        logger.info("✓ CloudFront disable requested")
+    except Exception as e:
+        logger.error(f"Error disabling CloudFront: {e}")
+
+
+def wait_for_cloudfront_disabled(max_wait: int = 900, poll_interval: int = 30) -> bool:
+    logger.info("  Waiting for CloudFront to become disabled...")
+    waited = 0
+    while waited < max_wait:
+        still = []
+        distributions = cloudfront_client.list_distributions()
+        for dist in distributions.get("DistributionList", {}).get("Items", []):
+            if _matches_cloudfront(dist) and dist.get("Enabled", True):
+                still.append(dist["Id"])
+        if not still:
+            logger.info("  ✓ Matching CloudFront distributions disabled")
+            return True
+        logger.info(f"  Still enabled: {still} ({waited}s/{max_wait}s)")
+        time.sleep(poll_interval)
+        waited += poll_interval
+    logger.warning("  Timed out waiting for CloudFront disable")
+    return False
+
+
+def delete_cloudfront_distributions():
+    logger.info("[7/8] Deleting CloudFront distributions")
+    try:
+        distributions = cloudfront_client.list_distributions()
+        for dist in distributions.get("DistributionList", {}).get("Items", []):
+            if not _matches_cloudfront(dist):
+                continue
+            if dist.get("Enabled", True):
+                logger.info(f"  Skipping enabled distribution: {dist['Id']}")
+                continue
+            dist_id = dist["Id"]
+            try:
+                cfg_resp = cloudfront_client.get_distribution_config(Id=dist_id)
+                cloudfront_client.delete_distribution(
+                    Id=dist_id, IfMatch=cfg_resp["ETag"]
+                )
+                logger.info(f"  ✓ Deleted distribution: {dist_id}")
+            except ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code in {"DistributionNotDisabled", "NoSuchDistribution"}:
+                    logger.info(f"  Skip {dist_id}: {code}")
+                else:
+                    logger.warning(f"  Could not delete {dist_id}: {e}")
+        logger.info("✓ CloudFront distributions processed")
+    except Exception as e:
+        logger.error(f"Error deleting CloudFront: {e}")
+
+
+def delete_cloudfront_oai():
+    logger.info("  Deleting CloudFront Origin Access Identities")
+    try:
+        oai_list = cloudfront_client.list_cloud_front_origin_access_identities()
+        for oai in oai_list.get("CloudFrontOriginAccessIdentityList", {}).get(
+            "Items", []
+        ):
+            if _oai_comment() not in oai.get("Comment", ""):
+                continue
+            oai_id = oai["Id"]
+            try:
+                cfg = cloudfront_client.get_cloud_front_origin_access_identity_config(
+                    Id=oai_id
+                )
+                cloudfront_client.delete_cloud_front_origin_access_identity(
+                    Id=oai_id, IfMatch=cfg["ETag"]
+                )
+                logger.info(f"  ✓ Deleted OAI: {oai_id}")
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "NoSuchCloudFrontOriginAccessIdentity":
+                    logger.warning(f"  Could not delete OAI {oai_id}: {e}")
+    except Exception as e:
+        logger.warning(f"  Error deleting OAI: {e}")
+
+
+# --- Harness / Memory --------------------------------------------------------
+
+def _paginate_list_harnesses() -> list:
+    items = []
+    token = None
+    while True:
+        kw = {"maxResults": 50}
+        if token:
+            kw["nextToken"] = token
+        resp = agentcore_control_client.list_harnesses(**kw)
+        items.extend(resp.get("harnesses") or [])
+        token = resp.get("nextToken")
+        if not token:
+            break
+    return items
+
+
+def harness_name_for_api(name: str) -> str:
+    """Same as installer: projectName → harnessName ('-' → '_')."""
+    return (name or "").replace("-", "_")
+
+
+def resolve_harness_id(cfg: dict) -> Optional[str]:
+    if cfg.get("harnessId"):
+        return cfg["harnessId"]
+    arn = cfg.get("HARNESS_ARN") or ""
+    if "harness/" in arn:
+        return arn.split("harness/", 1)[-1].strip()
+
+    # Fallback: match CreateHarness harnessName (installer harness_name_for_api)
+    api_name = harness_name_for_api(cfg.get("projectName") or project_name)
+    for h in _paginate_list_harnesses():
+        if h.get("harnessName") == api_name:
+            return h.get("harnessId")
+    return None
+
+
+def resolve_memory_id(cfg: dict) -> Optional[str]:
+    if cfg.get("memory_id"):
+        return cfg["memory_id"]
+    if cfg.get("memoryId"):
+        return cfg["memoryId"]
+    arn = cfg.get("agent_memory_arn") or ""
+    for marker in ("memory/", ":memory/", "/memory/"):
+        if marker in arn:
+            return arn.split(marker, 1)[-1].strip()
+    return None
+
+
+def delete_harness(harness_id: str) -> bool:
+    logger.info(f"[2/8] Deleting Harness: {harness_id}")
+    try:
+        agentcore_control_client.delete_harness(
+            harnessId=harness_id,
+            clientToken=str(uuid.uuid4()),
+        )
+        logger.info(f"  DeleteHarness accepted: {harness_id}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            logger.info(f"  Harness already gone: {harness_id}")
+            return True
+        logger.error(f"  DeleteHarness failed: {e}")
+        return False
+
+    deadline = time.monotonic() + DELETE_WAIT_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        try:
+            h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
+            status = h.get("status")
+            if status == "DELETE_FAILED":
+                logger.error(
+                    f"  Harness DELETE_FAILED: {h.get('failureReason')!r}"
+                )
+                return False
+            logger.info(f"  Waiting… status={status!r}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                logger.info(f"✓ Harness deleted: {harness_id}")
+                return True
+            raise
+        time.sleep(DELETE_POLL_INTERVAL_SEC)
+    logger.error("  Timed out waiting for harness deletion")
+    return False
+
+
+def delete_memory(memory_id: str) -> bool:
+    logger.info(f"[5/8] Deleting AgentCore Memory: {memory_id}")
+    try:
+        agentcore_control_client.delete_memory(
+            memoryId=memory_id,
+            clientToken=str(uuid.uuid4()),
+        )
+        logger.info(f"  DeleteMemory accepted: {memory_id}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            logger.info(f"  Memory already gone: {memory_id}")
+            return True
+        logger.error(f"  DeleteMemory failed: {e}")
+        return False
+
+    deadline = time.monotonic() + DELETE_WAIT_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        try:
+            m = agentcore_control_client.get_memory(memoryId=memory_id)["memory"]
+            status = m.get("status")
+            if status == "DELETE_FAILED":
+                logger.error(
+                    f"  Memory DELETE_FAILED: {m.get('failureReason')!r}"
+                )
+                return False
+            logger.info(f"  Waiting… status={status!r}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                logger.info(f"✓ Memory deleted: {memory_id}")
+                return True
+            raise
+        time.sleep(DELETE_POLL_INTERVAL_SEC)
+    logger.error("  Timed out waiting for memory deletion")
+    return False
+
+
+# --- S3 Files ----------------------------------------------------------------
+
+def _is_s3files_not_found(error: ClientError) -> bool:
+    code = error.response["Error"]["Code"]
+    return code in {
+        "ResourceNotFoundException",
+        "FileSystemNotFound",
+        "AccessPointNotFound",
+        "MountTargetNotFound",
+        "NotFound",
+        "404",
+    }
+
+
+def _wait_s3files_gone(describe_fn, id_key: str, resource_id: str, timeout: int = 600):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            resp = describe_fn(**{id_key: resource_id})
+            status = (resp.get("status") or "").lower()
+            if status in {"deleted", "deleting"}:
+                time.sleep(5)
+                continue
+            time.sleep(8)
+        except ClientError as e:
+            if _is_s3files_not_found(e):
+                return
+            raise
+    raise TimeoutError(f"Timed out waiting for S3 Files {resource_id} deletion")
+
+
+def _find_s3files_fs_id(cfg: dict) -> str:
+    if cfg.get("s3_files_file_system_id"):
+        return cfg["s3_files_file_system_id"]
+    bucket_arn = f"arn:aws:s3:::{_bucket_name()}"
+    try:
+        paginator = s3files_client.get_paginator("list_file_systems")
+        for page in paginator.paginate():
+            for item in page.get("fileSystems", []):
+                if item.get("bucket") == bucket_arn:
+                    return item.get("fileSystemId") or ""
+    except ClientError as e:
+        logger.warning(f"  Could not list S3 Files file systems: {e}")
+    return ""
+
+
+def delete_s3files_sync_role():
+    role_name = f"role-s3files-sync-for-{project_name}"
+    if len(role_name) > 64:
+        role_name = role_name[:64]
+    try:
+        for pname in iam_client.list_role_policies(RoleName=role_name).get(
+            "PolicyNames", []
+        ):
+            iam_client.delete_role_policy(RoleName=role_name, PolicyName=pname)
+        iam_client.delete_role(RoleName=role_name)
+        logger.info(f"  ✓ Deleted S3 Files sync role: {role_name}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "NoSuchEntity":
+            logger.warning(f"  Could not delete sync role {role_name}: {e}")
+
+
+def delete_s3_files_session_storage(cfg: dict):
+    logger.info("[3/8] Deleting S3 Files session storage")
+    fs_id = _find_s3files_fs_id(cfg)
+    if not fs_id:
+        logger.info("  No S3 Files file system found")
+        delete_s3files_sync_role()
+        return
+
+    logger.info(f"  File system: {fs_id}")
+
+    try:
+        s3files_client.delete_file_system_policy(fileSystemId=fs_id)
+        logger.info("  ✓ Deleted file system policy")
+    except ClientError as e:
+        if not _is_s3files_not_found(e):
+            logger.warning(f"  Could not delete FS policy: {e}")
+
+    access_point_ids: List[str] = []
+    try:
+        paginator = s3files_client.get_paginator("list_access_points")
+        for page in paginator.paginate(fileSystemId=fs_id):
+            for item in page.get("accessPoints", []):
+                if item.get("accessPointId"):
+                    access_point_ids.append(item["accessPointId"])
+    except ClientError as e:
+        logger.warning(f"  Could not list access points: {e}")
+
+    for ap_id in access_point_ids:
+        try:
+            s3files_client.delete_access_point(accessPointId=ap_id)
+            _wait_s3files_gone(s3files_client.get_access_point, "accessPointId", ap_id)
+            logger.info(f"  ✓ Deleted access point: {ap_id}")
+        except ClientError as e:
+            if not _is_s3files_not_found(e):
+                logger.warning(f"  Could not delete access point {ap_id}: {e}")
+
+    mount_ids: List[str] = []
+    try:
+        paginator = s3files_client.get_paginator("list_mount_targets")
+        for page in paginator.paginate(fileSystemId=fs_id):
+            for item in page.get("mountTargets", []):
+                if item.get("mountTargetId"):
+                    mount_ids.append(item["mountTargetId"])
+    except ClientError as e:
+        logger.warning(f"  Could not list mount targets: {e}")
+
+    for mt_id in mount_ids:
+        try:
+            s3files_client.delete_mount_target(mountTargetId=mt_id)
+            _wait_s3files_gone(s3files_client.get_mount_target, "mountTargetId", mt_id)
+            logger.info(f"  ✓ Deleted mount target: {mt_id}")
+        except ClientError as e:
+            if not _is_s3files_not_found(e):
+                logger.warning(f"  Could not delete mount target {mt_id}: {e}")
+
+    try:
+        s3files_client.delete_file_system(fileSystemId=fs_id, forceDelete=True)
+        _wait_s3files_gone(s3files_client.get_file_system, "fileSystemId", fs_id)
+        logger.info(f"  ✓ Deleted file system: {fs_id}")
+    except ClientError as e:
+        if not _is_s3files_not_found(e):
+            logger.warning(f"  Could not delete file system {fs_id}: {e}")
+
+    delete_s3files_sync_role()
+    logger.info("✓ S3 Files session storage deleted")
+
+
+# --- VPC ---------------------------------------------------------------------
+
+def _resolve_vpc_id(cfg: dict) -> Optional[str]:
+    if cfg.get("vpc_id"):
+        return cfg["vpc_id"]
+    resp = ec2_client.describe_vpcs(
+        Filters=[{"Name": "tag:Name", "Values": [_vpc_name()]}]
+    )
+    vpcs = resp.get("Vpcs") or []
+    return vpcs[0]["VpcId"] if vpcs else None
+
+
+def delete_vpc(cfg: dict):
+    logger.info("[4/8] Deleting VPC resources")
+    vpc_id = _resolve_vpc_id(cfg)
+    if not vpc_id:
+        logger.info("  No project VPC found")
+        return
+
+    logger.info(f"  VPC: {vpc_id}")
+
+    # Detach/delete ENIs that are available
+    try:
+        enis = ec2_client.describe_network_interfaces(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("NetworkInterfaces", [])
+        for eni in enis:
+            if eni.get("Status") == "available":
+                try:
+                    ec2_client.delete_network_interface(
+                        NetworkInterfaceId=eni["NetworkInterfaceId"]
+                    )
+                    logger.info(f"  ✓ Deleted ENI: {eni['NetworkInterfaceId']}")
+                except ClientError as e:
+                    logger.warning(f"  Could not delete ENI: {e}")
+    except ClientError as e:
+        logger.warning(f"  ENI cleanup: {e}")
+
+    # NAT gateways + routes — capture EIP allocation IDs before delete
+    nat_ids = []
+    eip_alloc_ids = set()
+    try:
+        nats = ec2_client.describe_nat_gateways(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("NatGateways", [])
+        for nat in nats:
+            for addr in nat.get("NatGatewayAddresses", []):
+                if addr.get("AllocationId"):
+                    eip_alloc_ids.add(addr["AllocationId"])
+            if nat["State"] in {"deleted", "deleting"}:
+                continue
+            nat_id = nat["NatGatewayId"]
+            rts = ec2_client.describe_route_tables(
+                Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+            ).get("RouteTables", [])
+            for rt in rts:
+                for route in rt.get("Routes", []):
+                    if route.get("NatGatewayId") == nat_id:
+                        try:
+                            ec2_client.delete_route(
+                                RouteTableId=rt["RouteTableId"],
+                                DestinationCidrBlock=route["DestinationCidrBlock"],
+                            )
+                        except ClientError:
+                            pass
+            try:
+                ec2_client.delete_nat_gateway(NatGatewayId=nat_id)
+                nat_ids.append(nat_id)
+                logger.info(f"  ✓ Delete NAT requested: {nat_id}")
+            except ClientError as e:
+                logger.warning(f"  Could not delete NAT {nat_id}: {e}")
+    except ClientError as e:
+        logger.warning(f"  NAT cleanup: {e}")
+
+    if nat_ids:
+        logger.info("  Waiting for NAT gateways to delete...")
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            remaining = []
+            for nid in nat_ids:
+                st = ec2_client.describe_nat_gateways(NatGatewayIds=[nid])[
+                    "NatGateways"
+                ][0]["State"]
+                if st != "deleted":
+                    remaining.append(nid)
+            if not remaining:
+                break
+            time.sleep(15)
+
+    for alloc_id in eip_alloc_ids:
+        try:
+            ec2_client.release_address(AllocationId=alloc_id)
+            logger.info(f"  ✓ Released EIP: {alloc_id}")
+        except ClientError as e:
+            logger.debug(f"  EIP release {alloc_id}: {e}")
+
+    # Detach/delete IGWs
+    try:
+        igws = ec2_client.describe_internet_gateways(
+            Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}]
+        ).get("InternetGateways", [])
+        for igw in igws:
+            igw_id = igw["InternetGatewayId"]
+            try:
+                ec2_client.detach_internet_gateway(
+                    InternetGatewayId=igw_id, VpcId=vpc_id
+                )
+            except ClientError:
+                pass
+            try:
+                ec2_client.delete_internet_gateway(InternetGatewayId=igw_id)
+                logger.info(f"  ✓ Deleted IGW: {igw_id}")
+            except ClientError as e:
+                logger.warning(f"  Could not delete IGW {igw_id}: {e}")
+    except ClientError as e:
+        logger.warning(f"  IGW cleanup: {e}")
+
+    # Subnets
+    try:
+        subnets = ec2_client.describe_subnets(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("Subnets", [])
+        for sn in subnets:
+            try:
+                ec2_client.delete_subnet(SubnetId=sn["SubnetId"])
+                logger.info(f"  ✓ Deleted subnet: {sn['SubnetId']}")
+            except ClientError as e:
+                logger.warning(f"  Could not delete subnet {sn['SubnetId']}: {e}")
+    except ClientError as e:
+        logger.warning(f"  Subnet cleanup: {e}")
+
+    # Route tables (non-main)
+    try:
+        rts = ec2_client.describe_route_tables(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("RouteTables", [])
+        for rt in rts:
+            is_main = any(a.get("Main") for a in rt.get("Associations", []))
+            if is_main:
+                continue
+            for assoc in rt.get("Associations", []):
+                if assoc.get("RouteTableAssociationId") and not assoc.get("Main"):
+                    try:
+                        ec2_client.disassociate_route_table(
+                            AssociationId=assoc["RouteTableAssociationId"]
+                        )
+                    except ClientError:
+                        pass
+            try:
+                ec2_client.delete_route_table(RouteTableId=rt["RouteTableId"])
+                logger.info(f"  ✓ Deleted route table: {rt['RouteTableId']}")
+            except ClientError as e:
+                logger.warning(f"  Could not delete RT {rt['RouteTableId']}: {e}")
+    except ClientError as e:
+        logger.warning(f"  Route table cleanup: {e}")
+
+    # Security groups (non-default) — revoke cross refs then delete
+    try:
+        sgs = ec2_client.describe_security_groups(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("SecurityGroups", [])
+        for sg in sgs:
+            if sg.get("GroupName") == "default":
+                continue
+            try:
+                if sg.get("IpPermissions"):
+                    ec2_client.revoke_security_group_ingress(
+                        GroupId=sg["GroupId"], IpPermissions=sg["IpPermissions"]
+                    )
+                if sg.get("IpPermissionsEgress"):
+                    ec2_client.revoke_security_group_egress(
+                        GroupId=sg["GroupId"],
+                        IpPermissions=sg["IpPermissionsEgress"],
+                    )
+            except ClientError:
+                pass
+        for sg in sgs:
+            if sg.get("GroupName") == "default":
+                continue
+            try:
+                ec2_client.delete_security_group(GroupId=sg["GroupId"])
+                logger.info(f"  ✓ Deleted SG: {sg['GroupId']} ({sg.get('GroupName')})")
+            except ClientError as e:
+                logger.warning(f"  Could not delete SG {sg['GroupId']}: {e}")
+    except ClientError as e:
+        logger.warning(f"  SG cleanup: {e}")
+
+    try:
+        ec2_client.delete_vpc(VpcId=vpc_id)
+        logger.info(f"✓ Deleted VPC: {vpc_id}")
+    except ClientError as e:
+        logger.warning(f"  Could not delete VPC {vpc_id}: {e}")
+
+
+# --- S3 / IAM / config -------------------------------------------------------
+
+def _empty_s3_bucket(bucket: str):
+    delete_keys = []
+    try:
+        paginator = s3_client.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=bucket):
+            for obj in page.get("Versions", []):
+                delete_keys.append({"Key": obj["Key"], "VersionId": obj["VersionId"]})
+            for obj in page.get("DeleteMarkers", []):
+                delete_keys.append({"Key": obj["Key"], "VersionId": obj["VersionId"]})
+    except ClientError:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket):
+            for obj in page.get("Contents", []):
+                delete_keys.append({"Key": obj["Key"]})
+
+    if not delete_keys:
+        return
+    for i in range(0, len(delete_keys), 1000):
+        batch = delete_keys[i : i + 1000]
+        s3_client.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+    logger.info(f"  ✓ Emptied {len(delete_keys)} object(s) from {bucket}")
+
+
+def delete_s3_bucket():
+    logger.info("[6/8] Deleting S3 bucket")
+    bucket = _bucket_name()
+    try:
+        s3_client.head_bucket(Bucket=bucket)
+    except ClientError:
+        logger.info(f"  Bucket not found: {bucket}")
+        return
+    try:
+        try:
+            s3_client.delete_bucket_policy(Bucket=bucket)
+        except ClientError:
+            pass
+        _empty_s3_bucket(bucket)
+        s3_client.delete_bucket(Bucket=bucket)
+        logger.info(f"✓ Deleted S3 bucket: {bucket}")
+    except ClientError as e:
+        logger.warning(f"  Could not delete bucket {bucket}: {e}")
+
+
+def delete_iam_role(role_name: str):
+    try:
+        for p in iam_client.list_attached_role_policies(RoleName=role_name).get(
+            "AttachedPolicies", []
+        ):
+            iam_client.detach_role_policy(
+                RoleName=role_name, PolicyArn=p["PolicyArn"]
+            )
+        for pname in iam_client.list_role_policies(RoleName=role_name).get(
+            "PolicyNames", []
+        ):
+            iam_client.delete_role_policy(RoleName=role_name, PolicyName=pname)
+        iam_client.delete_role(RoleName=role_name)
+        logger.info(f"  ✓ Deleted IAM role: {role_name}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchEntity":
+            logger.info(f"  IAM role not found: {role_name}")
+        else:
+            logger.warning(f"  Could not delete role {role_name}: {e}")
+
+
+def delete_iam_roles():
+    logger.info("  Deleting IAM roles")
+    harness_role = f"role-harness-for-{project_name}-{region}"
+    memory_role = f"role-agentcore-memory-for-{project_name}-{region}"
+    delete_iam_role(harness_role)
+    delete_iam_role(memory_role)
+    delete_s3files_sync_role()
+    logger.info("✓ IAM roles processed")
+
+
+INSTALLER_CONFIG_KEYS = [
+    "executionRoleArn",
+    "agentcore_memory_role",
+    "agent_memory_arn",
+    "memory_id",
+    "memoryId",
+    "harnessId",
+    "HARNESS_ARN",
+    "s3_bucket",
+    "s3_arn",
+    "sharing_url",
+    "app_url",
+    "ui_cloudfront_domain",
+    "ui_cloudfront_id",
+    "vpc_id",
+    "s3_files_file_system_id",
+    "s3_files_access_point_arn",
+    "s3_files_mount_path",
+    "agent_runtime_vpc_subnets",
+    "agent_runtime_security_groups",
+    "ecs_cluster_arn",
+    "ecs_service_name",
+    "ecs_task_definition_arn",
+    "ecr_image_uri",
+    "latest_image_tag",
+    "build_number",
+]
+
+
+def clear_config_json():
+    logger.info("[8/8] Clearing installer fields from config.json")
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception as e:
+        logger.warning(f"  Could not read config: {e}")
+        return
+
+    for key in INSTALLER_CONFIG_KEYS:
+        cfg.pop(key, None)
+
+    # Keep projectName / region / accountId for reinstall
+    cfg["projectName"] = project_name
+    cfg["region"] = region
+    cfg["accountId"] = account_id
+
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        logger.info(f"✓ Updated {CONFIG_PATH}")
+    except Exception as e:
+        logger.warning(f"  Could not write config: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Uninstall AgentCore Harness infrastructure from installer.py"
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip confirmation prompts",
+    )
+    parser.add_argument(
+        "--keep-s3-bucket",
+        action="store_true",
+        help="Retain the project S3 bucket (default: delete)",
+    )
+    parser.add_argument(
+        "--keep-cloudfront",
+        action="store_true",
+        help="Retain the project S3 CloudFront / OAI (default: delete)",
+    )
+    args = parser.parse_args()
+
+    cfg = load_config()
+
+    logger.info("=" * 60)
+    logger.info("Starting AgentCore Harness Infrastructure Uninstall")
+    logger.info("=" * 60)
+    logger.info(f"Project: {project_name}")
+    logger.info(f"Region: {region}")
+    logger.info(f"Account ID: {account_id}")
+    logger.info(f"S3 Bucket: {_bucket_name()}")
+    logger.info(f"S3 CloudFront: {_cloudfront_comment()}")
+    logger.info(f"Config: {CONFIG_PATH}")
+    logger.info("=" * 60)
+
+    if not args.yes:
+        if not prompt_yes_no(
+            "Delete installer-managed harness resources for this project?",
+            default=False,
+        ):
+            logger.info("Aborted.")
+            sys.exit(0)
+        delete_s3_bucket_flag = prompt_yes_no(
+            f"Delete S3 bucket ({_bucket_name()})?",
+            default=True,
+        )
+        delete_cloudfront_flag = prompt_yes_no(
+            f"Delete S3 CloudFront ({_cloudfront_comment()})?",
+            default=True,
+        )
+    else:
+        delete_s3_bucket_flag = not args.keep_s3_bucket
+        delete_cloudfront_flag = not args.keep_cloudfront
+
+    start = time.time()
+    try:
+        # Web UI stack first (depends on VPC SGs / ALB)
+        delete_ui_cloudfront(project_name, region, logger)
+        delete_ecs_resources(project_name, region, logger)
+        delete_alb_resources(project_name, region, logger)
+
+        if delete_cloudfront_flag:
+            disable_cloudfront_distributions()
+
+        harness_id = resolve_harness_id(cfg)
+        if harness_id:
+            if not delete_harness(harness_id):
+                logger.warning(
+                    "Harness delete incomplete; continuing with remaining cleanup"
+                )
+        else:
+            logger.info("No harness id found; skipping DeleteHarness")
+
+        delete_s3_files_session_storage(cfg)
+        delete_vpc(cfg)
+
+        memory_id = resolve_memory_id(cfg)
+        if memory_id:
+            delete_memory(memory_id)
+        else:
+            logger.info("No memory id found; skipping DeleteMemory")
+
+        delete_ecs_iam_roles(project_name, region, logger)
+        delete_alb_origin_header_secret(project_name, region, logger)
+        delete_iam_roles()
+
+        if delete_s3_bucket_flag:
+            delete_s3_bucket()
+        else:
+            logger.info(f"S3 bucket retained: {_bucket_name()}")
+
+        if delete_cloudfront_flag:
+            wait_for_cloudfront_disabled(max_wait=600, poll_interval=20)
+            delete_cloudfront_distributions()
+            delete_cloudfront_oai()
+        else:
+            logger.info(f"S3 CloudFront retained: {_cloudfront_comment()}")
+
+        # UI CF may still be disabling; best-effort delete if already disabled
+        delete_disabled_ui_cloudfront(project_name, region, logger)
+
+        clear_config_json()
+
+        elapsed = time.time() - start
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Uninstall completed")
+        logger.info(f"Total time: {elapsed / 60:.2f} minutes")
+        logger.info(
+            "Note: if UI CloudFront delete failed (Deploying), re-run uninstaller later"
+        )
+        logger.info("=" * 60)
+    except Exception as e:
+        logger.error(f"Uninstall failed: {e}")
+        import traceback
+
+        logger.error(traceback.format_exc())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+__pycache__
+data/
+
+# configuration
+config.json
+
+# frontend
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
