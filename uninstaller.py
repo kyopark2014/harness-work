@@ -755,11 +755,230 @@ def delete_iam_roles():
     harness_role = f"role-harness-for-{project_name}-{region}"
     memory_role = f"role-agentcore-memory-for-{project_name}-{region}"
     kb_role = f"role-knowledge-base-for-{project_name}-{region}"
+    kb_mcp_role = f"role-kb-mcp-for-{project_name}-{region}"
+    s3_mcp_role = f"role-artifact-share-mcp-for-{project_name}-{region}"
+    gateway_role = f"role-agentcore-gateway-for-{project_name}-{region}"
     delete_iam_role(harness_role)
     delete_iam_role(memory_role)
     delete_iam_role(kb_role)
+    delete_iam_role(kb_mcp_role)
+    delete_iam_role(s3_mcp_role)
+    delete_iam_role(f"role-s3-mcp-for-{project_name}-{region}")  # legacy
+    delete_iam_role(gateway_role)
+    # legacy KB-only gateway role name
+    delete_iam_role(f"role-kb-mcp-gw-for-{project_name}-{region}")
     delete_s3files_sync_role()
     logger.info("✓ IAM roles processed")
+
+
+
+def _kb_mcp_runtime_name() -> str:
+    return f"knowledge_base_of_{project_name}".replace("-", "_")
+
+
+def _agentcore_gateway_name() -> str:
+    return project_name[:48]
+
+
+def delete_agentcore_gateway(cfg: Dict):
+    """Delete the shared project AgentCore Gateway and its targets."""
+    logger.info("  Deleting project AgentCore Gateway")
+    gateway_name = _agentcore_gateway_name()
+    gateway_id = (
+        cfg.get("agentcore_gateway_id")
+        or cfg.get("knowledge_base_mcp_gateway_id")
+        or ""
+    )
+
+    try:
+        if not gateway_id:
+            next_token = None
+            while True:
+                kwargs = {}
+                if next_token:
+                    kwargs["nextToken"] = next_token
+                resp = agentcore_control_client.list_gateways(**kwargs)
+                for item in resp.get("items") or []:
+                    if item.get("name") == gateway_name:
+                        gateway_id = item["gatewayId"]
+                        break
+                if gateway_id:
+                    break
+                next_token = resp.get("nextToken")
+                if not next_token:
+                    break
+
+        if not gateway_id:
+            logger.info(f"  No AgentCore Gateway named {gateway_name}")
+            return
+
+        try:
+            targets = agentcore_control_client.list_gateway_targets(
+                gatewayIdentifier=gateway_id
+            ).get("items") or []
+            for target in targets:
+                tid = target.get("targetId")
+                if not tid:
+                    continue
+                try:
+                    agentcore_control_client.delete_gateway_target(
+                        gatewayIdentifier=gateway_id,
+                        targetId=tid,
+                    )
+                    logger.info(f"  ✓ Deleted gateway target: {tid}")
+                except ClientError as e:
+                    logger.warning(f"  Could not delete gateway target {tid}: {e}")
+        except ClientError as e:
+            logger.warning(f"  Could not list/delete gateway targets: {e}")
+
+        agentcore_control_client.delete_gateway(gatewayIdentifier=gateway_id)
+        logger.info(f"  ✓ Deleted AgentCore Gateway: {gateway_id}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            logger.info(f"  Gateway already gone: {gateway_id or gateway_name}")
+        else:
+            logger.warning(f"  Could not delete AgentCore Gateway: {e}")
+    except Exception as e:
+        logger.warning(f"  Could not delete AgentCore Gateway: {e}")
+
+
+def delete_knowledge_base_mcp_runtime(cfg: Dict):
+    """Delete Knowledge Base MCP AgentCore Runtime and its ECR repository."""
+    logger.info("  Deleting Knowledge Base MCP Runtime")
+    runtime_name = _kb_mcp_runtime_name()
+    arn = cfg.get("knowledge_base_mcp_runtime_arn") or ""
+
+    try:
+        next_token = None
+        runtime_id = None
+        while True:
+            kwargs = {}
+            if next_token:
+                kwargs["nextToken"] = next_token
+            response = agentcore_control_client.list_agent_runtimes(**kwargs)
+            for item in response.get("agentRuntimes", []):
+                if item.get("agentRuntimeName") == runtime_name or (
+                    arn and item.get("agentRuntimeArn") == arn
+                ):
+                    runtime_id = item.get("agentRuntimeId")
+                    break
+            if runtime_id:
+                break
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+
+        if runtime_id:
+            logger.info(f"  Deleting agent runtime: {runtime_name} ({runtime_id})")
+            try:
+                agentcore_control_client.delete_agent_runtime(agentRuntimeId=runtime_id)
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                    logger.warning(f"  Could not delete agent runtime: {e}")
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                try:
+                    agentcore_control_client.get_agent_runtime(agentRuntimeId=runtime_id)
+                    time.sleep(5)
+                except ClientError as e:
+                    if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                        break
+                    raise
+            logger.info(f"  ✓ Deleted Knowledge Base MCP Runtime: {runtime_name}")
+        else:
+            logger.info(f"  No Knowledge Base MCP Runtime named {runtime_name}")
+    except Exception as e:
+        logger.warning(f"  Could not delete Knowledge Base MCP Runtime: {e}")
+
+    repo = cfg.get("knowledge_base_mcp_ecr_repository") or runtime_name
+    try:
+        ecr = boto3.client("ecr", region_name=region)
+        ecr.delete_repository(repositoryName=repo, force=True)
+        logger.info(f"  ✓ Deleted ECR repository: {repo}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "RepositoryNotFoundException":
+            logger.info(f"  ECR repository not found: {repo}")
+        else:
+            logger.warning(f"  Could not delete ECR repository {repo}: {e}")
+    logger.info("✓ Knowledge Base MCP Runtime cleanup done")
+
+
+def _artifact_share_mcp_runtime_name() -> str:
+    return f"artifact_share_of_{project_name}".replace("-", "_")
+
+
+def delete_artifact_share_mcp_runtime(cfg: Dict):
+    """Delete Artifact Share MCP AgentCore Runtime and its ECR repository."""
+    logger.info("  Deleting Artifact Share MCP Runtime")
+    runtime_names = [
+        _artifact_share_mcp_runtime_name(),
+        f"s3_sharing_of_{project_name}".replace("-", "_"),  # legacy
+    ]
+    arn = (
+        cfg.get("artifact_share_mcp_runtime_arn")
+        or cfg.get("s3_sharing_mcp_runtime_arn")
+        or ""
+    )
+
+    try:
+        next_token = None
+        runtime_ids: List[str] = []
+        while True:
+            kwargs = {}
+            if next_token:
+                kwargs["nextToken"] = next_token
+            response = agentcore_control_client.list_agent_runtimes(**kwargs)
+            for item in response.get("agentRuntimes", []):
+                name = item.get("agentRuntimeName")
+                if name in runtime_names or (
+                    arn and item.get("agentRuntimeArn") == arn
+                ):
+                    rid = item.get("agentRuntimeId")
+                    if rid and rid not in runtime_ids:
+                        runtime_ids.append(rid)
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+
+        for runtime_id in runtime_ids:
+            logger.info(f"  Deleting agent runtime: {runtime_id}")
+            try:
+                agentcore_control_client.delete_agent_runtime(agentRuntimeId=runtime_id)
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                    logger.warning(f"  Could not delete agent runtime: {e}")
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                try:
+                    agentcore_control_client.get_agent_runtime(agentRuntimeId=runtime_id)
+                    time.sleep(5)
+                except ClientError as e:
+                    if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                        break
+                    raise
+            logger.info(f"  ✓ Deleted Artifact Share MCP Runtime: {runtime_id}")
+        if not runtime_ids:
+            logger.info("  No Artifact Share MCP Runtime found")
+    except Exception as e:
+        logger.warning(f"  Could not delete Artifact Share MCP Runtime: {e}")
+
+    repos = {
+        cfg.get("artifact_share_mcp_ecr_repository") or "",
+        cfg.get("s3_sharing_mcp_ecr_repository") or "",
+        _artifact_share_mcp_runtime_name(),
+        f"s3_sharing_of_{project_name}".replace("-", "_"),
+    }
+    ecr = boto3.client("ecr", region_name=region)
+    for repo in {r for r in repos if r}:
+        try:
+            ecr.delete_repository(repositoryName=repo, force=True)
+            logger.info(f"  ✓ Deleted ECR repository: {repo}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "RepositoryNotFoundException":
+                logger.info(f"  ECR repository not found: {repo}")
+            else:
+                logger.warning(f"  Could not delete ECR repository {repo}: {e}")
+    logger.info("✓ Artifact Share MCP Runtime cleanup done")
 
 
 def delete_knowledge_bases():
@@ -918,6 +1137,31 @@ INSTALLER_CONFIG_KEYS = [
     "knowledge_base_id",
     "data_source_id",
     "knowledge_base_role",
+    "knowledge_base_mcp_runtime_arn",
+    "knowledge_base_mcp_url",
+    "knowledge_base_mcp_role",
+    "knowledge_base_mcp_ecr_repository",
+    "knowledge_base_mcp_image_tag",
+    "knowledge_base_mcp_gateway_target_id",
+    "knowledge_base_mcp_gateway_arn",  # legacy
+    "knowledge_base_mcp_gateway_id",  # legacy
+    "knowledge_base_mcp_gateway_role",  # legacy
+    "artifact_share_mcp_runtime_arn",
+    "artifact_share_mcp_url",
+    "artifact_share_mcp_role",
+    "artifact_share_mcp_ecr_repository",
+    "artifact_share_mcp_image_tag",
+    "artifact_share_mcp_gateway_target_id",
+    # legacy rename leftovers
+    "s3_sharing_mcp_runtime_arn",
+    "s3_sharing_mcp_url",
+    "s3_sharing_mcp_role",
+    "s3_sharing_mcp_ecr_repository",
+    "s3_sharing_mcp_image_tag",
+    "s3_sharing_mcp_gateway_target_id",
+    "agentcore_gateway_arn",
+    "agentcore_gateway_id",
+    "agentcore_gateway_role",
     "vector_bucket_name",
     "vector_bucket_arn",
     "vector_index_name",
@@ -1032,6 +1276,9 @@ def main():
         else:
             logger.info("No memory id found; skipping DeleteMemory")
 
+        delete_agentcore_gateway(cfg)
+        delete_artifact_share_mcp_runtime(cfg)
+        delete_knowledge_base_mcp_runtime(cfg)
         delete_knowledge_bases()
         delete_s3_vectors_store()
 

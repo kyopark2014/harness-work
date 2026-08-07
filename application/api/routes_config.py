@@ -58,10 +58,6 @@ class DefaultsPatch(BaseModel):
     default_mcp_servers: list[str] | None = None
 
 
-class UserMcpBody(BaseModel):
-    config: dict = {}
-
-
 def _skill_options() -> list[str]:
     if skill.skill_managers.get("base") is None:
         skill.register_plugin_skills("base")
@@ -101,15 +97,3 @@ def patch_defaults(body: DefaultsPatch):
         mcp_servers=body.default_mcp_servers,
     )
     return {"ok": True}
-
-
-@router.get("/user-mcp")
-def get_user_mcp():
-    return {"config": mcp_config.load_user_defined_mcp() or {}}
-
-
-@router.put("/user-mcp")
-def put_user_mcp(body: UserMcpBody):
-    mcp_config.mcp_user_config = body.config or {}
-    mcp_config.save_user_defined_mcp(mcp_config.mcp_user_config)
-    return {"ok": True, "config": mcp_config.mcp_user_config}

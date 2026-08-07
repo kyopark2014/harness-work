@@ -2,27 +2,37 @@
 """
 AWS Infrastructure Installer using boto3
 This script provisions AgentCore Harness (S3, skills, VPC, S3 Files mount,
-CloudFront, IAM roles, Memory, S3 Vectors Knowledge Base, CreateHarness)
+CloudFront, IAM roles, Memory, S3 Vectors Knowledge Base, KB + artifact-share
+MCP Runtimes behind a shared AgentCore Gateway, CreateHarness)
 and deploys the React+FastAPI Web UI to Amazon ECS Fargate (ALB + CloudFront),
 similar to strands-work.
 """
 
 import argparse
+import base64
 import boto3
 import json
 import time
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import mimetypes
 import uuid
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, NoCredentialsError
 from bedrock_agentcore.memory import MemoryClient
 
 import s3_files_vpc
 from ecs_web import EcsWebDeployer
+
+KB_MCP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MCP", "knowledge-base")
+ARTIFACT_SHARE_MCP_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "MCP", "artifact-share"
+)
 
 # Configuration
 project_name = "harness-work"  # at least 3 characters
@@ -755,6 +765,1010 @@ def create_knowledge_base_with_s3_vectors(
     return knowledge_base_id, data_source_id
 
 
+def _kb_mcp_repository_name() -> str:
+    """ECR / Agent Runtime name: knowledge_base_of_{project} (hyphens → underscores)."""
+    return f"knowledge_base_of_{project_name}".replace("-", "_")
+
+
+def knowledge_base_mcp_url(agent_runtime_arn: str, runtime_region: str | None = None) -> str:
+    """Streamable-HTTP MCP endpoint for an IAM-auth AgentCore Runtime."""
+    r = runtime_region or region
+    encoded = agent_runtime_arn.replace(":", "%3A").replace("/", "%2F")
+    return (
+        f"https://bedrock-agentcore.{r}.amazonaws.com/runtimes/"
+        f"{encoded}/invocations?qualifier=DEFAULT"
+    )
+
+
+def create_knowledge_base_mcp_role() -> str:
+    """IAM role assumed by the Knowledge Base MCP AgentCore Runtime."""
+    logger.info("[6.1/14] Creating Knowledge Base MCP Runtime IAM role")
+    role_name = f"role-kb-mcp-for-{project_name}-{region}"
+    if len(role_name) > 64:
+        role_name = f"role-kb-mcp-{project_name[:20]}-{region}"[:64]
+
+    assume_role_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            },
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
+                "Action": "sts:AssumeRole",
+            },
+        ],
+    }
+    role_arn, _ = create_iam_role(
+        role_name,
+        assume_role_policy,
+        description="Execution role for Knowledge Base MCP AgentCore Runtime",
+    )
+
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "KnowledgeBaseRetrieve",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock:Retrieve",
+                    "bedrock:RetrieveAndGenerate",
+                ],
+                "Resource": [
+                    f"arn:aws:bedrock:{region}:{account_id}:knowledge-base/*",
+                ],
+            },
+            {
+                "Sid": "ListKnowledgeBases",
+                "Effect": "Allow",
+                "Action": ["bedrock:ListKnowledgeBases", "bedrock:GetKnowledgeBase"],
+                "Resource": ["*"],
+            },
+            {
+                "Sid": "EcrPull",
+                "Effect": "Allow",
+                "Action": [
+                    "ecr:GetAuthorizationToken",
+                    "ecr:BatchGetImage",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:DescribeImages",
+                    "ecr:DescribeRepositories",
+                ],
+                "Resource": ["*"],
+            },
+            {
+                "Sid": "CloudWatchLogs",
+                "Effect": "Allow",
+                "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeLogStreams",
+                ],
+                "Resource": [
+                    f"arn:aws:logs:{region}:{account_id}:log-group:/aws/bedrock-agentcore/*",
+                    f"arn:aws:logs:{region}:{account_id}:log-group:/aws/bedrock-agentcore/*:log-stream:*",
+                ],
+            },
+            {
+                "Sid": "CloudWatchMetrics",
+                "Effect": "Allow",
+                "Action": [
+                    "cloudwatch:PutMetricData",
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                ],
+                "Resource": ["*"],
+            },
+        ],
+    }
+    attach_inline_policy(
+        role_name,
+        f"kb-mcp-inline-for-{project_name}"[:128],
+        policy,
+    )
+    logger.info(f"✓ Knowledge Base MCP Runtime role ready: {role_arn}")
+    return role_arn
+
+
+def _ensure_ecr_repository(repository_name: str) -> None:
+    ecr = boto3.client("ecr", region_name=region)
+    try:
+        ecr.describe_repositories(repositoryNames=[repository_name])
+        logger.info(f"  ECR repository exists: {repository_name}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "RepositoryNotFoundException":
+            raise
+        logger.info(f"  Creating ECR repository: {repository_name}")
+        ecr.create_repository(repositoryName=repository_name)
+
+
+def _docker_ecr_login() -> None:
+    ecr = boto3.client("ecr", region_name=region)
+    token = ecr.get_authorization_token()["authorizationData"][0]["authorizationToken"]
+    username, password = base64.b64decode(token).decode("utf-8").split(":")
+    registry = f"{account_id}.dkr.ecr.{region}.amazonaws.com"
+    process = subprocess.Popen(
+        ["docker", "login", "--username", username, "--password-stdin", registry],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _, stderr = process.communicate(input=password)
+    if process.returncode != 0:
+        raise RuntimeError(f"Docker ECR login failed: {stderr}")
+
+
+def _run_docker(cmd: List[str], description: str) -> None:
+    logger.info(f"  {description}: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+
+
+def push_knowledge_base_mcp_image() -> Tuple[str, str]:
+    """Build MCP/knowledge-base image and push to ECR. Returns (repository, tag)."""
+    logger.info("[6.2/14] Building Knowledge Base MCP Docker image and pushing to ECR")
+
+    if not shutil.which("docker"):
+        raise RuntimeError("docker is required to build the Knowledge Base MCP image")
+    if not os.path.isdir(KB_MCP_DIR):
+        raise RuntimeError(f"MCP directory not found: {KB_MCP_DIR}")
+
+    try:
+        boto3.client("sts").get_caller_identity()
+    except NoCredentialsError as e:
+        raise RuntimeError("AWS credentials are not configured") from e
+
+    repository = _kb_mcp_repository_name()
+    image_tag = datetime.now().strftime("%Y%m%d%H%M%S")
+    local_tag = f"{repository}:{image_tag}"
+    ecr_uri = f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repository}:{image_tag}"
+
+    _ensure_ecr_repository(repository)
+    _docker_ecr_login()
+    _run_docker(
+        [
+            "docker",
+            "build",
+            "--platform",
+            "linux/arm64",
+            "--provenance=false",
+            "--sbom=false",
+            "-t",
+            local_tag,
+            KB_MCP_DIR,
+        ],
+        "Building Docker image",
+    )
+    _run_docker(["docker", "tag", local_tag, ecr_uri], "Tagging for ECR")
+    _run_docker(["docker", "push", ecr_uri], "Pushing to ECR")
+    logger.info(f"✓ Pushed Knowledge Base MCP image: {ecr_uri}")
+    return repository, image_tag
+
+
+def _find_agent_runtime_by_name(runtime_name: str) -> Optional[Dict]:
+    client = agentcore_control_client
+    next_token = None
+    while True:
+        kwargs = {}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        response = client.list_agent_runtimes(**kwargs)
+        for item in response.get("agentRuntimes", []):
+            if item.get("agentRuntimeName") == runtime_name:
+                return item
+        next_token = response.get("nextToken")
+        if not next_token:
+            return None
+
+
+def create_or_update_knowledge_base_mcp_runtime(
+    role_arn: str,
+    repository: str,
+    image_tag: str,
+    knowledge_base_id: str,
+    sharing_url: str = "",
+) -> Dict[str, str]:
+    """Create or update AgentCore Runtime (MCP protocol) for Knowledge Base retrieve."""
+    logger.info("[6.3/14] Creating/updating Knowledge Base MCP AgentCore Runtime")
+    runtime_name = repository
+    container_uri = (
+        f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repository}:{image_tag}"
+    )
+    env_vars = {
+        "AWS_REGION": region,
+        "AWS_DEFAULT_REGION": region,
+        "PROJECT_NAME": project_name,
+        "KNOWLEDGE_BASE_ID": knowledge_base_id,
+    }
+    if sharing_url:
+        env_vars["SHARING_URL"] = sharing_url.rstrip("/")
+
+    existing = _find_agent_runtime_by_name(runtime_name)
+    if existing:
+        runtime_id = existing["agentRuntimeId"]
+        logger.info(f"  Updating existing runtime: {runtime_name} ({runtime_id})")
+        response = agentcore_control_client.update_agent_runtime(
+            agentRuntimeId=runtime_id,
+            description="Harness Knowledge Base retrieve MCP",
+            agentRuntimeArtifact={
+                "containerConfiguration": {"containerUri": container_uri}
+            },
+            roleArn=role_arn,
+            networkConfiguration={"networkMode": "PUBLIC"},
+            protocolConfiguration={"serverProtocol": "MCP"},
+            environmentVariables=env_vars,
+        )
+        agent_runtime_arn = response["agentRuntimeArn"]
+    else:
+        logger.info(f"  Creating runtime: {runtime_name}")
+        response = agentcore_control_client.create_agent_runtime(
+            agentRuntimeName=runtime_name,
+            description="Harness Knowledge Base retrieve MCP",
+            agentRuntimeArtifact={
+                "containerConfiguration": {"containerUri": container_uri}
+            },
+            networkConfiguration={"networkMode": "PUBLIC"},
+            roleArn=role_arn,
+            protocolConfiguration={"serverProtocol": "MCP"},
+            environmentVariables=env_vars,
+        )
+        agent_runtime_arn = response["agentRuntimeArn"]
+
+    mcp_url = knowledge_base_mcp_url(agent_runtime_arn)
+    logger.info(f"✓ Knowledge Base MCP Runtime: {agent_runtime_arn}")
+    logger.info(f"  MCP URL: {mcp_url}")
+    return {
+        "agent_runtime_arn": agent_runtime_arn,
+        "knowledge_base_mcp_url": mcp_url,
+        "ecr_repository": repository,
+        "latest_image_tag": image_tag,
+        "agent_runtime_role": role_arn,
+    }
+
+
+def deploy_knowledge_base_mcp(
+    knowledge_base_id: str,
+    sharing_url: str = "",
+) -> Dict[str, str]:
+    """Build/push image, deploy MCP Runtime, attach it to the project IAM Gateway.
+
+    Harness ``remote_mcp`` does not SigV4-sign AgentCore Runtime URLs (403).
+    A shared project Gateway (AWS_IAM) fronts Runtime MCP targets (KB and others).
+    """
+    role_arn = create_knowledge_base_mcp_role()
+    repository, image_tag = push_knowledge_base_mcp_image()
+    mcp_info = create_or_update_knowledge_base_mcp_runtime(
+        role_arn=role_arn,
+        repository=repository,
+        image_tag=image_tag,
+        knowledge_base_id=knowledge_base_id,
+        sharing_url=sharing_url,
+    )
+    gateway_info = ensure_project_mcp_gateway_with_knowledge_base_target(
+        agent_runtime_arn=mcp_info["agent_runtime_arn"],
+        mcp_url=mcp_info["knowledge_base_mcp_url"],
+    )
+    mcp_info.update(gateway_info)
+    return mcp_info
+
+
+def _agentcore_gateway_name() -> str:
+    """Shared project Gateway name (alphanumeric + hyphens; API pattern)."""
+    return project_name[:48]
+
+
+def _agentcore_gateway_role_name() -> str:
+    role_name = f"role-agentcore-gateway-for-{project_name}-{region}"
+    if len(role_name) > 64:
+        role_name = f"role-ac-gw-{project_name[:20]}-{region}"[:64]
+    return role_name
+
+
+def create_agentcore_gateway_role() -> str:
+    """IAM service role for the project AgentCore Gateway (all MCP targets)."""
+    logger.info("[7.1/14] Creating project AgentCore Gateway IAM role")
+    gateway_name = _agentcore_gateway_name()
+    role_name = _agentcore_gateway_role_name()
+
+    assume_role_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowAgentCoreGatewayAssume",
+                "Effect": "Allow",
+                "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "StringEquals": {"aws:SourceAccount": account_id},
+                    "ArnLike": {
+                        "aws:SourceArn": (
+                            f"arn:aws:bedrock-agentcore:{region}:{account_id}:"
+                            f"gateway/{gateway_name}-*"
+                        )
+                    },
+                },
+            }
+        ],
+    }
+    role_arn, _ = create_iam_role(
+        role_name,
+        assume_role_policy,
+        description=f"Service role for AgentCore Gateway ({project_name})",
+    )
+
+    # Shared gateway may front multiple Runtime MCP targets in this account/project.
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "InvokeAgentCoreRuntimeMcp",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore:InvokeAgentRuntime",
+                    "bedrock-agentcore:InvokeAgentRuntimeForUser",
+                ],
+                "Resource": [
+                    f"arn:aws:bedrock-agentcore:{region}:{account_id}:runtime/*",
+                ],
+            },
+            {
+                "Sid": "GatewayLogs",
+                "Effect": "Allow",
+                "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeLogStreams",
+                ],
+                "Resource": [
+                    f"arn:aws:logs:{region}:{account_id}:log-group:/aws/bedrock-agentcore/*",
+                ],
+            },
+        ],
+    }
+    attach_inline_policy(
+        role_name,
+        f"agentcore-gateway-inline-for-{project_name}"[:128],
+        policy,
+    )
+    logger.info(f"✓ AgentCore Gateway role ready: {role_arn}")
+    return role_arn
+
+
+def put_mcp_runtime_resource_policy(
+    agent_runtime_arn: str,
+    gateway_role_arn: str,
+    harness_role_arn: Optional[str] = None,
+) -> None:
+    """Allow Gateway (and Harness) to InvokeAgentRuntime on an MCP Runtime."""
+    principals = [gateway_role_arn]
+    if harness_role_arn:
+        principals.append(harness_role_arn)
+    # PutResourcePolicy requires Resource to be exactly the target runtime ARN
+    # (not "*"); multiple principals are allowed in one statement.
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowInvokeFromGatewayAndHarness",
+                "Effect": "Allow",
+                "Principal": {
+                    "AWS": principals if len(principals) > 1 else principals[0]
+                },
+                "Action": [
+                    "bedrock-agentcore:InvokeAgentRuntime",
+                    "bedrock-agentcore:InvokeAgentRuntimeForUser",
+                ],
+                "Resource": agent_runtime_arn,
+            }
+        ],
+    }
+    try:
+        agentcore_control_client.put_resource_policy(
+            resourceArn=agent_runtime_arn,
+            policy=json.dumps(policy),
+        )
+        logger.info(f"  ✓ Resource policy set on MCP Runtime: {agent_runtime_arn}")
+    except ClientError as e:
+        logger.warning(f"  Could not put resource policy on MCP Runtime: {e}")
+
+
+def _wait_gateway_ready(gateway_id: str, timeout_seconds: int = 600) -> Dict:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        gateway = agentcore_control_client.get_gateway(gatewayIdentifier=gateway_id)
+        status = gateway.get("status", "")
+        if status == "READY":
+            return gateway
+        if status in ("FAILED", "UPDATE_UNSUCCESSFUL", "DELETE_UNSUCCESSFUL"):
+            raise RuntimeError(f"Gateway {gateway_id} terminal status: {status}")
+        logger.info(f"  Waiting for gateway {gateway_id}: {status}")
+        time.sleep(8)
+    raise TimeoutError(f"Timed out waiting for gateway {gateway_id}")
+
+
+def _wait_gateway_target_ready(
+    gateway_id: str, target_id: str, timeout_seconds: int = 600
+) -> None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        target = agentcore_control_client.get_gateway_target(
+            gatewayIdentifier=gateway_id,
+            targetId=target_id,
+        )
+        status = target.get("status", "")
+        if status == "READY":
+            logger.info(f"  Gateway target ready: {target_id}")
+            return
+        if status in (
+            "FAILED",
+            "UPDATE_UNSUCCESSFUL",
+            "CREATE_UNSUCCESSFUL",
+            "SYNCHRONIZE_UNSUCCESSFUL",
+        ):
+            raise RuntimeError(
+                f"Gateway target {target_id} terminal status: {status} "
+                f"reasons={target.get('statusReasons')}"
+            )
+        logger.info(f"  Waiting for gateway target {target_id}: {status}")
+        time.sleep(8)
+    raise TimeoutError(f"Timed out waiting for gateway target {target_id}")
+
+
+def _find_gateway_target(gateway_id: str, target_name: str) -> Optional[Dict]:
+    for target in (
+        agentcore_control_client.list_gateway_targets(
+            gatewayIdentifier=gateway_id
+        ).get("items")
+        or []
+    ):
+        if target.get("name") == target_name:
+            return target
+    return None
+
+
+def _delete_gateway_target(gateway_id: str, target_id: str) -> None:
+    logger.info(f"  Deleting gateway target {target_id}")
+    try:
+        agentcore_control_client.delete_gateway_target(
+            gatewayIdentifier=gateway_id,
+            targetId=target_id,
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+        return
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        try:
+            agentcore_control_client.get_gateway_target(
+                gatewayIdentifier=gateway_id,
+                targetId=target_id,
+            )
+            time.sleep(5)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                logger.info(f"  ✓ Deleted gateway target {target_id}")
+                return
+            raise
+    raise TimeoutError(f"Timed out waiting for gateway target delete: {target_id}")
+
+
+def _ensure_mcp_gateway_target(
+    *,
+    gateway_id: str,
+    target_name: str,
+    description: str,
+    agent_runtime_arn: str,
+    mcp_url: str,
+    gateway_role_arn: str,
+    result_key: str,
+) -> Dict[str, str]:
+    """Create/update an MCP Runtime gateway target; recreate if FAILED."""
+    harness_role_arn = (
+        f"arn:aws:iam::{account_id}:role/role-harness-for-{project_name}-{region}"
+    )
+    put_mcp_runtime_resource_policy(
+        agent_runtime_arn=agent_runtime_arn,
+        gateway_role_arn=gateway_role_arn,
+        harness_role_arn=harness_role_arn,
+    )
+
+    existing = _find_gateway_target(gateway_id, target_name)
+    target_id = existing.get("targetId") if existing else None
+    if existing and existing.get("status") == "FAILED":
+        logger.warning(
+            f"  Gateway target '{target_name}' is FAILED; deleting before recreate"
+        )
+        _delete_gateway_target(gateway_id, target_id)
+        target_id = None
+
+    target_configuration = {
+        "mcp": {"mcpServer": {"endpoint": mcp_url}}
+    }
+    credential_provider_configurations = [
+        {
+            "credentialProviderType": "GATEWAY_IAM_ROLE",
+            "credentialProvider": {
+                "iamCredentialProvider": {
+                    "service": "bedrock-agentcore",
+                    "region": region,
+                }
+            },
+        }
+    ]
+
+    if not target_id:
+        logger.info(f"  Creating gateway target '{target_name}' → {mcp_url}")
+        created_target = agentcore_control_client.create_gateway_target(
+            gatewayIdentifier=gateway_id,
+            name=target_name,
+            description=description,
+            targetConfiguration=target_configuration,
+            credentialProviderConfigurations=credential_provider_configurations,
+        )
+        target_id = created_target["targetId"]
+    else:
+        logger.info(f"  Updating gateway target {target_id}")
+        agentcore_control_client.update_gateway_target(
+            gatewayIdentifier=gateway_id,
+            targetId=target_id,
+            name=target_name,
+            description=description,
+            targetConfiguration=target_configuration,
+            credentialProviderConfigurations=credential_provider_configurations,
+        )
+
+    # Create/Update already syncs tools; Synchronize while CREATING fails.
+    _wait_gateway_target_ready(gateway_id, target_id)
+    try:
+        agentcore_control_client.synchronize_gateway_targets(
+            gatewayIdentifier=gateway_id,
+            targetIdList=[target_id],
+        )
+        _wait_gateway_target_ready(gateway_id, target_id)
+    except ClientError as e:
+        logger.warning(f"  synchronize_gateway_targets: {e}")
+
+    return {result_key: target_id}
+
+
+def ensure_project_agentcore_gateway() -> Dict[str, str]:
+    """Create or reuse the shared project AgentCore Gateway (IAM inbound)."""
+    logger.info("[7.2/14] Ensuring project AgentCore Gateway")
+    gateway_name = _agentcore_gateway_name()
+    gateway_role_arn = create_agentcore_gateway_role()
+
+    gateway_id = None
+    next_token = None
+    while True:
+        kwargs = {}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        resp = agentcore_control_client.list_gateways(**kwargs)
+        for item in resp.get("items") or []:
+            if item.get("name") == gateway_name:
+                gateway_id = item["gatewayId"]
+                logger.warning(f"  Gateway already exists: {gateway_name} ({gateway_id})")
+                break
+        if gateway_id:
+            break
+        next_token = resp.get("nextToken")
+        if not next_token:
+            break
+
+    if not gateway_id:
+        logger.info(f"  Creating gateway: {gateway_name}")
+        time.sleep(12)
+        created = agentcore_control_client.create_gateway(
+            name=gateway_name,
+            description=f"Shared IAM Gateway for {project_name} MCP runtimes",
+            roleArn=gateway_role_arn,
+            protocolType="MCP",
+            authorizerType="AWS_IAM",
+            tags={"Project": project_name, "Component": "agentcore-gateway"},
+        )
+        gateway_id = created["gatewayId"]
+        logger.info(f"  ✓ Gateway created: {gateway_id}")
+
+    gateway = _wait_gateway_ready(gateway_id)
+    gateway_arn = gateway.get("gatewayArn") or (
+        f"arn:aws:bedrock-agentcore:{region}:{account_id}:gateway/{gateway_id}"
+    )
+    logger.info(f"✓ Project AgentCore Gateway ready: {gateway_arn}")
+    return {
+        "agentcore_gateway_arn": gateway_arn,
+        "agentcore_gateway_id": gateway_id,
+        "agentcore_gateway_role": gateway_role_arn,
+    }
+
+
+def ensure_knowledge_base_gateway_target(
+    gateway_id: str,
+    agent_runtime_arn: str,
+    mcp_url: str,
+    gateway_role_arn: str,
+) -> Dict[str, str]:
+    """Attach Knowledge Base MCP Runtime as a target on the project Gateway."""
+    return _ensure_mcp_gateway_target(
+        gateway_id=gateway_id,
+        target_name="knowledge-base",
+        description="AgentCore Runtime MCP (knowledge base retrieve)",
+        agent_runtime_arn=agent_runtime_arn,
+        mcp_url=mcp_url,
+        gateway_role_arn=gateway_role_arn,
+        result_key="knowledge_base_mcp_gateway_target_id",
+    )
+
+
+def ensure_project_mcp_gateway_with_knowledge_base_target(
+    agent_runtime_arn: str,
+    mcp_url: str,
+) -> Dict[str, str]:
+    """Ensure shared project Gateway exists and KB MCP Runtime is a target."""
+    gateway_info = ensure_project_agentcore_gateway()
+    target_info = ensure_knowledge_base_gateway_target(
+        gateway_id=gateway_info["agentcore_gateway_id"],
+        agent_runtime_arn=agent_runtime_arn,
+        mcp_url=mcp_url,
+        gateway_role_arn=gateway_info["agentcore_gateway_role"],
+    )
+    gateway_info.update(target_info)
+    return gateway_info
+
+
+def refresh_knowledge_base_mcp_env(
+    mcp_info: Dict[str, str],
+    knowledge_base_id: str,
+    sharing_url: str,
+) -> None:
+    """Update MCP runtime env after CloudFront / KB ids are finalized."""
+    arn = mcp_info.get("agent_runtime_arn") or ""
+    if not arn:
+        return
+    runtime_name = _kb_mcp_repository_name()
+    existing = _find_agent_runtime_by_name(runtime_name)
+    if not existing:
+        logger.warning("  Knowledge Base MCP runtime not found for env refresh")
+        return
+    role_arn = mcp_info.get("agent_runtime_role") or ""
+    repository = mcp_info.get("ecr_repository") or runtime_name
+    image_tag = mcp_info.get("latest_image_tag")
+    if not image_tag or not role_arn:
+        logger.warning("  Skipping MCP env refresh (missing role/image tag)")
+        return
+    updated = create_or_update_knowledge_base_mcp_runtime(
+        role_arn=role_arn,
+        repository=repository,
+        image_tag=image_tag,
+        knowledge_base_id=knowledge_base_id,
+        sharing_url=sharing_url,
+    )
+    mcp_info.update(updated)
+    if updated.get("knowledge_base_mcp_url"):
+        gateway_info = ensure_project_mcp_gateway_with_knowledge_base_target(
+            agent_runtime_arn=updated["agent_runtime_arn"],
+            mcp_url=updated["knowledge_base_mcp_url"],
+        )
+        mcp_info.update(gateway_info)
+
+
+def _artifact_share_mcp_repository_name() -> str:
+    return f"artifact_share_of_{project_name}".replace("-", "_")
+
+
+def create_artifact_share_mcp_role() -> str:
+    """IAM role assumed by the Artifact Share MCP AgentCore Runtime."""
+    logger.info("[8.1/14] Creating Artifact Share MCP Runtime IAM role")
+    role_name = f"role-artifact-share-mcp-for-{project_name}-{region}"
+    if len(role_name) > 64:
+        role_name = f"role-artifact-share-mcp-{project_name[:20]}-{region}"[:64]
+
+    assume_role_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            },
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
+                "Action": "sts:AssumeRole",
+            },
+        ],
+    }
+    role_arn, _ = create_iam_role(
+        role_name,
+        assume_role_policy,
+        description="Execution role for Artifact Share MCP AgentCore Runtime",
+    )
+
+    bucket = _bucket_name()
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "S3ListBucket",
+                "Effect": "Allow",
+                "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+                "Resource": [f"arn:aws:s3:::{bucket}"],
+            },
+            {
+                "Sid": "S3ReadSessionObjects",
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:HeadObject"],
+                "Resource": [f"arn:aws:s3:::{bucket}/*"],
+            },
+            {
+                "Sid": "S3PutSharingObjects",
+                "Effect": "Allow",
+                "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+                "Resource": [
+                    f"arn:aws:s3:::{bucket}/artifacts/*",
+                    f"arn:aws:s3:::{bucket}/images/*",
+                    f"arn:aws:s3:::{bucket}/docs/*",
+                ],
+            },
+            {
+                "Sid": "EcrPull",
+                "Effect": "Allow",
+                "Action": [
+                    "ecr:GetAuthorizationToken",
+                    "ecr:BatchGetImage",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:DescribeImages",
+                    "ecr:DescribeRepositories",
+                ],
+                "Resource": ["*"],
+            },
+            {
+                "Sid": "CloudWatchLogs",
+                "Effect": "Allow",
+                "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeLogStreams",
+                ],
+                "Resource": [
+                    f"arn:aws:logs:{region}:{account_id}:log-group:/aws/bedrock-agentcore/*",
+                    f"arn:aws:logs:{region}:{account_id}:log-group:/aws/bedrock-agentcore/*:log-stream:*",
+                ],
+            },
+            {
+                "Sid": "CloudWatchMetrics",
+                "Effect": "Allow",
+                "Action": [
+                    "cloudwatch:PutMetricData",
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                ],
+                "Resource": ["*"],
+            },
+        ],
+    }
+    attach_inline_policy(
+        role_name,
+        f"artifact-share-mcp-inline-for-{project_name}"[:128],
+        policy,
+    )
+    logger.info(f"✓ Artifact Share MCP Runtime role ready: {role_arn}")
+    return role_arn
+
+
+def push_artifact_share_mcp_image() -> Tuple[str, str]:
+    """Build MCP/artifact-share image and push to ECR. Returns (repository, tag)."""
+    logger.info("[8.2/14] Building Artifact Share MCP Docker image and pushing to ECR")
+
+    if not shutil.which("docker"):
+        raise RuntimeError("docker is required to build the Artifact Share MCP image")
+    if not os.path.isdir(ARTIFACT_SHARE_MCP_DIR):
+        raise RuntimeError(f"MCP directory not found: {ARTIFACT_SHARE_MCP_DIR}")
+
+    try:
+        boto3.client("sts").get_caller_identity()
+    except NoCredentialsError as e:
+        raise RuntimeError("AWS credentials are not configured") from e
+
+    repository = _artifact_share_mcp_repository_name()
+    image_tag = datetime.now().strftime("%Y%m%d%H%M%S")
+    local_tag = f"{repository}:{image_tag}"
+    ecr_uri = f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repository}:{image_tag}"
+
+    _ensure_ecr_repository(repository)
+    _docker_ecr_login()
+    _run_docker(
+        [
+            "docker",
+            "build",
+            "--platform",
+            "linux/arm64",
+            "--provenance=false",
+            "--sbom=false",
+            "-t",
+            local_tag,
+            ARTIFACT_SHARE_MCP_DIR,
+        ],
+        "Building Docker image",
+    )
+    _run_docker(["docker", "tag", local_tag, ecr_uri], "Tagging for ECR")
+    _run_docker(["docker", "push", ecr_uri], "Pushing to ECR")
+    logger.info(f"✓ Pushed Artifact Share MCP image: {ecr_uri}")
+    return repository, image_tag
+
+
+def create_or_update_artifact_share_mcp_runtime(
+    role_arn: str,
+    repository: str,
+    image_tag: str,
+    s3_bucket_name: str,
+    sharing_url: str = "",
+) -> Dict[str, str]:
+    """Create or update AgentCore Runtime (MCP protocol) for S3 sharing uploads."""
+    logger.info("[8.3/14] Creating/updating Artifact Share MCP AgentCore Runtime")
+    runtime_name = repository
+    container_uri = (
+        f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repository}:{image_tag}"
+    )
+    env_vars = {
+        "AWS_REGION": region,
+        "AWS_DEFAULT_REGION": region,
+        "PROJECT_NAME": project_name,
+        "S3_BUCKET": s3_bucket_name,
+        "SESSION_STORAGE_DIR": s3_files_vpc.SESSION_STORAGE_MOUNT_PATH,
+    }
+    if sharing_url:
+        env_vars["SHARING_URL"] = sharing_url.rstrip("/")
+
+    existing = _find_agent_runtime_by_name(runtime_name)
+    if existing:
+        runtime_id = existing["agentRuntimeId"]
+        logger.info(f"  Updating existing runtime: {runtime_name} ({runtime_id})")
+        response = agentcore_control_client.update_agent_runtime(
+            agentRuntimeId=runtime_id,
+            description="Harness S3 sharing MCP (CloudFront download URLs)",
+            agentRuntimeArtifact={
+                "containerConfiguration": {"containerUri": container_uri}
+            },
+            roleArn=role_arn,
+            networkConfiguration={"networkMode": "PUBLIC"},
+            protocolConfiguration={"serverProtocol": "MCP"},
+            environmentVariables=env_vars,
+        )
+        agent_runtime_arn = response["agentRuntimeArn"]
+    else:
+        logger.info(f"  Creating runtime: {runtime_name}")
+        response = agentcore_control_client.create_agent_runtime(
+            agentRuntimeName=runtime_name,
+            description="Harness S3 sharing MCP (CloudFront download URLs)",
+            agentRuntimeArtifact={
+                "containerConfiguration": {"containerUri": container_uri}
+            },
+            networkConfiguration={"networkMode": "PUBLIC"},
+            roleArn=role_arn,
+            protocolConfiguration={"serverProtocol": "MCP"},
+            environmentVariables=env_vars,
+        )
+        agent_runtime_arn = response["agentRuntimeArn"]
+
+    mcp_url = knowledge_base_mcp_url(agent_runtime_arn)
+    logger.info(f"✓ Artifact Share MCP Runtime: {agent_runtime_arn}")
+    logger.info(f"  MCP URL: {mcp_url}")
+    return {
+        "agent_runtime_arn": agent_runtime_arn,
+        "artifact_share_mcp_url": mcp_url,
+        "ecr_repository": repository,
+        "latest_image_tag": image_tag,
+        "agent_runtime_role": role_arn,
+    }
+
+
+def ensure_artifact_share_gateway_target(
+    gateway_id: str,
+    agent_runtime_arn: str,
+    mcp_url: str,
+    gateway_role_arn: str,
+) -> Dict[str, str]:
+    """Attach Artifact Share MCP Runtime as a target on the project Gateway."""
+    return _ensure_mcp_gateway_target(
+        gateway_id=gateway_id,
+        target_name="artifact-share",
+        description="AgentCore Runtime MCP (S3 sharing / CloudFront URLs)",
+        agent_runtime_arn=agent_runtime_arn,
+        mcp_url=mcp_url,
+        gateway_role_arn=gateway_role_arn,
+        result_key="artifact_share_mcp_gateway_target_id",
+    )
+
+
+def deploy_artifact_share_mcp(
+    s3_bucket_name: str,
+    sharing_url: str = "",
+    gateway_info: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Build/push image, deploy MCP Runtime, attach it to the project IAM Gateway."""
+    role_arn = create_artifact_share_mcp_role()
+    repository, image_tag = push_artifact_share_mcp_image()
+    mcp_info = create_or_update_artifact_share_mcp_runtime(
+        role_arn=role_arn,
+        repository=repository,
+        image_tag=image_tag,
+        s3_bucket_name=s3_bucket_name,
+        sharing_url=sharing_url,
+    )
+    gw = dict(gateway_info or {})
+    if not gw.get("agentcore_gateway_id"):
+        gw.update(ensure_project_agentcore_gateway())
+    target_info = ensure_artifact_share_gateway_target(
+        gateway_id=gw["agentcore_gateway_id"],
+        agent_runtime_arn=mcp_info["agent_runtime_arn"],
+        mcp_url=mcp_info["artifact_share_mcp_url"],
+        gateway_role_arn=gw["agentcore_gateway_role"],
+    )
+    # Only copy shared gateway fields — do not overwrite this runtime's ARN/role/ECR.
+    for key in (
+        "agentcore_gateway_arn",
+        "agentcore_gateway_id",
+        "agentcore_gateway_role",
+    ):
+        if gw.get(key):
+            mcp_info[key] = gw[key]
+    mcp_info.update(target_info)
+    return mcp_info
+
+
+def refresh_artifact_share_mcp_env(
+    mcp_info: Dict[str, str],
+    s3_bucket_name: str,
+    sharing_url: str,
+) -> None:
+    """Update Artifact Share MCP runtime env after CloudFront URL is finalized."""
+    arn = mcp_info.get("agent_runtime_arn") or ""
+    if not arn:
+        return
+    runtime_name = _artifact_share_mcp_repository_name()
+    existing = _find_agent_runtime_by_name(runtime_name)
+    if not existing:
+        logger.warning("  Artifact Share MCP runtime not found for env refresh")
+        return
+    role_arn = mcp_info.get("agent_runtime_role") or ""
+    repository = mcp_info.get("ecr_repository") or runtime_name
+    image_tag = mcp_info.get("latest_image_tag")
+    if not image_tag or not role_arn:
+        logger.warning("  Skipping Artifact Share MCP env refresh (missing role/image tag)")
+        return
+    updated = create_or_update_artifact_share_mcp_runtime(
+        role_arn=role_arn,
+        repository=repository,
+        image_tag=image_tag,
+        s3_bucket_name=s3_bucket_name,
+        sharing_url=sharing_url,
+    )
+    mcp_info.update(updated)
+    gateway_id = mcp_info.get("agentcore_gateway_id") or ""
+    gateway_role = mcp_info.get("agentcore_gateway_role") or ""
+    if gateway_id and gateway_role and updated.get("artifact_share_mcp_url"):
+        target_info = ensure_artifact_share_gateway_target(
+            gateway_id=gateway_id,
+            agent_runtime_arn=updated["agent_runtime_arn"],
+            mcp_url=updated["artifact_share_mcp_url"],
+            gateway_role_arn=gateway_role,
+        )
+        mcp_info.update(target_info)
+
+
 def _s3_files_provisioner() -> s3_files_vpc.S3FilesVpcProvisioner:
     return s3_files_vpc.S3FilesVpcProvisioner(
         ec2_client=ec2_client,
@@ -1041,9 +2055,13 @@ def create_cloudfront_distribution(s3_bucket_name: str) -> Dict[str, str]:
     return {"id": distribution_id, "domain": distribution_domain}
 
 
-def create_harness_execution_role() -> str:
+def create_harness_execution_role(
+    knowledge_base_mcp_runtime_arn: Optional[str] = None,
+    artifact_share_mcp_runtime_arn: Optional[str] = None,
+    agentcore_gateway_arn: Optional[str] = None,
+) -> str:
     """Create IAM execution role for Bedrock AgentCore harness."""
-    logger.info("[3/9] Creating Harness execution IAM role")
+    logger.info("[9/14] Creating Harness execution IAM role")
     role_name = f"role-harness-for-{project_name}-{region}"
     if len(role_name) > 64:
         logger.error(
@@ -1153,7 +2171,7 @@ def create_harness_execution_role() -> str:
                 "Action": ["s3:GetObject"],
                 "Resource": [f"arn:aws:s3:::{_bucket_name()}/*"],
             },
-            # s3-sharing skill: put_object for CloudFront download URLs
+            # Sharing prefix writes (CloudFront); artifact-share MCP also uses its own role
             {
                 "Sid": "AgentCoreSharingS3PutObject",
                 "Effect": "Allow",
@@ -1166,6 +2184,49 @@ def create_harness_execution_role() -> str:
             },
         ],
     }
+
+    # Harness → Gateway (SigV4) → Knowledge Base MCP Runtime (SigV4).
+    # remote_mcp cannot call IAM AgentCore Runtime URLs (403 without SigV4).
+    if agentcore_gateway_arn:
+        harness_execution_policy["Statement"].append(
+            {
+                "Sid": "InvokeAgentCoreGateway",
+                "Effect": "Allow",
+                "Action": ["bedrock-agentcore:InvokeGateway"],
+                "Resource": [
+                    agentcore_gateway_arn,
+                    f"{agentcore_gateway_arn}/*",
+                ],
+            }
+        )
+    runtime_arns: List[str] = []
+    if knowledge_base_mcp_runtime_arn:
+        runtime_arns.extend(
+            [
+                knowledge_base_mcp_runtime_arn,
+                f"{knowledge_base_mcp_runtime_arn}/*",
+            ]
+        )
+    if artifact_share_mcp_runtime_arn:
+        runtime_arns.extend(
+            [
+                artifact_share_mcp_runtime_arn,
+                f"{artifact_share_mcp_runtime_arn}/*",
+            ]
+        )
+    if runtime_arns:
+        harness_execution_policy["Statement"].append(
+            {
+                "Sid": "InvokeProjectMcpRuntimes",
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore:InvokeAgentRuntime",
+                    "bedrock-agentcore:InvokeAgentRuntimeForUser",
+                ],
+                "Resource": runtime_arns,
+            }
+        )
+
     attach_inline_policy(
         role_name,
         f"harness-exec-inline-for-{role_name}",
@@ -1394,17 +2455,21 @@ BASE_SYSTEM_PROMPT = (
     "모르는 질문을 받으면 솔직히 모른다고 말합니다.\n"
     "한국어로 답변하세요.\n"
     "\n"
-    "생성된 artifact(PDF, DOCX, PNG, CSV 등)를 사용자에게 공유하거나 다운로드 링크를 제공할 때는 "
-    "반드시 s3-sharing SKILL을 사용하세요. "
-    "로컬 경로만 알려주지 말고, 해당 스킬로 S3에 업로드한 뒤 CloudFront 공유 URL을 전달하세요.\n"
+    "InvokeHarness 호출마다 systemPrompt에 actor_id와 ARTIFACTS_DIR이 명시됩니다.\n"
+    "- ARTIFACTS_DIR = /mnt/workspace/{actor_id}/artifacts\n"
+    "- 모든 산출물은 반드시 해당 ARTIFACTS_DIR 아래에 생성하세요.\n"
+    "knowledge-base retrieve와 artifact-share share_artifact를 호출할 때 "
+    "반드시 그 actor_id를 도구 인자로 그대로 사용하세요. "
+    "닉네임·표시 이름·추측 값으로 바꾸지 마세요.\n"
     "\n"
-    "An agent orchestrates the following workflow:\n"
-    "1. Receives user input\n"
-    "2. Processes the input using a language model\n"
-    "3. Decides whether to use tools to gather information or perform actions\n"
-    "4. Executes those tools and receives results\n"
-    "5. Continues reasoning with the new information\n"
-    "6. Produces a final response\n"
+    "## Agent Workflow\n"
+    "1. 사용자 입력을 받는다\n"
+    "2. 요청에 맞는 skill/도구가 있으면 해당 지침에 따라 작업을 수행한다\n"
+    "3. 코드 실행·파일 생성 시 반드시 ARTIFACTS_DIR(actor별 폴더) 아래에 산출물을 저장한다\n"
+    "4. 결과 파일이 있으면 artifact-share MCP의 share_artifact로 공유 URL을 제공한다 "
+    "(filepath는 'artifacts/파일명' 또는 ARTIFACTS_DIR 절대경로; actor_id 필수; "
+    "세션 스토리지에서 artifacts/{actor_id}/... 로 복사된다)\n"
+    "5. 최종 결과를 사용자에게 전달한다\n"
 )
 
 
@@ -1446,8 +2511,8 @@ def ensure_harness_memory_binding(harness_id: str, agent_memory_arn: str) -> Non
         f"Updating harness memory: {current!r} -> {agent_memory_arn!r} "
         f"(harnessId={harness_id})"
     )
-    agentcore_control_client.update_harness(
-        harnessId=harness_id,
+    update_harness_safe(
+        harness_id,
         memory={
             "optionalValue": {
                 "agentCoreMemoryConfiguration": {
@@ -1486,6 +2551,32 @@ def wait_for_harness_ready(harness_id: str, timeout_seconds: int = 300) -> str:
         time.sleep(5)
     raise TimeoutError(f"Harness {harness_id} did not reach READY within {timeout_seconds}s")
 
+
+def update_harness_safe(harness_id: str, *, timeout_seconds: int = 600, **kwargs) -> None:
+    """UpdateHarness only when READY; retry on ConflictException (still UPDATING)."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        remaining = max(30, int(deadline - time.time()))
+        wait_for_harness_ready(harness_id, timeout_seconds=remaining)
+        try:
+            agentcore_control_client.update_harness(
+                harnessId=harness_id,
+                **kwargs,
+            )
+            return
+        except ClientError as e:
+            code = (e.response.get("Error") or {}).get("Code", "")
+            msg = (e.response.get("Error") or {}).get("Message", "")
+            if code != "ConflictException" and "while it is UPDATING" not in msg:
+                raise
+            logger.warning(
+                "  UpdateHarness ConflictException (harness still UPDATING); "
+                "waiting and retrying..."
+            )
+            time.sleep(8)
+    raise TimeoutError(
+        f"Timed out updating harness {harness_id} within {timeout_seconds}s"
+    )
 
 def ensure_harness_environment(
     harness_id: str,
@@ -1527,8 +2618,8 @@ def ensure_harness_environment(
         f"  Updating harness environment: networkMode {current_mode!r} -> {desired_mode!r}, "
         f"s3FilesAccessPoint {'set' if desired_ap else 'none'}"
     )
-    agentcore_control_client.update_harness(
-        harnessId=harness_id,
+    update_harness_safe(
+        harness_id,
         environment=desired,
         environmentVariables=_harness_environment_variables(),
     )
@@ -1541,7 +2632,7 @@ def _harness_environment_variables(
     knowledge_base_id: str | None = None,
     data_source_id: str | None = None,
 ) -> Dict[str, str]:
-    """Env vars for Harness runtime (session storage + s3-sharing + KB)."""
+    """Env vars for Harness runtime (session storage + artifact-share + KB)."""
     env: Dict[str, str] = {
         "LOG_LEVEL": "info",
         "SESSION_STORAGE_DIR": s3_files_vpc.SESSION_STORAGE_MOUNT_PATH,
@@ -1570,7 +2661,7 @@ def ensure_harness_sharing_env(
         return
     url = (sharing_url or "").rstrip("/")
     if not url:
-        logger.warning("  SHARING_URL empty; s3-sharing will fall back to console URLs")
+        logger.warning("  SHARING_URL empty; artifact-share will fall back to console URLs")
     env_vars = _harness_environment_variables(
         s3_bucket_name=s3_bucket_name,
         sharing_url=url or None,
@@ -1578,12 +2669,12 @@ def ensure_harness_sharing_env(
         data_source_id=data_source_id,
     )
     logger.info(
-        f"  Updating harness env for s3-sharing/KB: "
+        f"  Updating harness env for artifact-share/KB: "
         f"S3_BUCKET={s3_bucket_name}, SHARING_URL={url or '(none)'}, "
         f"KNOWLEDGE_BASE_ID={knowledge_base_id or '(none)'}"
     )
-    agentcore_control_client.update_harness(
-        harnessId=harness_id,
+    update_harness_safe(
+        harness_id,
         environmentVariables=env_vars,
     )
 
@@ -1599,19 +2690,116 @@ def ensure_harness_system_prompt(harness_id: str) -> None:
         logger.info("  Harness systemPrompt already up to date")
         return
     logger.info(f"  Updating harness systemPrompt (harnessId={harness_id})")
-    agentcore_control_client.update_harness(
-        harnessId=harness_id,
+    update_harness_safe(
+        harness_id,
         systemPrompt=desired,
     )
 
+
+def _default_harness_tools(
+    agentcore_gateway_arn: Optional[str] = None,
+) -> List[Dict]:
+    """Default CreateHarness / UpdateHarness tools list."""
+    tools: List[Dict] = [
+        {
+            "type": "remote_mcp",
+            "name": "exa",
+            "config": {"remoteMcp": {"url": "https://mcp.exa.ai/mcp"}},
+        },
+        {
+            "type": "remote_mcp",
+            "name": "aws_knowledge",
+            "config": {
+                "remoteMcp": {
+                    "url": "https://knowledge-mcp.global.api.aws",
+                }
+            },
+        },
+        {
+            "type": "agentcore_browser",
+            "name": "browser",
+            "config": {"agentCoreBrowser": {}},
+        },
+        {
+            "type": "agentcore_code_interpreter",
+            "name": "code",
+            "config": {"agentCoreCodeInterpreter": {}},
+        },
+    ]
+    if agentcore_gateway_arn:
+        tools.append(
+            {
+                "type": "agentcore_gateway",
+                "name": "knowledge_base",
+                "config": {
+                    "agentCoreGateway": {
+                        "gatewayArn": agentcore_gateway_arn,
+                        "outboundAuth": {"awsIam": {}},
+                    }
+                },
+            }
+        )
+    return tools
+
+
+def ensure_harness_tools(
+    harness_id: str,
+    agentcore_gateway_arn: Optional[str] = None,
+) -> None:
+    """Ensure Knowledge Base MCP Gateway (and defaults) are present on the harness."""
+    desired = _default_harness_tools(agentcore_gateway_arn)
+    h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
+    current = h.get("tools") or []
+    current_by_name = {
+        t.get("name"): t for t in current if isinstance(t, dict) and t.get("name")
+    }
+    changed = False
+    for tool in desired:
+        name = tool.get("name")
+        existing = current_by_name.get(name)
+        if not existing:
+            changed = True
+            break
+        if name == "knowledge_base":
+            cur_arn = (
+                ((existing.get("config") or {}).get("agentCoreGateway") or {}).get(
+                    "gatewayArn"
+                )
+            )
+            new_arn = (
+                ((tool.get("config") or {}).get("agentCoreGateway") or {}).get(
+                    "gatewayArn"
+                )
+            )
+            if cur_arn != new_arn or existing.get("type") != "agentcore_gateway":
+                changed = True
+                break
+    if not changed and agentcore_gateway_arn:
+        logger.info("  Harness tools already include agentcore gateway")
+        return
+    if not agentcore_gateway_arn and not changed:
+        return
+
+    logger.info(
+        f"  Updating harness tools "
+        f"(agentcore gateway={'set' if agentcore_gateway_arn else 'none'})"
+    )
+    merged_by_name = dict(current_by_name)
+    for tool in desired:
+        merged_by_name[tool["name"]] = tool
+    update_harness_safe(
+        harness_id,
+        tools=list(merged_by_name.values()),
+    )
 
 def create_or_get_harness(
     execution_role_arn: str,
     agent_memory_arn: str,
     s3_files_info: Optional[Dict[str, object]] = None,
+    agentcore_gateway_arn: Optional[str] = None,
 ) -> Dict[str, str]:
     """Create AgentCore Harness or reuse an existing one by API name."""
-    logger.info("[8/9] Creating AgentCore Harness")
+    logger.info("[8/12] Creating AgentCore Harness")
 
     harness_api_name = harness_name_for_api(project_name)
     logger.info(f"  harnessName: {harness_api_name} (from projectName={project_name!r})")
@@ -1619,6 +2807,7 @@ def create_or_get_harness(
     model_id = DEFAULT_MODEL_ID
     system_prompt = [{"text": BASE_SYSTEM_PROMPT}]
     environment = s3_files_vpc.build_harness_runtime_environment(s3_files_info)
+    tools = _default_harness_tools(agentcore_gateway_arn)
 
     existing = find_harness_by_api_name(harness_api_name)
     if existing:
@@ -1684,32 +2873,7 @@ def create_or_get_harness(
                     }
                 },
                 systemPrompt=system_prompt,
-                tools=[
-                    {
-                        "type": "remote_mcp",
-                        "name": "exa",
-                        "config": {"remoteMcp": {"url": "https://mcp.exa.ai/mcp"}},
-                    },
-                    {
-                        "type": "remote_mcp",
-                        "name": "aws_knowledge",
-                        "config": {
-                            "remoteMcp": {
-                                "url": "https://knowledge-mcp.global.api.aws",
-                            }
-                        },
-                    },
-                    {
-                        "type": "agentcore_browser",
-                        "name": "browser",
-                        "config": {"agentCoreBrowser": {}},
-                    },
-                    {
-                        "type": "agentcore_code_interpreter",
-                        "name": "code",
-                        "config": {"agentCoreCodeInterpreter": {}},
-                    },
-                ],
+                tools=tools,
                 memory={
                     "agentCoreMemoryConfiguration": {
                         "arn": agent_memory_arn,
@@ -1747,6 +2911,7 @@ def create_or_get_harness(
     ensure_harness_memory_binding(harness_id, agent_memory_arn)
     ensure_harness_environment(harness_id, environment)
     ensure_harness_system_prompt(harness_id)
+    ensure_harness_tools(harness_id, agentcore_gateway_arn)
     harness_arn = wait_for_harness_ready(harness_id)
 
     return {
@@ -1797,6 +2962,8 @@ def build_config_from_deployment_state(
     data_source_id: Optional[str] = None,
     knowledge_base_role_arn: Optional[str] = None,
     s3_vectors_info: Optional[Dict[str, str]] = None,
+    knowledge_base_mcp_info: Optional[Dict[str, str]] = None,
+    artifact_share_mcp_info: Optional[Dict[str, str]] = None,
 ) -> Dict:
     config_data: Dict = {
         "projectName": project_name,
@@ -1861,6 +3028,96 @@ def build_config_from_deployment_state(
         config_data["vector_bucket_arn"] = s3_vectors_info.get("vectorBucketArn", "")
         config_data["vector_index_name"] = s3_vectors_info.get("indexName", "")
         config_data["vector_index_arn"] = s3_vectors_info.get("indexArn", "")
+    if knowledge_base_mcp_info:
+        if knowledge_base_mcp_info.get("agent_runtime_arn"):
+            config_data["knowledge_base_mcp_runtime_arn"] = knowledge_base_mcp_info[
+                "agent_runtime_arn"
+            ]
+        if knowledge_base_mcp_info.get("knowledge_base_mcp_url"):
+            config_data["knowledge_base_mcp_url"] = knowledge_base_mcp_info[
+                "knowledge_base_mcp_url"
+            ]
+        if knowledge_base_mcp_info.get("agentcore_gateway_arn"):
+            config_data["agentcore_gateway_arn"] = knowledge_base_mcp_info[
+                "agentcore_gateway_arn"
+            ]
+        if knowledge_base_mcp_info.get("agentcore_gateway_id"):
+            config_data["agentcore_gateway_id"] = knowledge_base_mcp_info[
+                "agentcore_gateway_id"
+            ]
+        if knowledge_base_mcp_info.get("agentcore_gateway_role"):
+            config_data["agentcore_gateway_role"] = knowledge_base_mcp_info[
+                "agentcore_gateway_role"
+            ]
+        if knowledge_base_mcp_info.get("knowledge_base_mcp_gateway_target_id"):
+            config_data["knowledge_base_mcp_gateway_target_id"] = (
+                knowledge_base_mcp_info["knowledge_base_mcp_gateway_target_id"]
+            )
+        if knowledge_base_mcp_info.get("agent_runtime_role"):
+            config_data["knowledge_base_mcp_role"] = knowledge_base_mcp_info[
+                "agent_runtime_role"
+            ]
+        if knowledge_base_mcp_info.get("ecr_repository"):
+            config_data["knowledge_base_mcp_ecr_repository"] = knowledge_base_mcp_info[
+                "ecr_repository"
+            ]
+        if knowledge_base_mcp_info.get("latest_image_tag"):
+            config_data["knowledge_base_mcp_image_tag"] = knowledge_base_mcp_info[
+                "latest_image_tag"
+            ]
+    if artifact_share_mcp_info:
+        if artifact_share_mcp_info.get("agent_runtime_arn"):
+            config_data["artifact_share_mcp_runtime_arn"] = artifact_share_mcp_info[
+                "agent_runtime_arn"
+            ]
+        if artifact_share_mcp_info.get("artifact_share_mcp_url"):
+            config_data["artifact_share_mcp_url"] = artifact_share_mcp_info[
+                "artifact_share_mcp_url"
+            ]
+        if artifact_share_mcp_info.get("artifact_share_mcp_gateway_target_id"):
+            config_data["artifact_share_mcp_gateway_target_id"] = artifact_share_mcp_info[
+                "artifact_share_mcp_gateway_target_id"
+            ]
+        if artifact_share_mcp_info.get("agent_runtime_role"):
+            config_data["artifact_share_mcp_role"] = artifact_share_mcp_info[
+                "agent_runtime_role"
+            ]
+        if artifact_share_mcp_info.get("ecr_repository"):
+            config_data["artifact_share_mcp_ecr_repository"] = artifact_share_mcp_info[
+                "ecr_repository"
+            ]
+        if artifact_share_mcp_info.get("latest_image_tag"):
+            config_data["artifact_share_mcp_image_tag"] = artifact_share_mcp_info[
+                "latest_image_tag"
+            ]
+        for legacy in (
+            "s3_sharing_mcp_runtime_arn",
+            "s3_sharing_mcp_url",
+            "s3_sharing_mcp_role",
+            "s3_sharing_mcp_ecr_repository",
+            "s3_sharing_mcp_image_tag",
+            "s3_sharing_mcp_gateway_target_id",
+        ):
+            config_data.pop(legacy, None)
+        # Prefer gateway fields from either MCP deploy (shared project gateway).
+        if artifact_share_mcp_info.get("agentcore_gateway_arn") and not config_data.get(
+            "agentcore_gateway_arn"
+        ):
+            config_data["agentcore_gateway_arn"] = artifact_share_mcp_info[
+                "agentcore_gateway_arn"
+            ]
+        if artifact_share_mcp_info.get("agentcore_gateway_id") and not config_data.get(
+            "agentcore_gateway_id"
+        ):
+            config_data["agentcore_gateway_id"] = artifact_share_mcp_info[
+                "agentcore_gateway_id"
+            ]
+        if artifact_share_mcp_info.get("agentcore_gateway_role") and not config_data.get(
+            "agentcore_gateway_role"
+        ):
+            config_data["agentcore_gateway_role"] = artifact_share_mcp_info[
+                "agentcore_gateway_role"
+            ]
     return config_data
 
 
@@ -1902,6 +3159,8 @@ def main():
     s3_vectors_info = None
     knowledge_base_id = None
     data_source_id = None
+    knowledge_base_mcp_info = None
+    artifact_share_mcp_info = None
     execution_role_arn = None
     agentcore_memory_role_arn = None
     memory_id = None
@@ -1927,7 +3186,36 @@ def main():
             s3_vectors_info, knowledge_base_role_arn, s3_bucket_name
         )
 
-        execution_role_arn = create_harness_execution_role()
+        # Prefer existing sharing_url from a prior install when building MCP image env.
+        prior_sharing_url = ""
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                prior_sharing_url = (json.load(f).get("sharing_url") or "").rstrip("/")
+        except Exception:
+            pass
+
+        knowledge_base_mcp_info = deploy_knowledge_base_mcp(
+            knowledge_base_id=knowledge_base_id,
+            sharing_url=prior_sharing_url,
+        )
+        artifact_share_mcp_info = deploy_artifact_share_mcp(
+            s3_bucket_name=s3_bucket_name,
+            sharing_url=prior_sharing_url,
+            gateway_info=knowledge_base_mcp_info,
+        )
+
+        execution_role_arn = create_harness_execution_role(
+            knowledge_base_mcp_runtime_arn=knowledge_base_mcp_info.get(
+                "agent_runtime_arn"
+            ),
+            artifact_share_mcp_runtime_arn=artifact_share_mcp_info.get(
+                "agent_runtime_arn"
+            ),
+            agentcore_gateway_arn=knowledge_base_mcp_info.get(
+                "agentcore_gateway_arn"
+            )
+            or artifact_share_mcp_info.get("agentcore_gateway_arn"),
+        )
         execution_role_name = f"role-harness-for-{project_name}-{region}"
         agentcore_memory_role_arn = create_agentcore_memory_role()
         memory_id = create_agentcore_memory(agentcore_memory_role_arn)
@@ -1948,16 +3236,35 @@ def main():
             execution_role_arn,
             agent_memory_arn,
             s3_files_info=s3_files_info,
+            agentcore_gateway_arn=knowledge_base_mcp_info.get(
+                "agentcore_gateway_arn"
+            ),
         )
         logger.info("[9/12] Creating project S3 CloudFront (file sharing)")
         cloudfront_info = create_cloudfront_distribution(s3_bucket_name)
+        sharing_url = f"https://{cloudfront_info.get('domain', '')}".rstrip("/")
         ensure_harness_sharing_env(
             harness_info["harness_id"],
             s3_bucket_name,
-            f"https://{cloudfront_info.get('domain', '')}",
+            sharing_url,
             knowledge_base_id=knowledge_base_id,
             data_source_id=data_source_id,
         )
+        if sharing_url and sharing_url != prior_sharing_url:
+            if knowledge_base_mcp_info:
+                logger.info("Refreshing Knowledge Base MCP SHARING_URL")
+                refresh_knowledge_base_mcp_env(
+                    knowledge_base_mcp_info,
+                    knowledge_base_id=knowledge_base_id,
+                    sharing_url=sharing_url,
+                )
+            if artifact_share_mcp_info:
+                logger.info("Refreshing Artifact Share MCP SHARING_URL")
+                refresh_artifact_share_mcp_env(
+                    artifact_share_mcp_info,
+                    s3_bucket_name=s3_bucket_name,
+                    sharing_url=sharing_url,
+                )
 
         if args.skip_ecs:
             logger.warning("Skipping ECS Web UI deployment (--skip-ecs)")
@@ -2001,6 +3308,8 @@ def main():
                 data_source_id=data_source_id,
                 knowledge_base_role_arn=knowledge_base_role_arn,
                 s3_vectors_info=s3_vectors_info,
+                knowledge_base_mcp_info=knowledge_base_mcp_info,
+                artifact_share_mcp_info=artifact_share_mcp_info,
             )
             if write_config(CONFIG_PATH, app_environment):
                 logger.info(
@@ -2050,6 +3359,18 @@ def main():
         logger.info(f"  Knowledge Base ID: {knowledge_base_id}")
         logger.info(f"  Data Source ID: {data_source_id}")
         logger.info(f"  Knowledge Base Role: {knowledge_base_role_arn}")
+        logger.info(
+            f"  Knowledge Base MCP Runtime: "
+            f"{(knowledge_base_mcp_info or {}).get('agent_runtime_arn')}"
+        )
+        logger.info(
+            f"  Artifact Share MCP Runtime: "
+            f"{(artifact_share_mcp_info or {}).get('agent_runtime_arn')}"
+        )
+        logger.info(
+            f"  AgentCore Gateway: "
+            f"{(knowledge_base_mcp_info or {}).get('agentcore_gateway_arn')}"
+        )
         logger.info(f"  Vector Bucket: {s3_vectors_info.get('vectorBucketName')}")
         logger.info(f"  Vector Index: {s3_vectors_info.get('indexName')}")
         logger.info(f"  VPC: {vpc_info.get('vpc_id')}")
@@ -2107,6 +3428,8 @@ def main():
             data_source_id=data_source_id,
             knowledge_base_role_arn=knowledge_base_role_arn,
             s3_vectors_info=s3_vectors_info,
+            knowledge_base_mcp_info=knowledge_base_mcp_info,
+            artifact_share_mcp_info=artifact_share_mcp_info,
         )
         if app_environment is not None:
             config_data = {**app_environment, **config_data}

@@ -380,6 +380,7 @@ def _run_harness_thread(
     message_queue: queue.Queue,
     result_holder: dict[str, Any],
     files: list[str] | None = None,
+    actor_id: str | None = None,
 ) -> None:
     sink = QueueNotificationSink(message_queue)
 
@@ -394,6 +395,7 @@ def _run_harness_thread(
             skill_list=skill_list,
             mcp_servers=mcp_servers,
             runtime_session_id=runtime_session_id,
+            actor_id=actor_id,
             files=files or [],
         )
         if not isinstance(response, str):
@@ -437,6 +439,7 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
             "message_queue": message_queue,
             "result_holder": result_holder,
             "files": files,
+            "actor_id": user_id,
         },
         daemon=True,
     )

@@ -638,6 +638,48 @@ def build_harness_prompt_with_files(prompt: str, files: list | None = None) -> s
     return f"{text}\n\n[첨부 이미지 URL]\n{urls}"
 
 
+_HARNESS_SYSTEM_PROMPT_BASE = (
+    "당신의 이름은 서연이고, 질문에 친근한 방식으로 대답하도록 설계된 대화형 AI입니다.\n"
+    "상황에 맞는 구체적인 세부 정보를 충분히 제공합니다.\n"
+    "모르는 질문을 받으면 솔직히 모른다고 말합니다.\n"
+    "한국어로 답변하세요.\n"
+    "\n"
+    "## Agent Workflow\n"
+    "1. 사용자 입력을 받는다\n"
+    "2. 요청에 맞는 skill/도구가 있으면 해당 지침에 따라 작업을 수행한다\n"
+    "3. 코드 실행·파일 생성 시 반드시 ARTIFACTS_DIR(actor별 폴더) 아래에 산출물을 저장한다\n"
+    "4. 결과 파일이 있으면 artifact-share MCP의 share_artifact로 공유 URL을 제공한다 "
+    "(filepath는 'artifacts/파일명' 또는 ARTIFACTS_DIR 절대경로; actor_id 필수; "
+    "세션 스토리지에서 artifacts/{actor_id}/... 로 복사된다)\n"
+    "5. 최종 결과를 사용자에게 전달한다\n"
+)
+
+
+def build_harness_system_prompt(actor_id: str | None = None) -> list[dict]:
+    """Build InvokeHarness systemPrompt with actor_id and ARTIFACTS_DIR paths."""
+    text = _HARNESS_SYSTEM_PROMPT_BASE
+    aid = (actor_id or "").strip()
+    if aid:
+        artifacts_dir = f"/mnt/workspace/{aid}/artifacts"
+        text += (
+            "\n"
+            f"actor_id: {aid}\n"
+            "\n"
+            "## Paths (use absolute paths when writing files)\n"
+            f"- SESSION_STORAGE_DIR: /mnt/workspace\n"
+            f"- ARTIFACTS_DIR: {artifacts_dir}\n"
+            f"모든 산출물(PDF, DOCX, PNG, CSV, drawio 등)은 반드시 ARTIFACTS_DIR "
+            f"({artifacts_dir}) 아래에 생성하세요. "
+            f"다른 actor의 폴더나 /mnt/workspace 루트에 쓰지 마세요.\n"
+            f"Example: write/save to '{artifacts_dir}/report.pdf'\n"
+            "\n"
+            "knowledge-base ``retrieve``와 artifact-share ``share_artifact``를 "
+            f"호출할 때 actor_id 인자에는 반드시 위 값(\"{aid}\")을 그대로 사용하세요. "
+            "닉네임·표시 이름·추측 값으로 바꾸지 마세요.\n"
+        )
+    return [{"text": text}]
+
+
 def run_harness(
     prompt,
     notification_queue=None,
@@ -656,6 +698,8 @@ def run_harness(
 
     skill_list / mcp_servers override harness defaults for this invocation when provided.
     files: optional CloudFront/S3 image URLs attached in the chat UI.
+    actor_id: account login id (cookie); used as InvokeHarness actorId and embedded
+    in systemPrompt for RAG/S3 MCP tools.
     """
     tool_info_list.clear()
     tool_result_list.clear()
@@ -680,8 +724,15 @@ def run_harness(
 
     # Prefer per-call session (React task id); fall back to module default.
     session_id = (runtime_session_id or "").strip() or globals()["runtime_session_id"]
-    resolved_actor = (actor_id or projectName or "harness").replace("-", "_")
+    # Keep actor_id unchanged (must match KB owner / S3 key). Only sanitize the
+    # projectName fallback for ActorId character constraints.
+    resolved_actor = (actor_id or "").strip()
+    if not resolved_actor:
+        resolved_actor = (projectName or "harness").replace("-", "_")
     effective_prompt = build_harness_prompt_with_files(prompt, files)
+    system_prompt = build_harness_system_prompt(
+        (actor_id or "").strip() or None
+    )
 
     try:
         import skill as skill_mod
@@ -707,6 +758,7 @@ def run_harness(
         logger.info(f"invoke_harness skills: {skills}")
         logger.info(f"invoke_harness tools: {tools}")
         logger.info(f"invoke_harness model: {model_cfg}")
+        logger.info(f"invoke_harness actor_id: {resolved_actor}")
         logger.debug(
             f"invoke_harness: harnessArn: {harness_arn}, session: {session_id}, "
             f"actorId: {resolved_actor}, prompt_len: {len(effective_prompt or '')}, "
@@ -718,6 +770,7 @@ def run_harness(
             "runtimeSessionId": session_id,
             "actorId": resolved_actor,
             "model": model_cfg,
+            "systemPrompt": system_prompt,
             "messages": [
                 {
                     "role": "user",
@@ -854,10 +907,6 @@ def run_harness(
                                 tool_input_buffers[tid] = (
                                     tool_input_buffers.get(tid, "") + tin
                                 )
-                                logger.info(
-                                    f"[tool_input] {name}, toolUseId: {tid}, "
-                                    f"input: {_json_preview(tool_input_buffers[tid], 4000)}"
-                                )
                                 if notification_queue is not None:
                                     tool_slot_update(
                                         notification_queue,
@@ -865,7 +914,7 @@ def run_harness(
                                         f"Tool: {name}, Input: {tool_input_buffers[tid]}",
                                     )
                             else:
-                                logger.info(
+                                logger.debug(
                                     f"[tool_input_delta] contentBlockIndex: {idx}, "
                                     f"fragment: {_json_preview(tin, 1600)}"
                                 )
@@ -894,10 +943,6 @@ def run_harness(
                                     buf += _json_preview(tr_part, 8000)
                                 tool_result_buffers[tid] = buf
                                 tname = tool_name_list.get(tid, "")
-                                logger.info(
-                                    f"[tool_result] {tname}, toolUseId: {tid}, "
-                                    f"body: {_json_preview(buf, 5000)}"
-                                )
                                 if notification_queue is not None:
                                     tool_slot_update(
                                         notification_queue,
@@ -911,10 +956,6 @@ def run_harness(
                                 if urls:
                                     for url in urls:
                                         image_url.append(url)
-                                if content:
-                                    logger.info(
-                                        f"tool_result: parsed_content_len: {len(content)}"
-                                    )
                     if "reasoningContent" in delta:
                         rc = delta["reasoningContent"]
                         if isinstance(rc, dict):
@@ -929,10 +970,34 @@ def run_harness(
 
                 elif "contentBlockStop" in event:
                     cbe = event["contentBlockStop"]
+                    idx = cbe.get("contentBlockIndex")
                     logger.debug(
-                        f"contentBlockStop: contentBlockIndex: {cbe.get('contentBlockIndex')}, "
+                        f"contentBlockStop: contentBlockIndex: {idx}, "
                         f"full: {_json_preview(cbe, 800)}"
                     )
+                    # Log final tool input / result once when the block completes
+                    if idx is not None:
+                        pair = block_tool_use.get(idx)
+                        if pair:
+                            tid, name = pair
+                            final_input = tool_input_buffers.get(tid, "")
+                            logger.info(
+                                f"[tool_input] {name}, toolUseId: {tid}, "
+                                f"input: {_json_preview(final_input, 4000)}"
+                            )
+                        tid = block_tool_result.get(idx)
+                        if tid:
+                            tname = tool_name_list.get(tid, "")
+                            buf = tool_result_buffers.get(tid, "")
+                            logger.info(
+                                f"[tool_result] {tname}, toolUseId: {tid}, "
+                                f"body: {_json_preview(buf, 5000)}"
+                            )
+                            content, _, _ = get_tool_info(tname, buf)
+                            if content:
+                                logger.info(
+                                    f"tool_result: parsed_content_len: {len(content)}"
+                                )
 
                 elif "messageStop" in event:
                     ms = event["messageStop"]

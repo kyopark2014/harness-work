@@ -2,11 +2,11 @@
   "MCP": [
     "websearch",
     "aws_documentation",
-    "code interpreter"
+    "knowledge base",
+    "artifact-share"
   ],
   "SKILL": [
     "docx",
-    "korea-weather",
-    "s3-sharing"
+    "korea-weather"
   ]
 }
