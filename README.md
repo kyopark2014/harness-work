@@ -637,6 +637,17 @@ response = client.invoke_harness(**invoke_kwargs)
 
 ---
 
+## 실행 결과
+
+Agent 실행시 sidebar에서 task별로 session이 분리된 대화를 이어갈수 있습니다.
+
+<img width="1000" alt="image" src="https://github.com/user-attachments/assets/001d1b20-4632-414d-a420-e024cad51f06" />
+
+대화 corpus로부터 graph를 추출하여 생성한 Knowledge Graph 입니다.
+
+<img width="1000" alt="knowledge_graph" src="https://github.com/user-attachments/assets/e109e818-54d7-4835-9e72-7792bb6f3639" />
+
+
 ## 관련 문서
 
 - [AgentCore Harness 개요](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness.html)
@@ -648,3 +659,4 @@ response = client.invoke_harness(**invoke_kwargs)
 - [Strands Agents](https://strandsagents.com/)
 - [Boto3 CreateHarness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/create_harness.html)
 - [Boto3 InvokeHarness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore/client/invoke_harness.html)
+<img width="1089" height="680" alt="knowledge_graph" src="https://github.com/user-attachments/assets/6f27a764-c612-4556-93d4-3ca34ce46701" />
