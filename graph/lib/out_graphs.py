@@ -34,12 +34,23 @@ def _load_graph(path: Path) -> nx.Graph:
 
 
 def _author_of(node_id: str, data: dict[str, Any]) -> str:
-    author = (data.get("author") or "").strip()
-    if author:
-        return author
+    # Prefer explicit provenance fields (LLM may put user_id in either).
+    for key in ("author", "contributor"):
+        value = (data.get(key) or "").strip()
+        if value:
+            return value
+
+    # Filename patterns from lib.corpus.turn_filename:
+    #   stable: turn-{user}-{msg_id}.md
+    #   legacy: turn-{index:04d}-{user}-{title}-{id8}.md
     source = data.get("source_file") or ""
-    m = re.search(r"turn-\d+-([^-/]+)", source)
+    name = Path(source).name if source else ""
+    haystack = f"{name}\n{source}\n{node_id}"
+    m = re.search(r"turn-\d+-([^-/]+)", haystack)
     if m:
+        return m.group(1)
+    m = re.search(r"turn-([^-/\s]+)-", haystack)
+    if m and not m.group(1).isdigit():
         return m.group(1)
     return "unknown"
 
