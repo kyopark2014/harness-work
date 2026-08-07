@@ -4,10 +4,12 @@ import { useTheme } from "../hooks/useTheme";
 import type { Theme } from "../theme";
 import type { AppConfig, Task } from "../types";
 import { ConfigDrawer } from "./ConfigDrawer";
+import { KnowledgeGraphModal } from "./KnowledgeGraphModal";
 import { TaskListItem } from "./TaskListItem";
 import {
   AppearanceIcon,
   ChevronIcon,
+  KnowledgeGraphIcon,
   LogoutIcon,
   McpIcon,
   ModelIcon,
@@ -36,6 +38,7 @@ interface Props {
   config: AppConfig | null;
   drawer: DrawerKind;
   open: boolean;
+  knowledgeGraphEnabled?: boolean;
   onClose: () => void;
   onNewTask: () => void;
   onSelectTask: (id: string) => void;
@@ -44,6 +47,7 @@ interface Props {
   onPatchTask: (taskId: string, patch: Partial<Task>) => void | Promise<void>;
   onDeleteTask: (taskId: string) => void;
   onLogout: () => void;
+  onPatchKnowledgeGraphEnabled?: (enabled: boolean) => void | Promise<void>;
 }
 
 export function Sidebar({
@@ -53,6 +57,7 @@ export function Sidebar({
   config,
   drawer,
   open,
+  knowledgeGraphEnabled = true,
   onClose,
   onNewTask,
   onSelectTask,
@@ -61,6 +66,7 @@ export function Sidebar({
   onPatchTask,
   onDeleteTask,
   onLogout,
+  onPatchKnowledgeGraphEnabled,
 }: Props) {
   const skillBtnRef = useRef<HTMLButtonElement>(null);
   const mcpBtnRef = useRef<HTMLButtonElement>(null);
@@ -68,6 +74,7 @@ export function Sidebar({
   const appearanceBtnRef = useRef<HTMLButtonElement>(null);
   const settingsSectionRef = useRef<HTMLDivElement>(null);
   const [settingsExpanded, setSettingsExpanded] = useState(false);
+  const [knowledgeGraphOpen, setKnowledgeGraphOpen] = useState(false);
   const { theme, setTheme } = useTheme();
   const skills = activeTask?.skills ?? config?.default_skills ?? [];
   const mcpServers = activeTask?.mcp_servers ?? config?.default_mcp_servers ?? [];
@@ -124,14 +131,37 @@ export function Sidebar({
     setSettingsExpanded(false);
   }
 
+  function handleSettingApplied() {
+    setSettingsExpanded(false);
+  }
+
   return (
     <>
       <aside className={`sidebar${open ? " sidebar-panel-open" : ""}`}>
         <div className="sidebar-header">
           <div className="brand-row">
-            <div className="brand" title={brandTitle} aria-label={brandTitle}>
+            <button
+              type="button"
+              className={`brand brand-graph-btn${knowledgeGraphEnabled ? "" : " is-disabled"}`}
+              title={
+                knowledgeGraphEnabled
+                  ? "Knowledge Graph 보기"
+                  : "Knowledge Graph가 꺼져 있습니다"
+              }
+              aria-label={
+                knowledgeGraphEnabled
+                  ? `${brandTitle} Knowledge Graph 보기`
+                  : brandTitle
+              }
+              aria-disabled={!knowledgeGraphEnabled}
+              onClick={() => {
+                if (!knowledgeGraphEnabled) return;
+                collapseSettings();
+                setKnowledgeGraphOpen(true);
+              }}
+            >
               {brandTitle}
-            </div>
+            </button>
             <div className="sidebar-header-actions">
               <button
                 type="button"
@@ -249,6 +279,24 @@ export function Sidebar({
                 <McpIcon className="sidebar-icon" />
                 <span>MCP ({mcpServers.length})</span>
               </button>
+              <label className="sidebar-menu-btn settings-toggle">
+                <KnowledgeGraphIcon className="sidebar-icon" />
+                <span>Knowledge Graph</span>
+                <input
+                  type="checkbox"
+                  checked={knowledgeGraphEnabled}
+                  onChange={(e) => {
+                    const enabled = e.target.checked;
+                    void (async () => {
+                      try {
+                        await onPatchKnowledgeGraphEnabled?.(enabled);
+                      } finally {
+                        handleSettingApplied();
+                      }
+                    })();
+                  }}
+                />
+              </label>
               <button
                 ref={appearanceBtnRef}
                 type="button"
@@ -309,6 +357,14 @@ export function Sidebar({
             if (next[0]) setTheme(labelToTheme(next[0]));
           }}
           onClose={handleDrawerClose}
+        />
+      )}
+
+      {knowledgeGraphOpen && knowledgeGraphEnabled && (
+        <KnowledgeGraphModal
+          userId={userId}
+          title={`${brandTitle} Knowledge Graph`}
+          onClose={() => setKnowledgeGraphOpen(false)}
         />
       )}
     </>

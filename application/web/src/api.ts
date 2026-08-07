@@ -48,6 +48,26 @@ export interface SessionInfo {
   knowledge_graph_enabled?: boolean;
 }
 
+export interface GraphStatus {
+  user_id: string;
+  exists: boolean;
+  path: string | null;
+  status:
+    | "idle"
+    | "queued"
+    | "running"
+    | "ready"
+    | "error"
+    | "skipped_cooldown"
+    | "disabled"
+    | string;
+  enabled?: boolean;
+  error?: string | null;
+  last_success_at?: string | null;
+  cooldown_seconds?: number;
+  next_eligible_at?: string | null;
+}
+
 export interface FileUploadResult {
   ok: boolean;
   file_name: string;
@@ -82,6 +102,16 @@ export const api = {
       body: JSON.stringify({ user_id }),
     }),
   clearSession: () => request<void>("/api/session", { method: "DELETE" }),
+  patchSessionSettings: (body: { knowledge_graph_enabled?: boolean }) =>
+    request<SessionInfo>("/api/session/settings", {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  getGraphStatus: () => request<GraphStatus>("/api/graph/status"),
+  rebuildGraph: (force = false) =>
+    request<GraphStatus>(`/api/graph/rebuild${force ? "?force=1" : ""}`, {
+      method: "POST",
+    }),
   getConfig: () => request<AppConfig>("/api/config"),
   listTasks: () => request<{ tasks: Task[] }>("/api/tasks"),
   createTask: (body: Partial<Task>) =>

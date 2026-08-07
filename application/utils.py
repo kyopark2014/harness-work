@@ -20,6 +20,17 @@ config_path = os.path.join(script_dir, "config.json")
 favorite_tools_path = os.path.join(script_dir, "favorite_tools.json")
 
 
+def _default_session_storage_dir() -> str:
+    """Prefer shared S3 Files mount (AgentCore /mnt/workspace or ECS /mnt/app-data)."""
+    for candidate in ("/mnt/workspace", "/mnt/app-data"):
+        if os.path.isdir(candidate):
+            return candidate
+    return os.path.join(script_dir, ".session_storage")
+
+
+SESSION_STORAGE_DIR = os.environ.get("SESSION_STORAGE_DIR") or _default_session_storage_dir()
+
+
 def load_config():
     config = None
     try:
@@ -111,6 +122,93 @@ def sanitize_user_path_segment(user_id: str | None) -> str | None:
         raw.replace("/", "_").replace("\\", "_").replace("..", "_")
     )
     return segment or None
+
+
+def get_user_graph_dir(user_id: str | None) -> str:
+    """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/graph (does not create)."""
+    segment = sanitize_user_path_segment(user_id)
+    if not segment:
+        segment = "default"
+    return os.path.join(SESSION_STORAGE_DIR, segment, "graph")
+
+
+def ensure_user_graph_dir(user_id: str | None) -> str:
+    """Create session graph workspace: corpus/ + out/.
+
+    Returns the graph root: {SESSION_STORAGE_DIR}/{user_id}/graph
+    """
+    segment = sanitize_user_path_segment(user_id)
+    if not segment:
+        raise ValueError(
+            "Invalid user_id for graph path; expected a plain user id, "
+            "not a signed session cookie"
+        )
+    graph_dir = os.path.join(SESSION_STORAGE_DIR, segment, "graph")
+    for name in ("corpus", "out"):
+        os.makedirs(os.path.join(graph_dir, name), exist_ok=True)
+    logger.info("user graph dir ready: %s", graph_dir)
+    return graph_dir
+
+
+def user_graph_html_path(user_id: str | None) -> str:
+    """Published HTML: {SESSION_STORAGE_DIR}/{user_id}/graph/out/graph.html"""
+    segment = sanitize_user_path_segment(user_id) or "default"
+    return os.path.join(SESSION_STORAGE_DIR, segment, "graph", "out", "graph.html")
+
+
+_DEFAULT_USER_SETTINGS: dict[str, bool] = {
+    "knowledge_graph_enabled": True,
+}
+
+
+def get_user_settings_path(user_id: str | None) -> str:
+    """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/settings.json (does not create)."""
+    segment = sanitize_user_path_segment(user_id) or "default"
+    return os.path.join(SESSION_STORAGE_DIR, segment, "settings.json")
+
+
+def load_user_settings(user_id: str | None) -> dict[str, bool]:
+    """Load per-user UI/feature settings. Missing file → defaults (KG on)."""
+    settings = dict(_DEFAULT_USER_SETTINGS)
+    path = get_user_settings_path(user_id)
+    if not os.path.isfile(path):
+        return settings
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            if "knowledge_graph_enabled" in raw:
+                settings["knowledge_graph_enabled"] = bool(raw["knowledge_graph_enabled"])
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Failed to load user settings %s: %s", path, e)
+    return settings
+
+
+def save_user_settings(user_id: str | None, **updates: bool) -> dict[str, bool]:
+    """Merge updates into per-user settings.json and return the full settings."""
+    segment = sanitize_user_path_segment(user_id)
+    if not segment:
+        raise ValueError(
+            "Invalid user_id for settings path; expected a plain user id, "
+            "not a signed session cookie"
+        )
+    user_dir = os.path.join(SESSION_STORAGE_DIR, segment)
+    os.makedirs(user_dir, exist_ok=True)
+    settings = load_user_settings(user_id)
+    for key, value in updates.items():
+        if key in _DEFAULT_USER_SETTINGS:
+            settings[key] = bool(value)
+    path = get_user_settings_path(user_id)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    logger.info("user settings saved: %s -> %s", path, settings)
+    return settings
+
+
+def is_knowledge_graph_enabled(user_id: str | None) -> bool:
+    """True when Knowledge Graph feature is on (default)."""
+    return bool(load_user_settings(user_id).get("knowledge_graph_enabled", True))
 
 
 def get_contents_type(file_name: str) -> str:

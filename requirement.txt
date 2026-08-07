@@ -15,3 +15,9 @@ pydantic>=2.0
 requests>=2.31.0
 langchain-aws>=0.2.0
 pyyaml
+
+# Knowledge Graph pipeline (graph/)
+graphifyy>=0.4.0
+python-dotenv>=1.0.0
+networkx>=3.0
+openai>=1.40.0

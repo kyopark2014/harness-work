@@ -24,6 +24,7 @@ export const appDataService = {
   async loadBootState(): Promise<{
     config: AppConfig;
     userId: string | null;
+    knowledgeGraphEnabled: boolean;
   }> {
     try {
       const config = await api.getConfig();
@@ -32,6 +33,7 @@ export const appDataService = {
       return {
         config,
         userId,
+        knowledgeGraphEnabled: session?.knowledge_graph_enabled ?? true,
       };
     } catch (error) {
       throw sanitizeError(error, "Failed to load application configuration.");

@@ -1878,8 +1878,67 @@ def _should_skip_skill_path(rel_path: str) -> bool:
     return False
 
 
+def _local_skill_names() -> set[str]:
+    """Top-level skill folder names under skills/."""
+    if not os.path.isdir(SKILLS_DIR):
+        return set()
+    return {
+        name
+        for name in os.listdir(SKILLS_DIR)
+        if os.path.isdir(os.path.join(SKILLS_DIR, name))
+        and not name.startswith(".")
+        and name not in {"__pycache__", "node_modules"}
+    }
+
+
+def _prune_removed_skills_from_s3(s3_bucket_name: str) -> int:
+    """Delete S3 skill prefixes that no longer exist under local skills/."""
+    local_names = _local_skill_names()
+    prefix = f"{SKILLS_S3_PREFIX}/"
+    removed = 0
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        remote_names: set[str] = set()
+        for page in paginator.paginate(
+            Bucket=s3_bucket_name, Prefix=prefix, Delimiter="/"
+        ):
+            for cp in page.get("CommonPrefixes") or []:
+                p = (cp.get("Prefix") or "").rstrip("/")
+                name = p.split("/")[-1] if p else ""
+                if name:
+                    remote_names.add(name)
+        orphans = sorted(remote_names - local_names)
+        for name in orphans:
+            orphan_prefix = f"{prefix}{name}/"
+            logger.info(
+                f"  pruning removed skill from S3: s3://{s3_bucket_name}/{orphan_prefix}"
+            )
+            for page in paginator.paginate(Bucket=s3_bucket_name, Prefix=orphan_prefix):
+                objs = page.get("Contents") or []
+                if not objs:
+                    continue
+                s3_client.delete_objects(
+                    Bucket=s3_bucket_name,
+                    Delete={
+                        "Objects": [{"Key": o["Key"]} for o in objs],
+                        "Quiet": True,
+                    },
+                )
+                removed += len(objs)
+    except ClientError as e:
+        logger.warning(f"  skill prune skipped: {e}")
+        return removed
+    if removed:
+        logger.info(f"✓ Pruned {removed} stale skill object(s) from S3")
+    return removed
+
+
 def upload_skills_to_s3(s3_bucket_name: str) -> int:
-    """Upload skills/ to s3://{bucket}/skills/ (AgentCore S3 skill layout)."""
+    """Upload skills/ to s3://{bucket}/skills/ (AgentCore S3 skill layout).
+
+    Also deletes remote skill prefixes that are no longer present locally
+    (e.g. renamed s3-sharing → artifact-share MCP).
+    """
     logger.info(f"[2/9] Uploading skills to s3://{s3_bucket_name}/{SKILLS_S3_PREFIX}/")
 
     if not os.path.isdir(SKILLS_DIR):
@@ -1918,6 +1977,8 @@ def upload_skills_to_s3(s3_bucket_name: str) -> int:
             f"Skills upload incomplete: {uploaded} ok, {failed} failed "
             f"(from {SKILLS_DIR})"
         )
+
+    _prune_removed_skills_from_s3(s3_bucket_name)
 
     logger.info(
         f"✓ Uploaded {uploaded} skill file(s) to "

@@ -13,7 +13,7 @@ from typing import Any, Generator
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
 
-from application.api.routes_auth import require_user_id
+from application.api.routes_auth import _kick_graph_job, require_user_id
 from application import task_store
 from application.task_store_persistence import flush_persist
 from application.notification_queue import QueueNotificationSink
@@ -313,6 +313,7 @@ def _build_final_payload(
 def _spawn_late_persist(
     *,
     task_id: str,
+    user_id: str,
     message_queue: queue.Queue,
     result_holder: dict[str, Any],
     tool_events: list[dict[str, Any]],
@@ -360,6 +361,7 @@ def _spawn_late_persist(
                 tool_events=events,
             )
             flush_persist()
+            _kick_graph_job(user_id)
         except Exception:
             logger.exception("Late persist failed")
 
@@ -450,6 +452,7 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
         tool_meta: dict[str, dict[str, Any]] = {}
         streamed_text = ""
         sse_closed_early = False
+        pending_graph_kick = False
 
         try:
             deadline = time.monotonic() + AGENT_STREAM_TIMEOUT_SECONDS
@@ -475,6 +478,7 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
                     sse_closed_early = True
                     _spawn_late_persist(
                         task_id=task_id,
+                        user_id=user_id,
                         message_queue=message_queue,
                         result_holder=result_holder,
                         tool_events=tool_events,
@@ -525,6 +529,7 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
                 images=images,
                 tool_events=events,
             )
+            pending_graph_kick = True
 
             yield _sse_event(
                 {
@@ -545,6 +550,7 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
                 )
                 _spawn_late_persist(
                     task_id=task_id,
+                    user_id=user_id,
                     message_queue=message_queue,
                     result_holder=result_holder,
                     tool_events=tool_events,
@@ -555,6 +561,8 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
         finally:
             if not sse_closed_early:
                 flush_persist()
+                if pending_graph_kick:
+                    _kick_graph_job(user_id)
 
     from fastapi.responses import StreamingResponse
 

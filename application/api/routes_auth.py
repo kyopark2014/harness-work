@@ -46,7 +46,11 @@ class SessionResponse(BaseModel):
     name: str | None = None
     picture: str | None = None
     llm_gateway_ready: bool = False
-    knowledge_graph_enabled: bool = False
+    knowledge_graph_enabled: bool = True
+
+
+class SessionSettingsPatch(BaseModel):
+    knowledge_graph_enabled: bool | None = None
 
 
 def _google_client_id() -> str:
@@ -140,18 +144,34 @@ def get_optional_user_id(request: Request) -> str | None:
     return resolve_cookie_user_id(request.cookies.get(SESSION_COOKIE))
 
 
+def _kick_graph_job(user_id: str) -> None:
+    """Fire-and-forget background graph extract (respects cooldown / running lock)."""
+    if not utils.is_knowledge_graph_enabled(user_id):
+        logger.info("Knowledge Graph disabled for %s — skip extract", user_id)
+        return
+    try:
+        from application.graph_jobs import ensure_graph_job
+
+        ensure_graph_job(user_id)
+    except Exception:
+        logger.exception("Failed to schedule graph job for %s", user_id)
+
+
 def _session_response(
     user_id: str,
     *,
     name: str | None = None,
     picture: str | None = None,
 ) -> SessionResponse:
+    settings = utils.load_user_settings(user_id)
     return SessionResponse(
         user_id=user_id,
         name=name,
         picture=picture,
         llm_gateway_ready=False,
-        knowledge_graph_enabled=False,
+        knowledge_graph_enabled=bool(
+            settings.get("knowledge_graph_enabled", True)
+        ),
     )
 
 
@@ -182,6 +202,11 @@ def set_session(
 
         user_id = idinfo["email"].strip()
         _set_user_cookie(response, user_id)
+        try:
+            utils.ensure_user_graph_dir(user_id)
+        except Exception:
+            logger.exception("Failed to ensure graph dir for %s", user_id)
+        _kick_graph_job(user_id)
         logger.info("Google login success: %s", user_id)
         return _session_response(
             user_id,
@@ -196,6 +221,11 @@ def set_session(
                 detail="Local auth bypass is disabled",
             )
         _set_user_cookie(response, local_user_id)
+        try:
+            utils.ensure_user_graph_dir(local_user_id)
+        except Exception:
+            logger.exception("Failed to ensure graph dir for %s", local_user_id)
+        _kick_graph_job(local_user_id)
         logger.info("Local auth bypass login: %s", local_user_id)
         return _session_response(local_user_id)
 
@@ -209,6 +239,27 @@ def get_session(request: Request) -> SessionResponse | None:
     user_id = get_optional_user_id(request)
     if not user_id:
         return None
+    try:
+        utils.ensure_user_graph_dir(user_id)
+    except Exception:
+        logger.exception("Failed to ensure graph dir for %s", user_id)
+    _kick_graph_job(user_id)
+    return _session_response(user_id)
+
+
+@router.patch("/settings", response_model=SessionResponse)
+def patch_session_settings(
+    body: SessionSettingsPatch, request: Request
+) -> SessionResponse:
+    """Update per-user feature settings (e.g. Knowledge Graph toggle)."""
+    user_id = require_user_id(request)
+    updates: dict[str, bool] = {}
+    if body.knowledge_graph_enabled is not None:
+        updates["knowledge_graph_enabled"] = body.knowledge_graph_enabled
+    if updates:
+        utils.save_user_settings(user_id, **updates)
+    if updates.get("knowledge_graph_enabled") is True:
+        _kick_graph_job(user_id)
     return _session_response(user_id)
 
 

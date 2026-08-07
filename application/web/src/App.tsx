@@ -50,6 +50,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [drawer, setDrawer] = useState<DrawerKind>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [knowledgeGraphEnabled, setKnowledgeGraphEnabled] = useState(true);
   const [queuedByTaskId, setQueuedByTaskId] = useState<
     Record<string, QueuedMessage[]>
   >({});
@@ -112,6 +113,7 @@ export default function App() {
       try {
         const boot = await appDataService.loadBootState();
         setConfig(boot.config);
+        setKnowledgeGraphEnabled(boot.knowledgeGraphEnabled);
         if (boot.userId) {
           setUserId(boot.userId);
         }
@@ -201,6 +203,7 @@ export default function App() {
       try {
         const session = await appDataService.setSession(credential);
         setUserId(session.user_id.trim());
+        setKnowledgeGraphEnabled(session.knowledge_graph_enabled ?? true);
         await refreshConfig();
       } catch (err) {
         setBootError(err instanceof Error ? err.message : String(err));
@@ -216,6 +219,7 @@ export default function App() {
         const session =
           await appDataService.setSessionWithAccessToken(accessToken);
         setUserId(session.user_id.trim());
+        setKnowledgeGraphEnabled(session.knowledge_graph_enabled ?? true);
         await refreshConfig();
       } catch (err) {
         setBootError(err instanceof Error ? err.message : String(err));
@@ -230,6 +234,7 @@ export default function App() {
       try {
         const session = await appDataService.setLocalSession(id.trim());
         setUserId(session.user_id.trim());
+        setKnowledgeGraphEnabled(session.knowledge_graph_enabled ?? true);
         await refreshConfig();
       } catch (err) {
         setBootError(err instanceof Error ? err.message : String(err));
@@ -257,6 +262,7 @@ export default function App() {
     setActiveTaskId(null);
     setMessages([]);
     setDrawer(null);
+    setKnowledgeGraphEnabled(true);
     setQueuedByTaskId({});
     setQueuePausedByTaskId({});
     if (config?.projectName) {
@@ -559,6 +565,7 @@ export default function App() {
         config={config}
         drawer={drawer}
         open={sidebarOpen}
+        knowledgeGraphEnabled={knowledgeGraphEnabled}
         onClose={() => setSidebarOpen(false)}
         onNewTask={handleNewTaskAndCloseSidebar}
         onSelectTask={handleSelectTask}
@@ -567,6 +574,18 @@ export default function App() {
         onPatchTask={handlePatchTask}
         onDeleteTask={handleDeleteTask}
         onLogout={handleLogout}
+        onPatchKnowledgeGraphEnabled={async (enabled) => {
+          setKnowledgeGraphEnabled(enabled);
+          try {
+            const session = await api.patchSessionSettings({
+              knowledge_graph_enabled: enabled,
+            });
+            setKnowledgeGraphEnabled(session.knowledge_graph_enabled ?? enabled);
+          } catch (err) {
+            setKnowledgeGraphEnabled(!enabled);
+            uiError("knowledge graph setting failed", err);
+          }
+        }}
       />
       <div className="main-panel">
         <ChatThread
