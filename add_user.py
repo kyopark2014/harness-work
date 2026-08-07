@@ -5,10 +5,11 @@ Reads User Pool / App Client settings from application/config.json (written by
 installer.py), creates the user with a permanent password, then verifies login
 via USER_PASSWORD_AUTH (same flow as application/api/routes_auth.py).
 
+Password is always read with getpass (never echoed, never via CLI args).
+
 Usage:
   python add_user.py
   python add_user.py --username user01
-  python add_user.py --username user01 --password 'YourPassword1'
 """
 
 from __future__ import annotations
@@ -86,10 +87,17 @@ def prompt_username(default: Optional[str] = None) -> str:
 
 
 def prompt_password(username: str) -> str:
+    """Prompt for password with getpass so input is not echoed to the terminal."""
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "Password must be entered interactively (hidden). "
+            "Run `python add_user.py` in a terminal."
+        )
     logger.info(
         "  Password policy: min 8 chars, uppercase, lowercase, number "
         "(symbols optional)"
     )
+    logger.info("  Password input is hidden (not shown as you type).")
     while True:
         password = getpass.getpass(f"Enter password for '{username}': ")
         error = _cognito_password_valid(password)
@@ -186,11 +194,6 @@ def parse_args() -> argparse.Namespace:
         help="Cognito username (prompted if omitted)",
     )
     parser.add_argument(
-        "--password",
-        "-p",
-        help="Permanent password (prompted securely if omitted)",
-    )
-    parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
         help=f"Path to application config.json (default: {DEFAULT_CONFIG_PATH})",
@@ -221,14 +224,11 @@ def main() -> int:
         logger.info("  Project:    %s", cognito["project_name"])
 
     username = (args.username or "").strip() or prompt_username()
-    if args.password:
-        password = args.password
-        error = _cognito_password_valid(password)
-        if error:
-            logger.error("%s", error)
-            return 1
-    else:
+    try:
         password = prompt_password(username)
+    except RuntimeError as e:
+        logger.error("%s", e)
+        return 1
 
     try:
         client = boto3.client("cognito-idp", region_name=region)
