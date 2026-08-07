@@ -1,51 +1,61 @@
-"""Session auth — local User ID plus optional Google OAuth."""
+"""Session auth via Cognito USER_PASSWORD_AUTH + HMAC-signed cookies."""
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import urllib.error
-import urllib.parse
-import urllib.request
+from urllib.parse import urlparse
 
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 try:
+    from application import session_cookie
     from application import utils
 except ImportError:
+    import session_cookie  # type: ignore
     import utils  # type: ignore
 
 logger = logging.getLogger("routes_auth")
 
+_COGNITO_RETRY_CONFIG = Config(retries={"max_attempts": 5, "mode": "adaptive"})
+
 router = APIRouter(prefix="/api/session", tags=["session"])
 
 SESSION_COOKIE = "agent_user_id"
-TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
-_MAX_PLAIN_USER_ID_LEN = 128
 
 
-class SessionRequest(BaseModel):
-    credential: str | None = Field(
-        default=None, description="Google ID Token (JWT)"
-    )
-    access_token: str | None = Field(
-        default=None, description="Google OAuth access token"
-    )
-    user_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=128,
-        description="Local-only user id when auth bypass is enabled",
-    )
+def _cookie_secure(request: Request) -> bool:
+    proto = (
+        request.headers.get("cloudfront-forwarded-proto")
+        or request.headers.get("x-forwarded-proto")
+        or request.url.scheme
+        or ""
+    ).lower()
+    if proto == "https":
+        return True
+    host = (request.headers.get("host") or request.url.hostname or "").split(":")[0].lower()
+    if host.endswith(".cloudfront.net"):
+        return True
+    try:
+        sharing = (utils.load_config().get("sharing_url") or "").strip()
+        parsed = urlparse(sharing)
+        if parsed.scheme == "https" and (parsed.hostname or "").lower() == host:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
 
 
 class SessionResponse(BaseModel):
     user_id: str
-    name: str | None = None
-    picture: str | None = None
-    llm_gateway_ready: bool = False
     knowledge_graph_enabled: bool = True
 
 
@@ -53,95 +63,101 @@ class SessionSettingsPatch(BaseModel):
     knowledge_graph_enabled: bool | None = None
 
 
-def _google_client_id() -> str:
-    cfg = utils.load_config()
-    return (cfg.get("google_client_id") or "").strip()
+def _cognito_settings() -> tuple[str, str, str]:
+    config = utils.load_config()
+    user_pool_id = (config.get("cognito_user_pool_id") or "").strip()
+    client_id = (config.get("cognito_client_id") or "").strip()
+    cognito_region = (
+        config.get("cognito_region") or config.get("region") or "us-west-2"
+    ).strip()
+    if not user_pool_id or not client_id:
+        raise HTTPException(
+            status_code=503,
+            detail="Cognito is not configured. Run installer.py to create the User Pool.",
+        )
+    return user_pool_id, client_id, cognito_region
 
 
-def _env_bypass_flag() -> bool:
-    return os.environ.get("ALLOW_LOCAL_AUTH_BYPASS", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+def _authenticate_with_cognito(username: str, password: str) -> str:
+    """Authenticate with Cognito and return the verified Username.
 
-
-def is_loopback_request(request: Request) -> bool:
-    host = (request.headers.get("host") or "").split("%")[0]
-    hostname = host.split(":")[0].strip().lower().strip("[]")
-    return hostname in {"localhost", "127.0.0.1", "::1"}
-
-
-def local_auth_bypass_enabled(request: Request) -> bool:
-    if _env_bypass_flag() or is_loopback_request(request):
-        return True
-    return not bool(_google_client_id())
-
-
-def verify_google_token(token: str, client_id: str) -> dict:
-    url = f"{TOKENINFO_URL}?id_token={urllib.parse.quote(token)}"
-    req = urllib.request.Request(url)
+    Uses AccessToken → GetUser so the session is bound to a Cognito-confirmed
+    identity, not the raw login form string.
+    """
+    _user_pool_id, client_id, cognito_region = _cognito_settings()
+    client = boto3.client(
+        "cognito-idp",
+        region_name=cognito_region,
+        config=_COGNITO_RETRY_CONFIG,
+    )
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            idinfo = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise ValueError(f"Token verification failed ({e.code}): {body}") from e
-    except Exception as e:
-        raise ValueError(f"Token verification request failed: {e}") from e
+        response = client.initiate_auth(
+            ClientId=client_id,
+            AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={
+                "USERNAME": username,
+                "PASSWORD": password,
+            },
+        )
+    except ClientError as e:
+        err = e.response.get("Error", {}) or {}
+        code = err.get("Code", "") or ""
+        cognito_message = err.get("Message", "") or ""
+        logger.warning(
+            "Cognito auth failed for %s: %s (%s)",
+            username,
+            code,
+            cognito_message or type(e).__name__,
+        )
+        if code in (
+            "NotAuthorizedException",
+            "UserNotFoundException",
+            "UserNotConfirmedException",
+            "PasswordResetRequiredException",
+        ):
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        if code == "InvalidParameterException":
+            raise HTTPException(
+                status_code=400, detail="Invalid authentication parameters"
+            )
+        raise HTTPException(status_code=502, detail="Authentication service error")
 
-    if idinfo.get("aud") != client_id:
-        raise ValueError(f"Invalid audience: {idinfo.get('aud')}")
-    email = (idinfo.get("email") or "").strip()
-    if not email:
-        raise ValueError("Google token missing email")
-    return idinfo
+    challenge = response.get("ChallengeName")
+    if challenge:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Additional authentication required: {challenge}",
+        )
+    auth_result = response.get("AuthenticationResult") or {}
+    access_token = (auth_result.get("AccessToken") or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Authentication failed")
 
-
-def verify_google_access_token(token: str, client_id: str) -> dict:
-    info_url = f"{TOKENINFO_URL}?access_token={urllib.parse.quote(token)}"
-    req = urllib.request.Request(info_url)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            idinfo = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise ValueError(f"Token verification failed ({e.code}): {body}") from e
-    except Exception as e:
-        raise ValueError(f"Token verification request failed: {e}") from e
+        user = client.get_user(AccessToken=access_token)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        logger.warning("Cognito GetUser failed after login: %s", code)
+        raise HTTPException(status_code=401, detail="Authentication failed")
 
-    aud = idinfo.get("aud") or idinfo.get("azp")
-    if aud != client_id:
-        raise ValueError(f"Invalid audience: {aud}")
-    email = (idinfo.get("email") or "").strip()
-    if not email:
-        raise ValueError("Google token missing email")
-    return idinfo
+    verified = (user.get("Username") or "").strip()
+    if not verified:
+        raise HTTPException(status_code=401, detail="Authentication failed")
+    return verified
 
 
-def _set_user_cookie(response: Response, user_id: str) -> None:
+def _set_session_cookie(response: Response, request: Request, user_id: str) -> None:
+    token = session_cookie.sign_session(user_id)
+    secure = _cookie_secure(request)
+    max_age = session_cookie.session_max_age_seconds()
     response.set_cookie(
         key=SESSION_COOKIE,
-        value=user_id,
+        value=token,
         httponly=True,
         samesite="lax",
-        max_age=60 * 60 * 24 * 365,
+        secure=secure,
+        max_age=max_age,
     )
-
-
-def resolve_cookie_user_id(raw: str | None) -> str | None:
-    value = (raw or "").strip()
-    if not value:
-        return None
-    if len(value) > _MAX_PLAIN_USER_ID_LEN:
-        logger.warning("Ignoring oversized session cookie (%d chars)", len(value))
-        return None
-    return value
-
-
-def get_optional_user_id(request: Request) -> str | None:
-    return resolve_cookie_user_id(request.cookies.get(SESSION_COOKIE))
 
 
 def _kick_graph_job(user_id: str) -> None:
@@ -157,81 +173,41 @@ def _kick_graph_job(user_id: str) -> None:
         logger.exception("Failed to schedule graph job for %s", user_id)
 
 
-def _session_response(
-    user_id: str,
-    *,
-    name: str | None = None,
-    picture: str | None = None,
-) -> SessionResponse:
+def _session_response(user_id: str) -> SessionResponse:
     settings = utils.load_user_settings(user_id)
     return SessionResponse(
         user_id=user_id,
-        name=name,
-        picture=picture,
-        llm_gateway_ready=False,
         knowledge_graph_enabled=bool(
             settings.get("knowledge_graph_enabled", True)
         ),
     )
 
 
-@router.post("", response_model=SessionResponse)
-def set_session(
-    body: SessionRequest, request: Request, response: Response
-) -> SessionResponse:
-    credential = (body.credential or "").strip()
-    access_token = (body.access_token or "").strip()
-    local_user_id = (body.user_id or "").strip()
+def get_optional_user_id(request: Request) -> str | None:
+    """Return verified user_id from the HMAC session cookie, or None."""
+    return session_cookie.verify_session(request.cookies.get(SESSION_COOKIE) or "")
 
-    if credential or access_token:
-        client_id = _google_client_id()
-        if not client_id:
-            raise HTTPException(
-                status_code=500, detail="google_client_id is not configured"
-            )
-        try:
-            if credential:
-                idinfo = verify_google_token(credential, client_id)
-            else:
-                idinfo = verify_google_access_token(access_token, client_id)
-        except ValueError as e:
-            logger.warning("Google login rejected: %s", e)
-            raise HTTPException(
-                status_code=401, detail="Invalid Google credential"
-            ) from e
 
-        user_id = idinfo["email"].strip()
-        _set_user_cookie(response, user_id)
-        try:
-            utils.ensure_user_graph_dir(user_id)
-        except Exception:
-            logger.exception("Failed to ensure graph dir for %s", user_id)
-        _kick_graph_job(user_id)
-        logger.info("Google login success: %s", user_id)
-        return _session_response(
-            user_id,
-            name=(idinfo.get("name") or None),
-            picture=(idinfo.get("picture") or None),
-        )
+@router.post("/login", response_model=SessionResponse)
+def login(body: LoginRequest, request: Request, response: Response) -> SessionResponse:
+    username = body.username.strip()
+    password = body.password
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password are required")
+    user_id = _authenticate_with_cognito(username, password)
+    _set_session_cookie(response, request, user_id)
+    try:
+        utils.ensure_user_graph_dir(user_id)
+    except Exception:
+        logger.exception("Failed to ensure graph dir for %s", user_id)
+    _kick_graph_job(user_id)
+    return _session_response(user_id)
 
-    if local_user_id:
-        if not local_auth_bypass_enabled(request):
-            raise HTTPException(
-                status_code=403,
-                detail="Local auth bypass is disabled",
-            )
-        _set_user_cookie(response, local_user_id)
-        try:
-            utils.ensure_user_graph_dir(local_user_id)
-        except Exception:
-            logger.exception("Failed to ensure graph dir for %s", local_user_id)
-        _kick_graph_job(local_user_id)
-        logger.info("Local auth bypass login: %s", local_user_id)
-        return _session_response(local_user_id)
 
-    raise HTTPException(
-        status_code=400, detail="credential, access_token, or user_id is required"
-    )
+@router.post("", response_model=SessionResponse, deprecated=True)
+def set_session(body: LoginRequest, request: Request, response: Response) -> SessionResponse:
+    """Backward-compatible alias: requires Cognito username/password."""
+    return login(body, request, response)
 
 
 @router.get("", response_model=SessionResponse | None)
@@ -264,8 +240,9 @@ def patch_session_settings(
 
 
 @router.delete("", status_code=204, response_model=None)
-def clear_session(response: Response) -> None:
-    response.delete_cookie(key=SESSION_COOKIE, samesite="lax")
+def clear_session(request: Request, response: Response) -> None:
+    secure = _cookie_secure(request)
+    response.delete_cookie(key=SESSION_COOKIE, samesite="lax", secure=secure)
 
 
 def require_user_id(request: Request) -> str:

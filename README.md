@@ -10,6 +10,7 @@ AgentCore의 관리형 에이전트 하네스(Managed Agent Harness)는 사전 �
 
 - 모든 세션이 Firecracker microVM에서 격리 실행
 - 세션별 독립 파일시스템 & 셸
+- **Web UI 인증**: Amazon Cognito (`USER_PASSWORD_AUTH`) + HMAC 서명 세션 쿠키
 - **S3 Files**로 `/mnt/workspace` 영속 마운트 (VPC 필수)
 - **Skill**: Git(Anthropic 공식) 또는 S3 URI로 런타임에 주입
 - **MCP / Browser / Code Interpreter**: UI 선택 → `tools` 배열로 전달
@@ -73,9 +74,9 @@ flowchart TB
 
 | 단계 | 경로 |
 |------|------|
-| 프로비저닝 | `installer.py` → S3 · skills · IAM · Memory · **S3 Vectors KB** · **KB + artifact-share MCP Runtime + IAM Gateway** · VPC · S3 Files · `CreateHarness` · **ECR/ECS/ALB/UI CloudFront** → `application/config.json` |
-| 호출 | React UI → Skill/MCP/모델 · **이미지 첨부** → SSE `/api/tasks/{id}/chat` → `run_harness` → `invoke_harness` |
-| 삭제 | `uninstaller.py` → ECS/ALB/UI CF · Harness · MCP Gateway/Runtime · KB · S3 Vectors · S3 Files · VPC · Memory · IAM 정리 |
+| 프로비저닝 | `installer.py` → **Cognito User Pool** · S3 · skills · IAM · Memory · **S3 Vectors KB** · **KB + artifact-share MCP Runtime + IAM Gateway** · VPC · S3 Files · `CreateHarness` · **ECR/ECS/ALB/UI CloudFront** → `application/config.json` |
+| 호출 | React UI → Cognito 로그인 · Skill/MCP/모델 · **이미지 첨부** → SSE `/api/tasks/{id}/chat` → `run_harness` → `invoke_harness` |
+| 삭제 | `uninstaller.py` → Cognito · ECS/ALB/UI CF · Harness · MCP Gateway/Runtime · KB · S3 Vectors · S3 Files · VPC · Memory · IAM 정리 |
 
 ---
 
@@ -87,6 +88,8 @@ ARM64 호스트(예: `t4g` EC2)에서 Docker가 실행 중이어야 합니다. E
 
 ```bash
 # 1) Harness 인프라 + Web UI (Docker 빌드 → ECR → ECS)
+#    설치 초기에 Cognito admin('admin') 비밀번호를 대화형으로 입력합니다.
+#    (풀/admin이 이미 있으면 건너뜀)
 pip install -r requirement.txt
 python installer.py
 
@@ -98,8 +101,12 @@ python installer.py --skip-ecs
 
 # 2) 배포 후 CloudFront URL로 접속 (installer 로그의 app_url / ui_cloudfront_domain)
 #    https://xxxxx.cloudfront.net
+#    Cognito 사용자명(admin 또는 add_user.py로 만든 계정)과 비밀번호로 로그인
 
-# 3) 삭제 (ECS Web UI 포함)
+# 3) (선택) 추가 Cognito 사용자
+python add_user.py --username user01
+
+# 4) 삭제 (ECS Web UI · Cognito 포함)
 python uninstaller.py
 ```
 
@@ -109,6 +116,18 @@ python uninstaller.py
 | `ecs_web.py` | ECR · ECS Fargate · ALB · UI 전용 CloudFront |
 | `APP_CONFIG_JSON` | ECS 태스크 환경변수 → entrypoint가 `application/config.json`에 기록 |
 | S3 Files | ECS에도 `/mnt/app-data` 마운트 → `tasks.db` 영속 |
+| Cognito | User Pool + App Client (`USER_PASSWORD_AUTH`) · HMAC 세션 쿠키 |
+
+### Cognito / 세션
+
+| 항목 | 설명 |
+|------|------|
+| User Pool | 이름 = `projectName` (`harness-work`) |
+| App Client | `{project}-web-ui`, `USER_PASSWORD_AUTH` |
+| Admin | 사용자명 `admin` (installer가 비밀번호 입력받아 생성) |
+| 세션 | HMAC 서명 쿠키 `agent_user_id` (`application/session_cookie.py`) |
+| Signing key | Secrets Manager `{project}/session-signing-key` (없으면 로컬 파일 fallback) |
+| 추가 사용자 | `python add_user.py` |
 
 ### B) 로컬에서 UI만 실행
 
@@ -125,11 +144,16 @@ pip install -r requirement.txt
 #   cd application/web && npm install && npm run build
 #   uvicorn application.server:app --host 0.0.0.0 --port 8501
 
-# 4) 삭제
+# 4) (선택) 추가 Cognito 사용자
+python add_user.py --username user01
+
+# 5) 삭제
 python uninstaller.py
 ```
 
-`application/config.json`은 gitignore됩니다. installer가 `HARNESS_ARN`, `s3_bucket`, VPC·S3 Files, **Knowledge Base / S3 Vectors**, ECS(`app_url`) 필드를 채웁니다.
+브라우저에서 Cognito 사용자명(`admin` 또는 `add_user.py`로 만든 계정)과 비밀번호로 로그인합니다.
+
+`application/config.json`은 gitignore됩니다. installer가 `HARNESS_ARN`, `s3_bucket`, VPC·S3 Files, **Cognito**, **Knowledge Base / S3 Vectors**, ECS(`app_url`) 필드를 채웁니다.
 
 ---
 
@@ -594,16 +618,18 @@ response = client.invoke_harness(**invoke_kwargs)
 
 | 경로 | 역할 |
 |---|---|
-| `installer.py` | S3 · skills · IAM · Memory · VPC · S3 Files · CreateHarness · **ECS Web UI** |
+| `installer.py` | Cognito · S3 · skills · IAM · Memory · VPC · S3 Files · CreateHarness · **ECS Web UI** |
 | `ecs_web.py` | ECR · Docker 빌드 · ECS Fargate · ALB · UI CloudFront |
 | `Dockerfile` / `docker-entrypoint.sh` | Web UI 컨테이너 이미지 |
-| `uninstaller.py` | ECS/UI CF · MCP Gateway/Runtime · Harness · KB · VPC · IAM 등 정리 |
+| `uninstaller.py` | Cognito · ECS/UI CF · MCP Gateway/Runtime · Harness · KB · VPC · IAM 등 정리 |
+| `add_user.py` | Cognito 추가 사용자 등록 |
 | `s3_files_vpc.py` | VPC / S3 Files / harness `environment` 빌더 |
 | `skills/` | 로컬 스킬 소스 (→ S3 `skills/` 또는 Git) |
 | `MCP/` | knowledge-base · artifact-share Runtime MCP 소스 |
 | `graph/` | 채팅 이력 → Knowledge Graph 파이프라인 (`run_pipeline.py`) |
 | `application/server.py` | FastAPI + React SPA (`application/web`) |
 | `application/api/` | 세션 · 설정 · 태스크 · SSE 채팅 · **graph** API |
+| `application/session_cookie.py` | HMAC 서명 세션 쿠키 |
 | `application/graph_jobs.py` | 로그인/채팅 후 백그라운드 그래프 추출 잡 |
 | `application/agentcore_client.py` | `run_harness` / `invoke_harness` 스트림 처리 |
 | `application/skill.py` | 스킬 발견 + `build_harness_skills` |
@@ -628,6 +654,7 @@ response = client.invoke_harness(**invoke_kwargs)
 
 | 기능 | 설명 |
 |---|---|
+| Web UI 인증 | Cognito `USER_PASSWORD_AUTH` + HMAC 서명 세션 쿠키 |
 | 격리 실행 | Firecracker microVM |
 | IAM 실행 역할 | Bedrock · ECR · S3 · S3 Files 최소 권한 |
 | VPC | private subnet + NAT; S3 Files는 VPC 필수 |

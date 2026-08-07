@@ -22,7 +22,7 @@ import type { AppConfig, Message, Task } from "./types";
 import { Sidebar } from "./components/Sidebar";
 import { ChatThread } from "./components/ChatThread";
 import { ChatInput } from "./components/ChatInput";
-import { GoogleLoginModal } from "./components/GoogleLoginModal";
+import { UserIdModal } from "./components/UserIdModal";
 
 type DrawerKind = "skill" | "mcp" | "model" | "appearance" | null;
 
@@ -35,6 +35,8 @@ type QueuedMessage = {
 const MOBILE_BREAKPOINT_PX = 768;
 const BOOT_ERROR_MESSAGE =
   "Failed to load application configuration. Please try again.";
+const LOGIN_ERROR_MESSAGE =
+  "Login failed. Please check your credentials.";
 const TASK_ERROR_MESSAGE = "Task operation failed. Please try again.";
 const CHAT_ERROR_MESSAGE = "Failed to send message. Please try again.";
 const LOAD_MESSAGES_ERROR_MESSAGE =
@@ -43,6 +45,7 @@ const LOAD_MESSAGES_ERROR_MESSAGE =
 export default function App() {
   const [userId, setUserId] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(false);
+  const [loginLoading, setLoginLoading] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -197,51 +200,21 @@ export default function App() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  const handleGoogleCredential = useCallback(
-    async (credential: string) => {
-      setBootError(null);
-      try {
-        const session = await appDataService.setSession(credential);
-        setUserId(session.user_id.trim());
-        setKnowledgeGraphEnabled(session.knowledge_graph_enabled ?? true);
-        await refreshConfig();
-      } catch (err) {
-        setBootError(err instanceof Error ? err.message : String(err));
-      }
-    },
-    [refreshConfig],
-  );
-
-  const handleGoogleAccessToken = useCallback(
-    async (accessToken: string) => {
-      setBootError(null);
-      try {
-        const session =
-          await appDataService.setSessionWithAccessToken(accessToken);
-        setUserId(session.user_id.trim());
-        setKnowledgeGraphEnabled(session.knowledge_graph_enabled ?? true);
-        await refreshConfig();
-      } catch (err) {
-        setBootError(err instanceof Error ? err.message : String(err));
-      }
-    },
-    [refreshConfig],
-  );
-
-  const handleLocalUserId = useCallback(
-    async (id: string) => {
-      setBootError(null);
-      try {
-        const session = await appDataService.setLocalSession(id.trim());
-        setUserId(session.user_id.trim());
-        setKnowledgeGraphEnabled(session.knowledge_graph_enabled ?? true);
-        await refreshConfig();
-      } catch (err) {
-        setBootError(err instanceof Error ? err.message : String(err));
-      }
-    },
-    [refreshConfig],
-  );
+  async function handleLogin(username: string, password: string) {
+    setBootError(null);
+    setLoginLoading(true);
+    try {
+      const session = await appDataService.login(username, password);
+      await refreshConfig();
+      setUserId(session.user_id.trim());
+      setKnowledgeGraphEnabled(session.knowledge_graph_enabled ?? true);
+    } catch (err) {
+      uiError("login failed", err);
+      setBootError(LOGIN_ERROR_MESSAGE);
+    } finally {
+      setLoginLoading(false);
+    }
+  }
 
   async function handleLogout() {
     setBootError(null);
@@ -249,11 +222,6 @@ export default function App() {
       await appDataService.logout();
     } catch (err) {
       uiError("logout failed", err);
-    }
-    try {
-      window.google?.accounts?.id?.disableAutoSelect();
-    } catch {
-      // GSI may not be loaded yet
     }
     tasksBootstrappedForUserRef.current = null;
     emptyTaskBootstrapRef.current = null;
@@ -536,14 +504,11 @@ export default function App() {
 
   if (!userId) {
     return (
-      <GoogleLoginModal
-        clientId={config?.google_client_id ?? ""}
-        onCredential={handleGoogleCredential}
-        onAccessToken={handleGoogleAccessToken}
-        onLocalUserId={handleLocalUserId}
-        localAuthBypass={Boolean(config?.local_auth_bypass)}
+      <UserIdModal
+        onSubmit={handleLogin}
         error={bootError}
         projectName={config?.projectName}
+        loading={loginLoading}
       />
     );
   }

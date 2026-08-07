@@ -1,4 +1,5 @@
 import { api } from "../api";
+import type { SessionInfo } from "../api";
 import type { AppConfig, Message, Task } from "../types";
 
 export type CreateTaskDefaults = {
@@ -40,27 +41,11 @@ export const appDataService = {
     }
   },
 
-  async setSession(credential: string) {
+  async login(username: string, password: string): Promise<SessionInfo> {
     try {
-      return await api.setSession(credential);
+      return await api.login(username, password);
     } catch (error) {
-      throw sanitizeError(error, "Google login failed.");
-    }
-  },
-
-  async setSessionWithAccessToken(accessToken: string) {
-    try {
-      return await api.setSessionWithAccessToken(accessToken);
-    } catch (error) {
-      throw sanitizeError(error, "Google login failed.");
-    }
-  },
-
-  async setLocalSession(userId: string) {
-    try {
-      return await api.setLocalSession(userId);
-    } catch (error) {
-      throw sanitizeError(error, "Login failed.");
+      throw sanitizeError(error, "Login failed. Please check your credentials.");
     }
   },
 

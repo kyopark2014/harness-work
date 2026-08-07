@@ -86,20 +86,10 @@ export interface RagUploadResult {
 
 export const api = {
   getSession: () => request<SessionInfo | null>("/api/session"),
-  setSession: (credential: string) =>
-    request<SessionInfo>("/api/session", {
+  login: (username: string, password: string) =>
+    request<SessionInfo>("/api/session/login", {
       method: "POST",
-      body: JSON.stringify({ credential }),
-    }),
-  setSessionWithAccessToken: (access_token: string) =>
-    request<SessionInfo>("/api/session", {
-      method: "POST",
-      body: JSON.stringify({ access_token }),
-    }),
-  setLocalSession: (user_id: string) =>
-    request<SessionInfo>("/api/session", {
-      method: "POST",
-      body: JSON.stringify({ user_id }),
+      body: JSON.stringify({ username, password }),
     }),
   clearSession: () => request<void>("/api/session", { method: "DELETE" }),
   patchSessionSettings: (body: { knowledge_graph_enabled?: boolean }) =>

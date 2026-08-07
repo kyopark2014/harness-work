@@ -1,8 +1,8 @@
 """ECS Fargate + ALB + ECR + CloudFront deployment for Harness Web UI.
 
-Modeled after strands-work installer ECS patterns, simplified for harness-work:
+Modeled after strands-work installer ECS patterns, adapted for harness-work:
 - ALB-only CloudFront (separate from project S3 sharing CF)
-- No Cognito / signed cookies
+- Cognito USER_PASSWORD_AUTH + HMAC-signed session cookies (via APP_CONFIG_JSON)
 - APP_CONFIG_JSON injected into the container via docker-entrypoint.sh
 """
 
@@ -211,6 +211,28 @@ class EcsWebDeployer:
                         ],
                         "Resource": [f"{bucket_arn}/*"],
                     },
+                ],
+            },
+        )
+        session_secret_arn = (
+            f"arn:aws:secretsmanager:{self.region}:{self.account_id}:"
+            f"secret:{self.project_name}/session-signing-key*"
+        )
+        self._attach_inline_policy(
+            task_role_name,
+            f"ecs-task-session-secret-for-{self.project_name}",
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "ReadSessionSigningKey",
+                        "Effect": "Allow",
+                        "Action": [
+                            "secretsmanager:GetSecretValue",
+                            "secretsmanager:DescribeSecret",
+                        ],
+                        "Resource": [session_secret_arn],
+                    }
                 ],
             },
         )

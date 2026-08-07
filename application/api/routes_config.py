@@ -9,18 +9,12 @@ from pydantic import BaseModel
 
 try:
     from application import mcp_config, skill, utils
-    from application.api.routes_auth import (
-        get_optional_user_id,
-        local_auth_bypass_enabled,
-    )
+    from application.api.routes_auth import get_optional_user_id
 except ImportError:
     import mcp_config  # type: ignore
     import skill  # type: ignore
     import utils  # type: ignore
-    from routes_auth import (  # type: ignore
-        get_optional_user_id,
-        local_auth_bypass_enabled,
-    )
+    from routes_auth import get_optional_user_id  # type: ignore
 
 logger = logging.getLogger("routes_config")
 
@@ -75,8 +69,6 @@ def get_config(request: Request):
     config = utils.load_config()
     return {
         "projectName": config.get("projectName", "agentcore"),
-        "google_client_id": (config.get("google_client_id") or "").strip(),
-        "local_auth_bypass": local_auth_bypass_enabled(request),
         "is_admin": False,
         "skills": skill_options,
         "mcp_servers": mcp_options,

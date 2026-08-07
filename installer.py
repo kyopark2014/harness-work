@@ -11,11 +11,13 @@ similar to strands-work.
 import argparse
 import base64
 import boto3
+import getpass
 import json
 import time
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -42,6 +44,11 @@ DEFAULT_MODEL_ID = "global.anthropic.claude-opus-4-7"
 # CreateHarness harnessName: Pattern [a-zA-Z][a-zA-Z0-9_]{0,39} — no hyphens.
 _HARNESS_NAME_API_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,39}$")
 
+# Cognito Web UI auth
+COGNITO_ADMIN_USERNAME = "admin"
+COGNITO_CLIENT_NAME = f"{project_name}-web-ui"
+SESSION_SIGNING_KEY_SECRET_NAME = f"{project_name}/session-signing-key"
+
 sts_client = boto3.client("sts", region_name=region)
 account_id = str(sts_client.get_caller_identity()["Account"])
 
@@ -63,6 +70,8 @@ ec2_client = boto3.client("ec2", region_name=region)
 s3files_client = boto3.client("s3files", region_name=region)
 s3vectors_client = boto3.client("s3vectors", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name=region)
+cognito_idp_client = boto3.client("cognito-idp", region_name=region)
+secretsmanager_client = boto3.client("secretsmanager", region_name=region)
 agentcore_control_client = boto3.client(
     "bedrock-agentcore-control",
     region_name=region,
@@ -2982,6 +2991,271 @@ def create_or_get_harness(
     }
 
 
+def _find_cognito_user_pool_id(pool_name: str) -> Optional[str]:
+    next_token = None
+    while True:
+        kwargs: Dict = {"MaxResults": 60}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        response = cognito_idp_client.list_user_pools(**kwargs)
+        for pool in response.get("UserPools", []):
+            if pool.get("Name") == pool_name:
+                return pool["Id"]
+        next_token = response.get("NextToken")
+        if not next_token:
+            return None
+
+
+def _cognito_pool_id_from_config() -> Optional[str]:
+    """Return cognito_user_pool_id from application/config.json if present."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        pool_id = (config.get("cognito_user_pool_id") or "").strip()
+        return pool_id or None
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def _cognito_user_pool_exists(user_pool_id: str) -> bool:
+    try:
+        cognito_idp_client.describe_user_pool(UserPoolId=user_pool_id)
+        return True
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("ResourceNotFoundException", "UserPoolNotFoundException"):
+            return False
+        raise
+
+
+def _resolve_cognito_user_pool_id(pool_name: Optional[str] = None) -> Optional[str]:
+    """Prefer a live config.json pool id, then list User Pools by project name."""
+    pool_id = _cognito_pool_id_from_config()
+    if pool_id and _cognito_user_pool_exists(pool_id):
+        return pool_id
+    return _find_cognito_user_pool_id(pool_name or project_name)
+
+
+def _find_cognito_client_id(user_pool_id: str, client_name: str) -> Optional[str]:
+    next_token = None
+    while True:
+        kwargs: Dict = {"UserPoolId": user_pool_id, "MaxResults": 60}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        response = cognito_idp_client.list_user_pool_clients(**kwargs)
+        for client in response.get("UserPoolClients", []):
+            if client.get("ClientName") == client_name:
+                return client["ClientId"]
+        next_token = response.get("NextToken")
+        if not next_token:
+            return None
+
+
+def _cognito_password_valid(password: str) -> Optional[str]:
+    """Return an error message if password does not meet Cognito policy, else None."""
+    if len(password) < 8:
+        return "Password must be at least 8 characters"
+    if not any(c.isupper() for c in password):
+        return "Password must include at least one uppercase letter"
+    if not any(c.islower() for c in password):
+        return "Password must include at least one lowercase letter"
+    if not any(c.isdigit() for c in password):
+        return "Password must include at least one number"
+    return None
+
+
+def prompt_cognito_admin_password() -> str:
+    """Prompt the operator for the Cognito admin password (confirmed twice).
+
+    Password is read with getpass so it is not echoed to the terminal.
+    Non-interactive runs are rejected — do not pass a default/hardcoded password.
+    """
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "Cognito admin password must be entered interactively. "
+            "Run `python installer.py` in a terminal and type the password when prompted."
+        )
+    logger.info("")
+    logger.info("Cognito admin user registration")
+    logger.info(f"  Username: {COGNITO_ADMIN_USERNAME}")
+    logger.info(
+        "  Password policy: min 8 chars, uppercase, lowercase, number "
+        "(symbols optional)"
+    )
+    while True:
+        password = getpass.getpass(
+            f"Enter password for Cognito admin '{COGNITO_ADMIN_USERNAME}': "
+        )
+        error = _cognito_password_valid(password)
+        if error:
+            logger.warning(f"  {error}. Try again.")
+            continue
+        confirm = getpass.getpass("Confirm password: ")
+        if password != confirm:
+            logger.warning("  Passwords do not match. Try again.")
+            continue
+        return password
+
+
+def _cognito_admin_exists(user_pool_id: str, username: str) -> bool:
+    try:
+        cognito_idp_client.admin_get_user(UserPoolId=user_pool_id, Username=username)
+        return True
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("UserNotFoundException", "ResourceNotFoundException"):
+            return False
+        raise
+
+
+def _create_cognito_admin_user(user_pool_id: str, username: str, password: str) -> None:
+    cognito_idp_client.admin_create_user(
+        UserPoolId=user_pool_id,
+        Username=username,
+        TemporaryPassword=password,
+        MessageAction="SUPPRESS",
+    )
+    cognito_idp_client.admin_set_user_password(
+        UserPoolId=user_pool_id,
+        Username=username,
+        Password=password,
+        Permanent=True,
+    )
+
+
+def create_cognito_user_pool(
+    admin_password: Optional[str] = None,
+) -> Dict[str, str]:
+    """Create Cognito User Pool (named project_name), app client, and admin user.
+
+    When the admin user does not yet exist, ``admin_password`` must be provided
+    (prompted interactively at install start) — never auto-generated.
+    """
+    logger.info("Creating Cognito User Pool for Web UI authentication")
+    pool_name = project_name
+    user_pool_id = _resolve_cognito_user_pool_id(pool_name)
+
+    if user_pool_id:
+        logger.info(f"  ✓ Reusing Cognito User Pool: {user_pool_id} (name={pool_name})")
+    else:
+        response = cognito_idp_client.create_user_pool(
+            PoolName=pool_name,
+            Policies={
+                "PasswordPolicy": {
+                    "MinimumLength": 8,
+                    "RequireUppercase": True,
+                    "RequireLowercase": True,
+                    "RequireNumbers": True,
+                    "RequireSymbols": False,
+                }
+            },
+            MfaConfiguration="OFF",
+            AdminCreateUserConfig={"AllowAdminCreateUserOnly": True},
+            Schema=[
+                {
+                    "Name": "email",
+                    "AttributeDataType": "String",
+                    "Mutable": True,
+                    "Required": False,
+                }
+            ],
+        )
+        user_pool_id = response["UserPool"]["Id"]
+        logger.info(f"  ✓ Cognito User Pool created: {user_pool_id} (name={pool_name})")
+
+    client_id = _find_cognito_client_id(user_pool_id, COGNITO_CLIENT_NAME)
+    if client_id:
+        logger.info(f"  ✓ Reusing Cognito App Client: {client_id}")
+    else:
+        client_response = cognito_idp_client.create_user_pool_client(
+            UserPoolId=user_pool_id,
+            ClientName=COGNITO_CLIENT_NAME,
+            GenerateSecret=False,
+            ExplicitAuthFlows=[
+                "ALLOW_USER_PASSWORD_AUTH",
+                "ALLOW_REFRESH_TOKEN_AUTH",
+                "ALLOW_USER_SRP_AUTH",
+            ],
+            PreventUserExistenceErrors="ENABLED",
+        )
+        client_id = client_response["UserPoolClient"]["ClientId"]
+        logger.info(f"  ✓ Cognito App Client created: {client_id}")
+
+    if _cognito_admin_exists(user_pool_id, COGNITO_ADMIN_USERNAME):
+        logger.info(
+            f"  ✓ Cognito admin user already exists: {COGNITO_ADMIN_USERNAME}"
+        )
+    else:
+        password = admin_password or prompt_cognito_admin_password()
+        _create_cognito_admin_user(user_pool_id, COGNITO_ADMIN_USERNAME, password)
+        logger.info(f"  ✓ Cognito admin user created: {COGNITO_ADMIN_USERNAME}")
+
+    cognito_info = {
+        "cognito_user_pool_id": user_pool_id,
+        "cognito_user_pool_name": pool_name,
+        "cognito_client_id": client_id,
+        "cognito_client_name": COGNITO_CLIENT_NAME,
+        "cognito_admin_username": COGNITO_ADMIN_USERNAME,
+        "cognito_region": region,
+    }
+    if write_config(CONFIG_PATH, cognito_info):
+        logger.info("  ✓ Saved Cognito settings to application/config.json")
+    return cognito_info
+
+
+def get_or_create_session_signing_key(*, rotate: bool = False) -> str:
+    """Ensure HMAC key for Web UI session cookies exists in Secrets Manager."""
+    secret_name = SESSION_SIGNING_KEY_SECRET_NAME
+
+    try:
+        existing = secretsmanager_client.get_secret_value(SecretId=secret_name)
+        current = (existing.get("SecretString") or "").strip()
+        if current and not rotate:
+            logger.info(
+                f"  ✓ Reusing session signing key from Secrets Manager: {secret_name}"
+            )
+            return current
+        new_value = secrets.token_urlsafe(32)
+        secretsmanager_client.put_secret_value(
+            SecretId=secret_name,
+            SecretString=new_value,
+        )
+        logger.info(f"  ✓ Rotated session signing key in Secrets Manager: {secret_name}")
+        return new_value
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+
+    new_value = secrets.token_urlsafe(32)
+    try:
+        secretsmanager_client.create_secret(
+            Name=secret_name,
+            Description=f"HMAC signing key for {project_name} Web UI session cookies",
+            SecretString=new_value,
+            Tags=[
+                {"Key": "Name", "Value": secret_name},
+                {"Key": "Project", "Value": project_name},
+            ],
+        )
+        logger.info(f"  ✓ Created session signing key secret: {secret_name}")
+        return new_value
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceExistsException":
+            if rotate:
+                new_value = secrets.token_urlsafe(32)
+                secretsmanager_client.put_secret_value(
+                    SecretId=secret_name,
+                    SecretString=new_value,
+                )
+                logger.info(
+                    f"  ✓ Rotated session signing key in Secrets Manager: {secret_name}"
+                )
+                return new_value
+            response = secretsmanager_client.get_secret_value(SecretId=secret_name)
+            return response["SecretString"]
+        raise
+
+
 def write_config(config_path: str, config_data: Dict, *, merge_existing: bool = True) -> bool:
     """Write config JSON, optionally merging with existing contents."""
     existing: Dict = {}
@@ -3025,6 +3299,7 @@ def build_config_from_deployment_state(
     s3_vectors_info: Optional[Dict[str, str]] = None,
     knowledge_base_mcp_info: Optional[Dict[str, str]] = None,
     artifact_share_mcp_info: Optional[Dict[str, str]] = None,
+    cognito_info: Optional[Dict[str, str]] = None,
 ) -> Dict:
     config_data: Dict = {
         "projectName": project_name,
@@ -3179,6 +3454,19 @@ def build_config_from_deployment_state(
             config_data["agentcore_gateway_role"] = artifact_share_mcp_info[
                 "agentcore_gateway_role"
             ]
+    if cognito_info:
+        config_data["cognito_user_pool_id"] = cognito_info.get(
+            "cognito_user_pool_id", ""
+        )
+        config_data["cognito_user_pool_name"] = cognito_info.get(
+            "cognito_user_pool_name", ""
+        )
+        config_data["cognito_client_id"] = cognito_info.get("cognito_client_id", "")
+        config_data["cognito_client_name"] = cognito_info.get("cognito_client_name", "")
+        config_data["cognito_admin_username"] = cognito_info.get(
+            "cognito_admin_username", ""
+        )
+        config_data["cognito_region"] = cognito_info.get("cognito_region", region)
     return config_data
 
 
@@ -3214,6 +3502,20 @@ def main():
     logger.info(f"Config: {CONFIG_PATH}")
     logger.info("=" * 60)
 
+    # Ask for Cognito admin password up front only when admin does not exist yet.
+    existing_cognito_pool_id = _resolve_cognito_user_pool_id(project_name)
+    cognito_admin_password: Optional[str] = None
+    if existing_cognito_pool_id and _cognito_admin_exists(
+        existing_cognito_pool_id, COGNITO_ADMIN_USERNAME
+    ):
+        logger.info(
+            f"  ✓ Cognito admin '{COGNITO_ADMIN_USERNAME}' already exists "
+            f"(pool={existing_cognito_pool_id}) — skipping password prompt"
+        )
+    else:
+        cognito_admin_password = prompt_cognito_admin_password()
+        logger.info("  ✓ Cognito admin password accepted (will create admin user later)")
+
     start_time = time.time()
     s3_bucket_name = None
     knowledge_base_role_arn = None
@@ -3235,9 +3537,13 @@ def main():
     image_uri = None
     image_build_tag = None
     app_environment = None
+    cognito_info = None
     deployment_success = False
 
     try:
+        get_or_create_session_signing_key()
+        cognito_info = create_cognito_user_pool(admin_password=cognito_admin_password)
+
         s3_bucket_name = create_s3_bucket()
         upload_skills_to_s3(s3_bucket_name)
 
@@ -3371,6 +3677,7 @@ def main():
                 s3_vectors_info=s3_vectors_info,
                 knowledge_base_mcp_info=knowledge_base_mcp_info,
                 artifact_share_mcp_info=artifact_share_mcp_info,
+                cognito_info=cognito_info,
             )
             if write_config(CONFIG_PATH, app_environment):
                 logger.info(
@@ -3446,6 +3753,15 @@ def main():
         logger.info(f"  Memory ARN: {agent_memory_arn}")
         logger.info(f"  Harness ID: {harness_info['harness_id']}")
         logger.info(f"  Harness ARN: {harness_info['harness_arn']}")
+        if cognito_info:
+            logger.info(
+                f"  Cognito User Pool: {cognito_info.get('cognito_user_pool_id')} "
+                f"({cognito_info.get('cognito_user_pool_name')})"
+            )
+            logger.info(f"  Cognito Client ID: {cognito_info.get('cognito_client_id')}")
+            logger.info(
+                f"  Cognito Admin: {cognito_info.get('cognito_admin_username')}"
+            )
         if ecs_info:
             logger.info(
                 f"  ECS Service: {ecs_info.get('service_name')} "
@@ -3461,6 +3777,10 @@ def main():
             logger.info(f"  https://{ui_cloudfront_info['domain']}")
             logger.info(
                 "  Note: CloudFront/ECS may take 10–20 minutes to fully propagate"
+            )
+            logger.info(
+                f"  Login with Cognito username '{COGNITO_ADMIN_USERNAME}' "
+                "(or a user from add_user.py)"
             )
             logger.info("=" * 60)
     except Exception as e:
@@ -3491,6 +3811,7 @@ def main():
             s3_vectors_info=s3_vectors_info,
             knowledge_base_mcp_info=knowledge_base_mcp_info,
             artifact_share_mcp_info=artifact_share_mcp_info,
+            cognito_info=cognito_info,
         )
         if app_environment is not None:
             config_data = {**app_environment, **config_data}
