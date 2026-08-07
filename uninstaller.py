@@ -919,13 +919,8 @@ def delete_artifact_share_mcp_runtime(cfg: Dict):
     logger.info("  Deleting Artifact Share MCP Runtime")
     runtime_names = [
         _artifact_share_mcp_runtime_name(),
-        f"s3_sharing_of_{project_name}".replace("-", "_"),  # legacy
     ]
-    arn = (
-        cfg.get("artifact_share_mcp_runtime_arn")
-        or cfg.get("s3_sharing_mcp_runtime_arn")
-        or ""
-    )
+    arn = cfg.get("artifact_share_mcp_runtime_arn") or ""
 
     try:
         next_token = None
@@ -971,9 +966,7 @@ def delete_artifact_share_mcp_runtime(cfg: Dict):
 
     repos = {
         cfg.get("artifact_share_mcp_ecr_repository") or "",
-        cfg.get("s3_sharing_mcp_ecr_repository") or "",
         _artifact_share_mcp_runtime_name(),
-        f"s3_sharing_of_{project_name}".replace("-", "_"),
     }
     ecr = boto3.client("ecr", region_name=region)
     for repo in {r for r in repos if r}:
@@ -1159,13 +1152,6 @@ INSTALLER_CONFIG_KEYS = [
     "artifact_share_mcp_ecr_repository",
     "artifact_share_mcp_image_tag",
     "artifact_share_mcp_gateway_target_id",
-    # legacy rename leftovers
-    "s3_sharing_mcp_runtime_arn",
-    "s3_sharing_mcp_url",
-    "s3_sharing_mcp_role",
-    "s3_sharing_mcp_ecr_repository",
-    "s3_sharing_mcp_image_tag",
-    "s3_sharing_mcp_gateway_target_id",
     "agentcore_gateway_arn",
     "agentcore_gateway_id",
     "agentcore_gateway_role",

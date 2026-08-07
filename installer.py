@@ -3426,15 +3426,6 @@ def build_config_from_deployment_state(
             config_data["artifact_share_mcp_image_tag"] = artifact_share_mcp_info[
                 "latest_image_tag"
             ]
-        for legacy in (
-            "s3_sharing_mcp_runtime_arn",
-            "s3_sharing_mcp_url",
-            "s3_sharing_mcp_role",
-            "s3_sharing_mcp_ecr_repository",
-            "s3_sharing_mcp_image_tag",
-            "s3_sharing_mcp_gateway_target_id",
-        ):
-            config_data.pop(legacy, None)
         # Prefer gateway fields from either MCP deploy (shared project gateway).
         if artifact_share_mcp_info.get("agentcore_gateway_arn") and not config_data.get(
             "agentcore_gateway_arn"
