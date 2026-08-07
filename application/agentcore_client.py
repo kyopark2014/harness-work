@@ -529,6 +529,115 @@ def _json_preview(obj, max_len: int = 2400) -> str:
     return s
 
 
+def _image_format_from_name(file_name: str) -> str:
+    lower = (file_name or "").lower()
+    if lower.endswith((".jpg", ".jpeg")):
+        return "jpeg"
+    if lower.endswith(".gif"):
+        return "gif"
+    if lower.endswith(".webp"):
+        return "webp"
+    return "png"
+
+
+def _describe_images_with_bedrock(prompt: str, files: list[str]) -> str:
+    """
+    InvokeHarness content blocks are text-only, so describe attached images
+    with Bedrock Converse (vision) and inject the result into the harness prompt.
+    """
+    if not files:
+        return ""
+
+    content_blocks: list[dict] = []
+    names: list[str] = []
+    for file_ref in files:
+        try:
+            file_name, image_bytes = utils.load_image_bytes_from_ref(file_ref)
+            fmt = _image_format_from_name(file_name)
+            content_blocks.append(
+                {
+                    "image": {
+                        "format": fmt,
+                        "source": {"bytes": image_bytes},
+                    }
+                }
+            )
+            names.append(file_name)
+            logger.info("vision describe: loaded %s (%s bytes)", file_name, len(image_bytes))
+        except Exception as exc:
+            logger.warning("vision describe: failed to load %s: %s", file_ref, exc)
+            content_blocks.append(
+                {
+                    "text": f"(이미지 로드 실패: {file_ref} — {exc})",
+                }
+            )
+
+    if not any("image" in block for block in content_blocks):
+        return ""
+
+    user_text = (prompt or "").strip() or "첨부한 이미지를 자세히 설명해주세요."
+    content_blocks.append(
+        {
+            "text": (
+                "다음 첨부 이미지를 자세히 분석하세요. 구성 요소, 텍스트/레이블, "
+                "화살표·연결 관계, 전체 의미를 markdown으로 정리하세요.\n"
+                f"사용자 요청: {user_text}"
+            )
+        }
+    )
+
+    try:
+        import chat as chat_mod
+
+        model_id = getattr(chat_mod, "model_id", None) or (
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        )
+        # Prefer a fast vision-capable model for enrichment
+        if "opus" in str(model_id).lower() or "sonnet" in str(model_id).lower():
+            vision_model = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        else:
+            vision_model = model_id
+
+        runtime = boto3.client("bedrock-runtime", region_name=bedrock_region)
+        response = runtime.converse(
+            modelId=vision_model,
+            messages=[{"role": "user", "content": content_blocks}],
+            inferenceConfig={"maxTokens": 4096, "temperature": 0.2},
+        )
+        parts = []
+        for block in response.get("output", {}).get("message", {}).get("content", []):
+            text = block.get("text")
+            if text:
+                parts.append(text)
+        description = "\n".join(parts).strip()
+        if not description:
+            return ""
+        label = ", ".join(names) if names else "첨부 이미지"
+        return (
+            f"[첨부 이미지 분석: {label}]\n{description}\n"
+            f"[이미지 URL]\n" + "\n".join(f"- {u}" for u in files)
+        )
+    except Exception as exc:
+        logger.warning("vision describe via Converse failed: %s", exc)
+        urls = "\n".join(f"- {u}" for u in files)
+        return f"[첨부 이미지 URL]\n{urls}"
+
+
+def build_harness_prompt_with_files(prompt: str, files: list | None = None) -> str:
+    """Merge user text with vision description of attached image URLs."""
+    text = (prompt or "").strip()
+    file_list = [str(f).strip() for f in (files or []) if str(f).strip()]
+    if not file_list:
+        return text
+    if not text:
+        text = "첨부한 이미지를 분석해주세요."
+    description = _describe_images_with_bedrock(text, file_list)
+    if description:
+        return f"{text}\n\n---\n{description}"
+    urls = "\n".join(f"- {u}" for u in file_list)
+    return f"{text}\n\n[첨부 이미지 URL]\n{urls}"
+
+
 def run_harness(
     prompt,
     notification_queue=None,
@@ -536,6 +645,7 @@ def run_harness(
     mcp_servers=None,
     runtime_session_id=None,
     actor_id=None,
+    files=None,
 ):
     """
     Run the provisioned AgentCore Harness (deployment/test_invoke_harness.py shape).
@@ -545,6 +655,7 @@ def run_harness(
     it is used when the name does not match (see logs).
 
     skill_list / mcp_servers override harness defaults for this invocation when provided.
+    files: optional CloudFront/S3 image URLs attached in the chat UI.
     """
     tool_info_list.clear()
     tool_result_list.clear()
@@ -570,6 +681,7 @@ def run_harness(
     # Prefer per-call session (React task id); fall back to module default.
     session_id = (runtime_session_id or "").strip() or globals()["runtime_session_id"]
     resolved_actor = (actor_id or projectName or "harness").replace("-", "_")
+    effective_prompt = build_harness_prompt_with_files(prompt, files)
 
     try:
         import skill as skill_mod
@@ -597,7 +709,8 @@ def run_harness(
         logger.info(f"invoke_harness model: {model_cfg}")
         logger.debug(
             f"invoke_harness: harnessArn: {harness_arn}, session: {session_id}, "
-            f"actorId: {resolved_actor}, prompt_len: {len(prompt or '')}"
+            f"actorId: {resolved_actor}, prompt_len: {len(effective_prompt or '')}, "
+            f"files: {len(files or [])}"
         )
 
         invoke_kwargs = {
@@ -608,7 +721,7 @@ def run_harness(
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"text": prompt}],
+                    "content": [{"text": effective_prompt}],
                 }
             ],
         }

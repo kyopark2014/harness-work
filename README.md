@@ -12,6 +12,8 @@ AgentCore의 관리형 에이전트 하네스(Managed Agent Harness)는 사전 �
 - **Skill**: Git(Anthropic 공식) 또는 S3 URI로 런타임에 주입
 - **MCP / Browser / Code Interpreter**: UI 선택 → `tools` 배열로 전달
 - **모델**: 사이드바 선택 → `model.bedrockModelConfig`로 호출마다 override
+- **채팅 첨부**: `+` 버튼으로 이미지(사진·화면 캡처) 첨부, 문서 RAG 업로드
+- **Knowledge Base**: S3 Vectors 기반 Bedrock KB (`docs/` 인제스션)
 
 AWS 오픈소스 에이전트 프레임워크 [Strands Agents](https://strandsagents.com/docs/user-guide/quickstart/python/)로 구동됩니다.
 
@@ -25,20 +27,24 @@ AWS 오픈소스 에이전트 프레임워크 [Strands Agents](https://strandsag
 flowchart TB
   INST[installer.py] -->|CreateHarness + VPC + S3 Files| H[AgentCore Harness]
   INST --> Mem[AgentCore Memory]
-  INST --> S3[(S3 bucket<br/>skills/ · sessions/)]
+  INST --> KB[Bedrock KB<br/>S3 Vectors]
+  INST --> S3[(S3 bucket<br/>skills/ · docs/ · images/ · sessions/)]
   INST --> VPC[VPC + NAT<br/>private subnets]
   INST -->|Docker → ECR| ECS[ECS Fargate Web UI]
   INST --> ALB[ALB]
   INST --> CFUI[CloudFront UI]
   Mem --> H
   S3 -->|S3 Files Access Point<br/>mount /mnt/workspace| H
+  S3 -->|docs/ data source| KB
   VPC --> H
   VPC --> ECS
   ECS --> ALB --> CFUI
 
   CFUI --> App[server.py + React]
+  App -->|upload images/docs| S3
   App --> RH[run_harness]
   RH -->|skills · tools · model<br/>runtimeSessionId · actorId| H
+  RH -.->|첨부 이미지 비전 요약| BR[Bedrock Converse]
 
   subgraph Harness["Harness 런타임 microVM"]
     Loop[Strands agent loop]
@@ -60,9 +66,9 @@ flowchart TB
 
 | 단계 | 경로 |
 |------|------|
-| 프로비저닝 | `installer.py` → S3 · skills · IAM · Memory · VPC · S3 Files · `CreateHarness` · **ECR/ECS/ALB/UI CloudFront** → `application/config.json` |
-| 호출 | React UI → Skill/MCP/모델 선택 → SSE `/api/tasks/{id}/chat` → `run_harness` → `invoke_harness` |
-| 삭제 | `uninstaller.py` → ECS/ALB/UI CF · Harness · S3 Files · VPC · Memory · IAM 정리 |
+| 프로비저닝 | `installer.py` → S3 · skills · IAM · Memory · **S3 Vectors KB** · VPC · S3 Files · `CreateHarness` · **ECR/ECS/ALB/UI CloudFront** → `application/config.json` |
+| 호출 | React UI → Skill/MCP/모델 · **이미지 첨부** → SSE `/api/tasks/{id}/chat` → `run_harness` → `invoke_harness` |
+| 삭제 | `uninstaller.py` → ECS/ALB/UI CF · Harness · KB · S3 Vectors · S3 Files · VPC · Memory · IAM 정리 |
 
 ---
 
@@ -116,7 +122,62 @@ pip install -r requirement.txt
 python uninstaller.py
 ```
 
-`application/config.json`은 gitignore됩니다. installer가 `HARNESS_ARN`, `s3_bucket`, VPC·S3 Files, ECS(`app_url`) 필드를 채웁니다.
+`application/config.json`은 gitignore됩니다. installer가 `HARNESS_ARN`, `s3_bucket`, VPC·S3 Files, **Knowledge Base / S3 Vectors**, ECS(`app_url`) 필드를 채웁니다.
+
+---
+
+## 채팅 파일 · 이미지 업로드
+
+채팅 입력창 **+** 버튼으로 이미지와 RAG 문서를 올릴 수 있습니다 (`harness-skills` / `agent-skills`와 동일한 UX).
+
+| 메뉴 | 동작 |
+|------|------|
+| **사진 첨부** | png/jpeg/webp/gif — 파일 선택, **Ctrl/⌘+V 붙여넣기**, 드래그앤드롭 |
+| **Upload to RAG** | pdf/txt/md/docx 등 → S3 `docs/{user_id}/` + Knowledge Base 인제스션 |
+
+### 이미지 첨부 흐름
+
+```text
+[+ / paste / drop]
+  → multipart POST /api/files/upload
+  → S3 images/{user_id}/{name} + CloudFront URL
+  → 첨부 칩(미리보기)에 URL 보관
+
+[전송]
+  → POST /api/tasks/{id}/chat  JSON { prompt, files: [cdnUrl, ...] }
+  → task_store에 user 메시지 + images 저장
+  → run_harness(..., files=files)
+       · InvokeHarness content는 text만 지원
+       · 첨부가 있으면 Bedrock Converse(비전)로 이미지 요약 후 프롬프트에 주입
+       · invoke_harness(messages=[{text: enriched_prompt}])
+```
+
+프롬프트만 비어 있고 이미지만 있으면 기본 문구 `"첨부한 이미지를 분석해주세요."` 를 사용합니다.
+
+### RAG 업로드 흐름
+
+```text
+[+ → Upload to RAG]
+  → multipart POST /api/rag/upload
+  → S3 docs/{user_id}/{file} (+ {file}.metadata.json)
+  → StartIngestionJob (knowledge_base_id / data_source_id)
+  → UI에 assistant 알림 메시지 (채팅 files에는 포함되지 않음)
+```
+
+`docs/` prefix는 installer가 만든 Bedrock Knowledge Base 데이터 소스의 `inclusionPrefixes`와 맞춥니다.
+
+### 관련 API · 코드
+
+| 경로 | 역할 |
+|------|------|
+| `POST /api/files/upload` | 채팅용 이미지 → S3 `images/` |
+| `POST /api/rag/upload` | RAG 문서 → S3 `docs/` + KB sync |
+| `POST /api/tasks/{id}/chat` | `{ prompt, files: string[] }` SSE |
+| `application/web/src/components/ChatInput.tsx` | `+` 메뉴 · paste/drop · 첨부 칩 |
+| `application/web/src/hooks/useFileUpload.ts` | 업로드 상태 · clipboard 이미지 |
+| `application/api/routes_files.py` / `routes_rag.py` | 업로드 엔드포인트 |
+| `application/services/rag_service.py` | KB 메타데이터 · 인제스션 |
+| `application/agentcore_client.py` | `build_harness_prompt_with_files` (비전 요약) |
 
 ---
 
@@ -130,6 +191,7 @@ S3 Files 마운트는 **VPC 네트워크 모드**가 필요합니다. `s3_files_
 # installer.py main (요약)
 s3_bucket_name = create_s3_bucket()          # versioning=Enabled (S3 Files 요구)
 upload_skills_to_s3(s3_bucket_name)         # skills/ → s3://{bucket}/skills/
+# … Knowledge Base (S3 Vectors + docs/ data source) …
 execution_role_arn = create_harness_execution_role()
 # … Memory …
 
@@ -389,11 +451,13 @@ HARNESS_MCP_CATALOG = {
 
 ```text
 React Sidebar (Skill · MCP · 모델 선택)
+React ChatInput (+ 이미지 첨부 → files: CDN URL[])
    → chat.update(modelName)          # model_id 갱신
    → agentcore_client.run_harness(
          prompt,
          skill_list=[...],
          mcp_servers=[...],
+         files=[...],                 # optional image CDN URLs
      )
 ```
 

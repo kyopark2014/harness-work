@@ -25,6 +25,7 @@ router = APIRouter(prefix="/api/tasks", tags=["chat"])
 SSE_HEARTBEAT_INTERVAL_SECONDS = 15
 AGENT_STREAM_TIMEOUT_SECONDS = 1200
 LATE_PERSIST_WAIT_SECONDS = 1800
+DEFAULT_IMAGE_PROMPT = "첨부한 이미지를 분석해주세요."
 
 _TOOL_INPUT_RE = re.compile(r"^Tool: (.+?), Input:\s*(.*)$", re.DOTALL)
 _TOOL_RESULT_RE = re.compile(r"^Tool Result(?: \(.+?\))?: (.+)$", re.DOTALL)
@@ -378,6 +379,7 @@ def _run_harness_thread(
     runtime_session_id: str,
     message_queue: queue.Queue,
     result_holder: dict[str, Any],
+    files: list[str] | None = None,
 ) -> None:
     sink = QueueNotificationSink(message_queue)
 
@@ -392,6 +394,7 @@ def _run_harness_thread(
             skill_list=skill_list,
             mcp_servers=mcp_servers,
             runtime_session_id=runtime_session_id,
+            files=files or [],
         )
         if not isinstance(response, str):
             response = json.dumps(response, ensure_ascii=False)
@@ -411,11 +414,14 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
+    files = [url.strip() for url in (body.files or []) if url and url.strip()]
     prompt = body.prompt.strip()
+    if not prompt and files:
+        prompt = DEFAULT_IMAGE_PROMPT
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
-    task_store.add_message(task_id, "user", prompt)
+    task_store.add_message(task_id, "user", prompt, images=files)
 
     message_queue: queue.Queue = queue.Queue()
     result_holder: dict[str, Any] = {"content": "", "images": []}
@@ -430,6 +436,7 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
             "runtime_session_id": task.get("runtime_session_id") or task_id,
             "message_queue": message_queue,
             "result_holder": result_holder,
+            "files": files,
         },
         daemon=True,
     )

@@ -39,6 +39,18 @@ export function buildOptimisticUserMessage(
   };
 }
 
+export function buildRagUploadNotice(taskId: string, message: string): Message {
+  return {
+    id: `rag-upload-${randomUUID()}`,
+    task_id: taskId,
+    role: "assistant",
+    content: message,
+    images: [],
+    tool_events: [],
+    created_at: new Date().toISOString(),
+  };
+}
+
 export function buildPendingAssistantMessage(
   taskId: string,
   content: string,

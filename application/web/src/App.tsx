@@ -13,6 +13,7 @@ import {
   buildDisplayPrompt,
   buildOptimisticUserMessage,
   buildPendingAssistantMessage,
+  buildRagUploadNotice,
   shouldAppendAssistantMessage,
   stabilizeMessageKeys,
 } from "./services/messageService";
@@ -510,6 +511,14 @@ export default function App() {
     await dispatchSend(taskId, prompt, files);
   }
 
+  async function handleRagUploadComplete(message: string) {
+    if (!activeTaskId) return;
+    setMessages((prev) => [
+      ...prev,
+      buildRagUploadNotice(activeTaskId, message),
+    ]);
+  }
+
   async function handleNewTaskAndCloseSidebar() {
     await handleNewTask();
     setSidebarOpen(false);
@@ -578,6 +587,7 @@ export default function App() {
               onResumeQueue={handleResumeQueue}
               onStop={handleStop}
               onSend={handleSend}
+              onRagUploadComplete={handleRagUploadComplete}
             />
           }
         />

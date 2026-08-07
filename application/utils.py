@@ -1,8 +1,10 @@
 import logging
 import sys
 import json
+import traceback
 import boto3
 import os
+from urllib import parse
 
 logging.basicConfig(
     level=logging.INFO,  # Default to INFO level
@@ -86,4 +88,186 @@ config = load_config()
 bedrock_region = config["region"]
 projectName = config["projectName"]
 accountId = config["accountId"]
+s3_bucket = config.get("s3_bucket") or (
+    f"storage-for-{projectName}-{accountId}-{bedrock_region}"
+)
+sharing_url = (config.get("sharing_url") or "").rstrip("/")
+knowledge_base_id = config.get("knowledge_base_id") or ""
+data_source_id = config.get("data_source_id") or ""
+
+
+def sanitize_user_path_segment(user_id: str | None) -> str | None:
+    """Return a safe single path segment for per-user S3 folders, or None."""
+    if not user_id:
+        return None
+    raw = str(user_id).strip()
+    if raw.startswith("v1.") and raw.count(".") >= 2:
+        logger.warning("Refusing signed session token as S3 path segment")
+        return None
+    if len(raw) > 128:
+        logger.warning("Refusing oversized user_id as S3 path segment")
+        return None
+    segment = (
+        raw.replace("/", "_").replace("\\", "_").replace("..", "_")
+    )
+    return segment or None
+
+
+def get_contents_type(file_name: str) -> str:
+    lower = file_name.lower()
+    if lower.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if lower.endswith(".png"):
+        return "image/png"
+    if lower.endswith(".webp"):
+        return "image/webp"
+    if lower.endswith(".gif"):
+        return "image/gif"
+    if lower.endswith(".pdf"):
+        return "application/pdf"
+    if lower.endswith(".txt"):
+        return "text/plain"
+    if lower.endswith(".csv"):
+        return "text/csv"
+    if lower.endswith((".ppt", ".pptx")):
+        return "application/vnd.ms-powerpoint"
+    if lower.endswith((".doc", ".docx")):
+        return "application/msword"
+    if lower.endswith((".xls", ".xlsx")):
+        return "application/vnd.ms-excel"
+    if lower.endswith(".py"):
+        return "text/x-python"
+    if lower.endswith(".js"):
+        return "application/javascript"
+    if lower.endswith(".md"):
+        return "text/markdown"
+    if lower.endswith((".html", ".htm")):
+        return "text/html; charset=utf-8"
+    if lower.endswith(".json"):
+        return "application/json"
+    return "no info"
+
+
+def upload_to_s3(
+    file_bytes: bytes,
+    file_name: str,
+    user_id: str | None = None,
+) -> dict | None:
+    """Upload a file to S3 under docs/ or images/ and return upload metadata."""
+    if not s3_bucket:
+        logger.error("s3_bucket is not configured")
+        return None
+
+    try:
+        s3_client = boto3.client(service_name="s3", region_name=bedrock_region)
+        content_type = get_contents_type(file_name)
+        prefix = "images" if content_type.startswith("image/") else "docs"
+        user_segment = sanitize_user_path_segment(user_id)
+        if user_segment:
+            s3_key = f"{prefix}/{user_segment}/{file_name}"
+            relative_url_path = (
+                f"{prefix}/{parse.quote(user_segment)}/{parse.quote(file_name)}"
+            )
+        else:
+            s3_key = f"{prefix}/{file_name}"
+            relative_url_path = f"{prefix}/{parse.quote(file_name)}"
+
+        put_params = {
+            "Bucket": s3_bucket,
+            "Key": s3_key,
+            "Metadata": {"content_type": content_type},
+            "Body": file_bytes,
+        }
+        if content_type != "no info":
+            put_params["ContentType"] = content_type
+        if content_type == "application/pdf":
+            put_params["ContentDisposition"] = "inline"
+
+        s3_client.put_object(**put_params)
+
+        url = None
+        if sharing_url:
+            url = f"{sharing_url}/{relative_url_path}"
+
+        return {
+            "file_name": file_name,
+            "s3_key": s3_key,
+            "content_type": content_type,
+            "url": url,
+        }
+    except Exception:
+        logger.error("Error uploading to S3: %s", traceback.format_exc())
+        return None
+
+
+def get_active_ingestion_job() -> dict | None:
+    """Return the in-progress KB ingestion job, if any."""
+    if not knowledge_base_id or not data_source_id:
+        return None
+    try:
+        client = boto3.client("bedrock-agent", region_name=bedrock_region)
+        response = client.list_ingestion_jobs(
+            knowledgeBaseId=knowledge_base_id,
+            dataSourceId=data_source_id,
+            maxResults=5,
+        )
+        for job in response.get("ingestionJobSummaries") or []:
+            if job.get("status") in ("IN_PROGRESS", "STARTING"):
+                return job
+        return None
+    except Exception:
+        logger.error("Error listing ingestion jobs: %s", traceback.format_exc())
+        raise
+
+
+def sync_data_source() -> dict | None:
+    """Start a Knowledge Base ingestion job for the configured data source."""
+    if not knowledge_base_id or not data_source_id:
+        logger.error("knowledge_base_id or data_source_id is not configured")
+        return None
+    try:
+        client = boto3.client("bedrock-agent", region_name=bedrock_region)
+        response = client.start_ingestion_job(
+            knowledgeBaseId=knowledge_base_id,
+            dataSourceId=data_source_id,
+        )
+        job = response.get("ingestionJob", {})
+        return {
+            "ingestion_job_id": job.get("ingestionJobId"),
+            "status": job.get("status"),
+        }
+    except Exception:
+        logger.error("Error syncing data source: %s", traceback.format_exc())
+        return None
+
+
+def s3_key_from_file_ref(file_ref: str) -> str | None:
+    """Extract an S3 object key from a CloudFront/S3 URL or raw key."""
+    ref = (file_ref or "").strip()
+    if not ref:
+        return None
+    if ref.startswith("s3://"):
+        without = ref[5:]
+        parts = without.split("/", 1)
+        return parts[1] if len(parts) == 2 else None
+    if "://" in ref:
+        path = parse.urlparse(ref).path.lstrip("/")
+        return parse.unquote(path) if path else None
+    if ref.startswith("images/") or ref.startswith("docs/"):
+        return ref
+    return None
+
+
+def load_image_bytes_from_ref(file_ref: str) -> tuple[str, bytes]:
+    """Load image bytes from S3 given a URL or key. Returns (file_name, bytes)."""
+    if not s3_bucket:
+        raise ValueError("s3_bucket is not configured")
+    s3_key = s3_key_from_file_ref(file_ref)
+    if not s3_key:
+        raise ValueError(f"Cannot resolve S3 key from ref: {file_ref}")
+    file_name = os.path.basename(s3_key)
+    s3_client = boto3.client("s3", region_name=bedrock_region)
+    logger.info("loading image from s3://%s/%s", s3_bucket, s3_key)
+    image_obj = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+    return file_name, image_obj["Body"].read()
 

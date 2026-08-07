@@ -48,6 +48,22 @@ export interface SessionInfo {
   knowledge_graph_enabled?: boolean;
 }
 
+export interface FileUploadResult {
+  ok: boolean;
+  file_name: string;
+  s3_key: string;
+  url: string;
+  content_type?: string;
+}
+
+export interface RagUploadResult {
+  ok: boolean;
+  file_name: string;
+  s3_key: string;
+  url?: string;
+  message: string;
+}
+
 export const api = {
   getSession: () => request<SessionInfo | null>("/api/session"),
   setSession: (credential: string) =>
@@ -83,6 +99,60 @@ export const api = {
     request<{ ok: boolean }>(`/api/tasks/${id}`, { method: "DELETE" }),
   getMessages: (id: string) =>
     request<{ messages: Message[] }>(`/api/tasks/${id}/messages`),
+  uploadToRag: async (file: File): Promise<RagUploadResult> => {
+    uiLog("rag:upload start", { name: file.name, size: file.size });
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch("/api/rag/upload", {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      uiError("rag:upload failed", { status: res.status, body: text });
+      let message = text || res.statusText;
+      try {
+        const parsed = JSON.parse(text) as { detail?: string };
+        if (typeof parsed.detail === "string" && parsed.detail) {
+          message = parsed.detail;
+        }
+      } catch {
+        // keep raw text
+      }
+      throw new Error(message);
+    }
+    const data = (await res.json()) as RagUploadResult;
+    uiLog("rag:upload complete", data);
+    return data;
+  },
+  uploadFile: async (file: File): Promise<FileUploadResult> => {
+    uiLog("file:upload start", { name: file.name, size: file.size, type: file.type });
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch("/api/files/upload", {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      uiError("file:upload failed", { status: res.status, body: text });
+      let message = text || res.statusText;
+      try {
+        const parsed = JSON.parse(text) as { detail?: string };
+        if (typeof parsed.detail === "string" && parsed.detail) {
+          message = parsed.detail;
+        }
+      } catch {
+        // keep raw text
+      }
+      throw new Error(message);
+    }
+    const data = (await res.json()) as FileUploadResult;
+    uiLog("file:upload complete", data);
+    return data;
+  },
   streamChat: async function* (
     taskId: string,
     prompt: string,
