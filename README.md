@@ -18,6 +18,8 @@ AgentCore의 관리형 에이전트 하네스(Managed Agent Harness)는 사전 �
 
 AWS 오픈소스 에이전트 프레임워크 [Strands Agents](https://strandsagents.com/docs/user-guide/quickstart/python/)로 구동됩니다.
 
+<img width="1150" height="455" alt="image" src="https://github.com/user-attachments/assets/9a9cab8b-b172-4a79-a25d-e574410415a4" />
+
 ---
 
 ## Operation Architecture
