@@ -659,4 +659,3 @@ Agent 실행시 sidebar에서 task별로 session이 분리된 대화를 이어�
 - [Strands Agents](https://strandsagents.com/)
 - [Boto3 CreateHarness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/create_harness.html)
 - [Boto3 InvokeHarness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore/client/invoke_harness.html)
-<img width="1089" height="680" alt="knowledge_graph" src="https://github.com/user-attachments/assets/6f27a764-c612-4556-93d4-3ca34ce46701" />
