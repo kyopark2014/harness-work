@@ -4,6 +4,8 @@ AgentCore의 관리형 에이전트 하네스(Managed Agent Harness)는 사전 �
 
 이 저장소는 **인프라 프로비저닝(`installer.py`)** 과 **React + FastAPI UI(`application/`)** 로 구성됩니다. Harness는 VPC 모드 + Amazon S3 Files 마운트로 세션 스토리지를 붙이고, UI에서 고른 Skill·MCP·모델을 `InvokeHarness` 호출마다 override합니다. Web UI는 로컬 실행뿐 아니라 **Docker → ECR → ECS Fargate**(ALB + CloudFront)로도 배포합니다 (`strands-work`와 동일한 패턴).
 
+<img width="1000" alt="image" src="https://github.com/user-attachments/assets/9a9cab8b-b172-4a79-a25d-e574410415a4" />
+
 ## 주요 특징
 
 - 모든 세션이 Firecracker microVM에서 격리 실행
@@ -18,7 +20,6 @@ AgentCore의 관리형 에이전트 하네스(Managed Agent Harness)는 사전 �
 
 AWS 오픈소스 에이전트 프레임워크 [Strands Agents](https://strandsagents.com/docs/user-guide/quickstart/python/)로 구동됩니다.
 
-<img width="1150" height="455" alt="image" src="https://github.com/user-attachments/assets/9a9cab8b-b172-4a79-a25d-e574410415a4" />
 
 ---
 
