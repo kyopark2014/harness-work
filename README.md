@@ -1,4 +1,4 @@
-# AgentCore Harness
+# AgentCore Harness Work
 
 AgentCore의 관리형 에이전트 하네스(Managed Agent Harness)는 사전 구축 작업을 단순한 설정(configuration)으로 대체합니다.
 
