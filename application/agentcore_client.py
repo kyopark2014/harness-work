@@ -142,6 +142,28 @@ def update_streaming_result(notification_queue, message):
     if notification_queue is not None:
         notification_queue.stream(message)
 
+def commit_streaming_segment(notification_queue, message: str):
+    if notification_queue is not None:
+        notification_queue.commit_text_segment(message)
+
+def on_tool_use_started(
+    notification_queue,
+    current: str,
+    tool_use_id: str,
+    tool_info_list: dict,
+) -> str:
+    """Commit pre-tool assistant text when a new tool call starts.
+
+    Resets the streaming accumulator so later tokens are a new segment.
+    Without this, mid-turn text is concatenated across tools and the UI
+    collapses intermediate messages to the end of the turn.
+    """
+    if not tool_use_id or tool_use_id in tool_info_list:
+        return current
+    commit_streaming_segment(notification_queue, current)
+    tool_info_list[tool_use_id] = True
+    return ""
+
 def tool_slot_update(notification_queue, slot_key: str, message: str):
     if notification_queue is not None:
         notification_queue.tool_update(slot_key, message)
@@ -858,6 +880,9 @@ def run_harness(
                             ttype = tu.get("type")
                             sname = tu.get("serverName")
                             if tid and idx is not None:
+                                current = on_tool_use_started(
+                                    notification_queue, current, tid, tool_info_list
+                                )
                                 tool_name_list[tid] = name
                                 if hasattr(notification_queue, "register_tool"):
                                     notification_queue.register_tool(tid, name)
