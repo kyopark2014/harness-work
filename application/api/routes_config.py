@@ -52,16 +52,16 @@ class DefaultsPatch(BaseModel):
     default_mcp_servers: list[str] | None = None
 
 
-def _skill_options() -> list[str]:
+def _skill_options(user_id: str | None = None) -> list[str]:
     if skill.skill_managers.get("base") is None:
         skill.register_plugin_skills("base")
-    return [s["name"] for s in skill.available_skill_info("base")]
+    return [s["name"] for s in skill.available_skill_info("base", user_id=user_id)]
 
 
 @router.get("")
 def get_config(request: Request):
-    get_optional_user_id(request)  # cookie presence is optional for config
-    skill_options = _skill_options()
+    user_id = get_optional_user_id(request)  # cookie presence is optional for config
+    skill_options = _skill_options(user_id)
     mcp_options = list(mcp_config.MCP_OPTIONS)
     default_skills, default_mcp = utils.get_initial_tool_defaults()
     default_skills = [s for s in default_skills if s in skill_options]

@@ -317,70 +317,25 @@ VPC 모드에서 managed harness 이미지(`…dkr.ecr…/harness-<region>:lates
 
 ```
 skills/
-├── docx/                 # Anthropic git skill (이름만으로 git URL 매핑)
-│   └── SKILL.md
-├── pptx/ pdf/ xlsx/
-└── korea-weather/        # 커스텀 → S3 URI로 전달
+├── docx/ pptx/ pdf/ xlsx/   # 수정본 → installer가 S3 skills/ 로 업로드
+├── skill-creator/
+└── korea-weather/           # 커스텀 → 동일하게 S3 skills/ 로 전달
     ├── SKILL.md
     └── scripts/
         ├── get_weather.py
         └── recall_home_location.py
-
-MCP/
-├── knowledge-base/       # Bedrock KB retrieve (AgentCore Runtime MCP)
-└── artifact-share/       # share_artifact → S3 + CloudFront 공유 URL
 ```
 
 각 스킬은 Anthropic Agent Skills 스펙의 `SKILL.md`(YAML frontmatter + 본문)를 가집니다.
 
 ### 발견 (`application/skill.py`)
 
-UI는 프로젝트 루트 `skills/`를 스캔합니다.
-
-```python
-# skill.py
-PROJECT_ROOT = os.path.dirname(APPLICATION_DIR)
-SKILLS_DIR = os.path.join(PROJECT_ROOT, "skills")
-
-ANTHROPIC_GIT_SKILLS = {"docx", "pptx", "pdf", "xlsx"}
-ANTHROPIC_SKILLS_GIT_URL = "https://github.com/anthropics/skills"
-```
-
+UI는 프로젝트 루트 `skills/`와 (로그인 시) skill-creator 세션 스킬을 스캔합니다.  
 `SkillManager`가 `skills/*/SKILL.md`를 읽어 체크박스 목록을 만듭니다.
 
-### InvokeHarness용 payload (`build_harness_skills`)
+### InvokeHarness용 payload
 
-선택 이름이 Anthropic 세트의면 **git**, 아니면 **S3** URI를 씁니다.
-
-```python
-def build_harness_skills(skill_list: list[str]) -> list[dict]:
-    s3_bucket = (utils.load_config() or {}).get("s3_bucket") or ""
-    harness_skills = []
-    for name in skill_list:
-        if name in ANTHROPIC_GIT_SKILLS:
-            harness_skills.append({
-                "git": {
-                    "url": ANTHROPIC_SKILLS_GIT_URL,
-                    "path": f"skills/{name}",
-                }
-            })
-        elif s3_bucket:
-            harness_skills.append(
-                {"s3": {"uri": f"s3://{s3_bucket}/skills/{name}/"}}
-            )
-        else:
-            harness_skills.append({"path": f"skills/{name}"})
-    return harness_skills
-```
-
-예시 결과:
-
-```python
-[
-  {"git": {"url": "https://github.com/anthropics/skills", "path": "skills/docx"}},
-  {"s3": {"uri": "s3://storage-for-harness-work-…/skills/korea-weather/"}},
-]
-```
+선택 스킬 → `skills` 배열 매핑은 [`build_harness_skills`](#harness-skills) 를 참고하세요.
 
 ### S3 업로드 (`installer.upload_skills_to_s3`)
 
@@ -404,6 +359,161 @@ Harness 런타임에서 S3 스킬은 보통 다음 경로에 마운트됩니다.
 1. `skills/<name>/SKILL.md` (+ `scripts/` 등) 작성  
 2. (선택) installer 재실행 또는 `aws s3 sync skills/<name> s3://{bucket}/skills/<name>/`  
 3. React 사이드바 Skill 선택 → 다음 `InvokeHarness`에 `skills`로 전달  
+
+---
+
+## Harness Skills
+
+`application/skill.py`의 `build_harness_skills(skill_list, user_id)`가 UI에서 고른 스킬 이름을  
+`InvokeHarness`의 `skills` payload로 바꿉니다. 소스는 크게 세 가지입니다.
+
+```mermaid
+flowchart LR
+  UI[UI skill_list] --> B[build_harness_skills]
+  B -->|builtin / 커스텀 레포 스킬| S3["s3://{bucket}/skills/{name}/"]
+  B -->|skill-creator| M[materialize_user_skill_for_harness]
+  M -->|clean copy| U["s3://{bucket}/skills/users/{user}/{name}/"]
+  GitOpt["git 소스 (API 지원)"] -.-> H[InvokeHarness]
+  S3 --> H
+  U --> H
+```
+
+### 1) S3로 복사한 skills 활용 (기본)
+
+레포 `skills/<name>/`를 installer가 버킷에 올리고, invoke 시 그 URI를 붙입니다.
+
+| 단계 | 내용 |
+|------|------|
+| 업로드 | `installer.upload_skills_to_s3` → `s3://{bucket}/skills/<name>/` |
+| 대상 | `docx`, `pptx`, `pdf`, `xlsx`, `skill-creator`, `korea-weather` 등 **로컬 `skills/`에 있는 이름** |
+| payload | `{"s3": {"uri": "s3://{bucket}/skills/{name}/"}}` |
+
+```text
+skills/korea-weather/SKILL.md
+  → s3://{bucket}/skills/korea-weather/SKILL.md
+runtime mount
+  → /home/.agents/skills/s3/korea-weather/...
+```
+
+이 프로젝트는 Anthropic 공식 스킬도 **git 대신** 수정본을 S3에 올려 씁니다 (`build_harness_skills` docstring: runtime uses those copies—not git).
+
+### 2) GitHub에서 가져오는 방법
+
+`InvokeHarness`는 S3뿐 아니라 **git 소스**도 받습니다. 업스트림을 그대로 쓸 때:
+
+```python
+{
+    "git": {
+        "url": "https://github.com/anthropics/skills",
+        "path": "skills/docx",   # 또는 pptx / pdf / xlsx
+    }
+}
+```
+
+| 항목 | 값 |
+|------|-----|
+| 저장소 | [anthropics/skills](https://github.com/anthropics/skills) |
+| path | `skills/<name>` (`docx`, `pptx`, `pdf`, `xlsx` 등) |
+
+현재 `build_harness_skills`는 git 분기를 쓰지 않고 **1번 S3 복사본**을 기본으로 합니다.  
+공식 원본을 쓰고 싶으면 payload에 위 `git` 객체를 넣으면 됩니다 (로컬 `SKILL.md` 수정분은 반영되지 않음).
+
+### 3) skill-creator → session storage 스킬 활용
+
+skill-creator가 만든 스킬은 사용자 세션 스토리지에 저장됩니다.
+
+| 단계 | 경로 |
+|------|------|
+| 작성 위치 (런타임) | `/mnt/workspace/{user_id}/skills/<name>/` |
+| S3 Files 대응 | `s3://{bucket}/agentcore-sessions/{user_id}/skills/<name>/` |
+| UI 목록 | 로컬 mount 또는 S3에서 `SKILL.md` 있는 디렉터리 스캔 |
+| Invoke 직전 | `materialize_user_skill_for_harness`가 **clean copy** 생성 |
+
+판별 (`build_harness_skills`):
+
+- `user_id`가 있고, 해당 이름이 **builtin `skills/`에 없거나** session/S3에 user skill로 존재하면 → user skill 경로
+- 그 외 builtin → `s3://{bucket}/skills/{name}/`
+
+clean copy 규칙:
+
+- 소스: `agentcore-sessions/{user}/skills/{name}/`
+- 대상: `s3://{bucket}/skills/users/{user}/{name}/`
+- **제외**: S3 Files 디렉터리 마커(`*/` 0바이트), 루트 `evals/` (Errno 17 방지)
+- payload: `{"s3": {"uri": "s3://{bucket}/skills/users/{user}/{name}/"}}`
+
+예시 (`user_id=ksdyb`, `system-monitor` 선택):
+
+```python
+[
+  {"s3": {"uri": "s3://…/skills/docx/"}},
+  {"s3": {"uri": "s3://…/skills/users/ksdyb/system-monitor/"}},
+]
+```
+
+materialize 실패 시에만 raw `agentcore-sessions/.../skills/{name}/` URI로 fallback합니다 (마커가 있으면 런타임 추출이 실패할 수 있음).
+
+### 요약
+
+| 출처 | S3 / Git URI | 비고 |
+|------|----------------|------|
+| 레포 `skills/` (installer) | `s3://{bucket}/skills/{name}/` | 기본 경로 |
+| GitHub anthropics/skills | `git.url` + `git.path` | API 지원, 현재 코드는 미사용 |
+| skill-creator (session) | `s3://{bucket}/skills/users/{user}/{name}/` | session에서 clean copy 후 부착 |
+
+구현: `application/skill.py` — `build_harness_skills`, `materialize_user_skill_for_harness`.
+
+---
+
+## Harness 환경 제한
+
+AgentCore Harness microVM에서 에이전트가 실제로 쓸 수 있는 런타임은 로컬 Mac/Linux와 다릅니다.  
+`SKILL.md`·스크립트·시스템 프롬프트(`agentcore_client._HARNESS_SYSTEM_PROMPT_BASE`)는 아래 제약을 전제로 작성하세요.
+
+### Node.js / npm 미지원 → Python 사용
+
+| 금지 | 대안 |
+|------|------|
+| `node`, `npm`, `npx` | `python3` |
+| `docx` (npm) / docx-js | `python-docx` |
+| `pptxgenjs` / react-icons | `python-pptx` |
+
+- Node 바이너리가 없어 `command not found` / exit 127로 끝납니다.
+- 문서·슬라이드·스프레드시트는 **처음부터 Python**으로 생성하세요. Node 경로를 “있는지 확인”하는 probe도 하지 마세요.
+
+### `pip` 없음 → `pip3` 명시
+
+| 금지 | 사용 |
+|------|------|
+| `pip install …` | `pip3 install …` |
+| `pip show …` | `pip3 show …` |
+
+예시:
+
+```bash
+pip3 install python-docx
+pip3 install python-pptx
+pip3 install openpyxl
+```
+
+패키지 import 실패 시에도 `pip`가 아니라 `pip3`로 설치한 뒤 바로 재실행합니다.
+
+### 경로·산출물
+
+| 항목 | 올바른 위치 |
+|------|-------------|
+| S3로 주입된 스킬 스크립트 | `/home/.agents/skills/s3/<skill-name>/…` |
+| 세션 영속 스토리지 | `/mnt/workspace` (S3 Files) |
+| 산출물 (PDF, DOCX, PNG 등) | `/mnt/workspace/{actor_id}/artifacts/` |
+
+- `$WORKING_DIR/skills/...`, `skills/...` 상대경로는 Harness에 **없습니다**.
+- skill-creator가 만든 스킬은 워크스페이스의 `…/skills/<name>/`에 두고, Invoke 시에는 마커/`evals/`를 제거한  
+  `s3://{bucket}/skills/users/{user_id}/{name}/` 로 붙여집니다.
+
+### 기타
+
+- **InvokeHarness image content block 미지원** — UI 첨부 이미지는 Bedrock 비전 요약 후 텍스트로 주입합니다.
+- S3 Files에서 `mkdir`로 생긴 **0바이트 디렉터리 마커**(`evals/` 등)를 그대로 skill URI로 붙이면  
+  런타임 추출이 `[Errno 17] File exists: .../evals` 로 실패할 수 있습니다 (위 clean copy로 회피).
 
 ---
 
@@ -516,7 +626,10 @@ React ChatInput (+ 이미지 첨부 → files: CDN URL[])
 
 ```python
 # agentcore_client.run_harness (요약)
-skills = skill_mod.build_harness_skills(skill_list or [])
+skills = skill_mod.build_harness_skills(
+    skill_list or [],
+    user_id=(actor_id or "").strip() or None,
+)
 tools = mcp_config.build_harness_tools(mcp_servers or [])
 model_cfg = chat_mod.harness_model_config()
 # 예: {"bedrockModelConfig": {"modelId": "us.anthropic.claude-sonnet-5"}}

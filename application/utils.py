@@ -124,6 +124,20 @@ def sanitize_user_path_segment(user_id: str | None) -> str | None:
     return segment or None
 
 
+def get_user_skills_dir(user_id: str | None) -> str:
+    """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/skills (does not create)."""
+    segment = sanitize_user_path_segment(user_id) or "default"
+    return os.path.join(SESSION_STORAGE_DIR, segment, "skills")
+
+
+def ensure_user_skills_dir(user_id: str | None) -> str:
+    """Create {SESSION_STORAGE_DIR}/{user_id}/skills if needed and return it."""
+    skills_dir = get_user_skills_dir(user_id)
+    os.makedirs(skills_dir, exist_ok=True)
+    logger.info("user skills dir ready: %s", skills_dir)
+    return skills_dir
+
+
 def get_user_graph_dir(user_id: str | None) -> str:
     """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/graph (does not create)."""
     segment = sanitize_user_path_segment(user_id)

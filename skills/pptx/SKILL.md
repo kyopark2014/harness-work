@@ -10,13 +10,15 @@ A `.pptx` is a ZIP archive of XML files. Choose your approach by task:
 
 | Task | Approach |
 |---|---|
-| **Create** a new deck | Write a `pptxgenjs` script — see gotchas below |
-| **Edit** an existing deck, or build from a template | unzip → edit `ppt/slides/slideN.xml` → zip |
+| **Create** a new deck | Write a Python script with `python-pptx` — see gotchas below |
+| **Edit** an existing deck, or build from a template | Prefer `python-pptx` when possible; otherwise unzip → edit `ppt/slides/slideN.xml` → zip |
 | **Read** content | `markitdown deck.pptx` (one block per slide under `<!-- Slide number: N -->` markers); visual grid: `python scripts/thumbnail.py deck.pptx` |
+
+> **Runtime note:** Node.js/npm is **not** available here. Do **not** use `pptxgenjs` / `node` / `npm` / `react-icons`. Create decks with Python (`python-pptx`) from the start. If import fails: `pip3 install python-pptx`.
 
 ## Scripts
 
-Paths are relative to this skill's directory. Everything else is plain Python, `node`, or shell.
+Paths are relative to this skill's directory. Everything else is plain Python or shell.
 
 | Script | What it does |
 |---|---|
@@ -26,28 +28,18 @@ Paths are relative to this skill's directory. Everything else is plain Python, `
 | `scripts/office/validate.py deck.pptx [--original src.pptx]` | Schema, relationship, content-type, chart and slide checks; each failure names its fix. Pass `--original` for any template-derived deck — it baselines the schema checks against the template, so the template's own XSD errors don't read as yours |
 | `scripts/office/soffice.py --headless --convert-to pdf deck.pptx` | LibreOffice wrapper — bare `soffice` hangs in this sandbox |
 
-## Creating with pptxgenjs — gotchas
+## Creating with python-pptx — gotchas
 
-`pptxgenjs` is preinstalled — do not run `npm install` first; write the script and `require('pptxgenjs')` directly. Only if that require fails: `npm install pptxgenjs`. The model knows the API; these are the footguns:
+Use `python-pptx` only — never probe for `node`, `npm`, or `pptxgenjs`. The model knows the API; these are the footguns:
 
-- **Set `pres.layout` before adding slides.** The default canvas is `LAYOUT_16x9` = **10" × 5.625"**, not 13.3" wide. Coordinates past the edge are written, not clamped — the shape just isn't on the slide. (`LAYOUT_WIDE` is 13.3" × 7.5".)
-- **Hex colors: never `#`, never 8 digits.** `color: "FF0000"`. Both `"#FF0000"` and alpha baked into the hex (`"00000020"`) **corrupt the file**. For translucency: `transparency: 0-100` on fills and images, `opacity: 0.0-1.0` on shadows — each is silently ignored on the other.
-- **pptxgenjs mutates option objects in place** (converts values to EMU on first use). Never share one `shadow`/options object across two `add*` calls — build a fresh object each time.
-- **Shadow `offset` must be ≥ 0** — a negative offset corrupts the file. To cast a shadow upward, use `angle: 270` with a positive offset.
-- **`letterSpacing` is silently ignored** — the real option is `charSpacing`.
-- **Lists:** `bullet: true` on each item, never a literal `•` (renders double bullets). Set `breakLine: true` on every array item except the last. Space bulleted paragraphs with `paraSpaceAfter`, not `lineSpacing` (huge gaps).
-- **One `new pptxgen()` per output file** — never reuse an instance.
-- **`rectRadius` only works on `ROUNDED_RECTANGLE`**, not `RECTANGLE`.
-- **Gradient fills aren't supported** — use a gradient image as the background instead.
-- **Text boxes have built-in internal padding** — set `margin: 0` whenever text must align with a shape, line, or icon at the same x.
-- **Speaker notes go in `slide.addNotes("...")`** (plain text, once per slide), never in a text box on the slide.
-- **Keep charts native.** Use `addChart()` for everything PowerPoint can chart (pass an array of `{type, data, options}` for combos). For PowerPoint-native features the library doesn't expose (trendlines, error bars), compute the extra series yourself or post-process the generated OOXML — do not fall back to a rendered image. Only chart types PowerPoint has no native form for (Sankey, network, chord) go in as images.
-- **Default charts render bare** — no title, no data labels, dated palette. Set `showTitle` + `title`, `showValue: true` + `dataLabelPosition`, `chartColors: [...]` from your palette, and quiet the frame (`catAxisLabelColor`/`valAxisLabelColor`, `valGridLine: { color, size }`, `catGridLine: { style: "none" }`, `showLegend: false` for a single series).
-- **On a stacked bar or column chart, `dataLabelPosition` must be `ctr`, `inEnd`, or `inBase`.** `outEnd` **corrupts the file**.
-- **A combo series using `secondaryValAxis`/`secondaryCatAxis` needs both `valAxes` and `catAxes` on the chart options, two entries each.** Without them pptxgenjs writes axis *ids* it never declares, and PowerPoint **discards that chart** and reports the file as corrupt. Supplying only `valAxes` is not enough.
-- **After `writeFile()`, run `python scripts/office/validate.py deck.pptx`.** It reports the two chart faults above and the slide-XML defects PowerPoint refuses, and names the fix for each. Fix them in your generator, not by hand-editing the packed XML.
-- **Never reorder the children of `<p:presentation>`.** pptxgenjs writes `<p:notesMasterIdLst>` right after `<p:sldIdLst>` and points both masters at one theme part. PowerPoint reads that happily — move the element and the same deck becomes unopenable.
-- **Icons:** render `react-icons` to SVG (`ReactDOMServer.renderToStaticMarkup`), rasterize with `sharp` at ≥256px, and insert via `addImage({ data: "image/png;base64," + buf.toString("base64") })` — the `image/png;base64,` prefix is required (`react-icons`, `react`, `react-dom`, and `sharp` are preinstalled — `npm install react-icons react react-dom sharp` only if a require fails).
+- **Set slide size early.** Default is often 4:3; for 16:9 set `prs.slide_width` / `prs.slide_height` (e.g. `Inches(13.333)`, `Inches(7.5)`). Shapes past the edge are written but not visible.
+- **Do not assign `text_frame.text = "..."` when you need formatting** — that collapses the paragraph to a single unstyled run. Set `run.text` and style the run instead.
+- **Lists:** use paragraph level / bullet font; never insert a literal `•` (renders double bullets).
+- **One `Presentation()` per output file** — save with `prs.save(path)`.
+- **Charts:** prefer native `shapes.add_chart(...)` when PowerPoint can render the chart type. Exotic charts (Sankey, network) can be images.
+- **Icons/images:** use PNG/JPEG files on disk with `shapes.add_picture(...)`. Do not rely on Node/`react-icons`/`sharp`.
+- **After saving, run `python scripts/office/validate.py deck.pptx`.** Fix generator issues; do not hand-edit packed XML unless needed.
+- **Speaker notes:** use notes slide / notes text frame APIs, not a fake text box on the slide body.
 
 ## Editing existing decks and templates
 
@@ -197,9 +189,9 @@ the schema and slide checks against the template, suppressing errors it already 
 The structural checks — relationships, content types, charts — ignore `--original` and
 report template-inherited problems either way, so read those on their own merits.
 
-pptxgenjs emits chart XML PowerPoint refuses to open, and every other tool
-accepts: python-pptx opens those decks, LibreOffice renders them, the XSD
-passes them. Every failure names its fix. Fix it in the generator and rebuild.
+Some generators emit chart XML PowerPoint refuses to open even when other tools
+accept it. Prefer python-pptx charts, then re-validate. Every failure names its
+fix — fix it in the generator and rebuild.
 
 ### Visual QA
 
@@ -235,4 +227,4 @@ ls -1 "$PWD"/slide-*.jpg
 
 ## Dependencies
 
-`pptxgenjs` (npm, preinstalled — install only if `require('pptxgenjs')` fails) · `markitdown[pptx]`, `Pillow`, `defusedxml`, `lxml` (pip — text dump, thumbnail, clean, validate) · LibreOffice (`soffice`, auto-configured for sandboxed environments via `scripts/office/soffice.py`) · `pdftoppm` (Poppler)
+`python-pptx` (install with `pip3 install python-pptx` if missing) · `markitdown[pptx]`, `Pillow`, `defusedxml`, `lxml` (pip — text dump, thumbnail, clean, validate) · LibreOffice (`soffice`, auto-configured for sandboxed environments via `scripts/office/soffice.py`) · `pdftoppm` (Poppler). Node.js/npm is not available.

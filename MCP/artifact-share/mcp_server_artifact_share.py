@@ -219,17 +219,17 @@ def _sync_retry_delays() -> list[float]:
 def _copy_to_sharing(filepath: str, actor_id: str) -> str:
     uid = (actor_id or "").strip()
     if not uid:
-        return "Upload failed: actor_id is required"
+        return "Share failed: actor_id is required"
     if not _bucket:
-        return "Upload failed: S3 bucket is not configured (set S3_BUCKET)"
+        return "Share failed: S3 bucket is not configured (set S3_BUCKET)"
     if not filepath or not str(filepath).strip():
-        return "Upload failed: filepath is required"
+        return "Share failed: filepath is required"
 
     filepath = str(filepath).strip()
     dest = _dest_key(filepath, uid)
     if not dest.startswith(_ALLOWED_DEST_PREFIXES):
         return (
-            "Upload failed: S3 key must start with "
+            "Share failed: S3 key must start with "
             f"{', '.join(_ALLOWED_DEST_PREFIXES)} (got {dest!r})"
         )
 
@@ -265,7 +265,7 @@ def _copy_to_sharing(filepath: str, actor_id: str) -> str:
             tried = ", ".join(candidates[:4])
             waited = sum(delays)
             return (
-                f"Upload failed: File not found for {filepath!r} "
+                f"Share failed: File not found for {filepath!r} "
                 f"(looked under s3://{_bucket}/… e.g. {tried}; "
                 f"retried {len(delays)}x over ~{waited:.0f}s). "
                 "Ensure the file exists under ARTIFACTS_DIR "
@@ -297,10 +297,10 @@ def _copy_to_sharing(filepath: str, actor_id: str) -> str:
         else:
             logger.info("object already at sharing key: %s", dest)
 
-        return f"Upload complete: {_public_url(dest)}"
+        return f"Share complete: {_public_url(dest)}"
     except Exception as e:
-        logger.error("upload failed: %s", e)
-        return f"Upload failed: {e}"
+        logger.error("share failed: %s", e)
+        return f"Share failed: {e}"
 
 
 try:
@@ -336,7 +336,7 @@ def share_artifact(filepath: str, actor_id: str) -> str:
     filepath: ARTIFACTS_DIR path, e.g.
         '/mnt/workspace/{actor_id}/artifacts/report.pdf' or 'artifacts/report.pdf'.
     actor_id: account login id from the system prompt. Do NOT use a nickname.
-    return: 'Upload complete: <url>' or an error message.
+    return: 'Share complete: <url>' or an error message.
     """
     logger.info("share_artifact --> filepath=%s actor_id=%s", filepath, actor_id)
     try:
@@ -345,7 +345,7 @@ def share_artifact(filepath: str, actor_id: str) -> str:
         return result
     except Exception as e:
         logger.error("Error in share_artifact: %s", e)
-        return f"Upload failed: {str(e)}"
+        return f"Share failed: {str(e)}"
 
 
 if __name__ == "__main__":

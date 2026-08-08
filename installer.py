@@ -360,7 +360,7 @@ def _project_s3_bucket_arns() -> Tuple[str, str]:
 
 def create_knowledge_base_role() -> str:
     """Create Knowledge Base IAM role with least-privilege policies."""
-    logger.info("[3/12] Creating Knowledge Base IAM role")
+    logger.info("[3/25] Creating Knowledge Base IAM role")
     role_name = f"role-knowledge-base-for-{project_name}-{region}"
 
     assume_role_policy = _bedrock_knowledge_base_trust_policy()
@@ -532,7 +532,7 @@ def delete_knowledge_base(knowledge_base_id: str) -> None:
 
 def create_s3_vectors_store() -> Dict[str, str]:
     """Create S3 vector bucket and index for Bedrock Knowledge Base."""
-    logger.info("[4/12] Creating S3 Vectors store (vector bucket + index)")
+    logger.info("[4/25] Creating S3 Vectors store (vector bucket + index)")
 
     vector_bucket_arn = s3_vectors_bucket_arn()
     index_arn = s3_vectors_index_arn()
@@ -645,7 +645,7 @@ def create_knowledge_base_with_s3_vectors(
     s3_vectors_info: Dict[str, str], knowledge_base_role_arn: str, s3_bucket_name: str
 ) -> Tuple[str, str]:
     """Create Knowledge Base with S3 Vectors as the vector store."""
-    logger.info("[KB] Creating Knowledge Base with S3 Vectors")
+    logger.info("[5/25] Creating Knowledge Base with S3 Vectors")
 
     bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
 
@@ -791,7 +791,7 @@ def knowledge_base_mcp_url(agent_runtime_arn: str, runtime_region: str | None = 
 
 def create_knowledge_base_mcp_role() -> str:
     """IAM role assumed by the Knowledge Base MCP AgentCore Runtime."""
-    logger.info("[6.1/14] Creating Knowledge Base MCP Runtime IAM role")
+    logger.info("[6/25] Creating Knowledge Base MCP Runtime IAM role")
     role_name = f"role-kb-mcp-for-{project_name}-{region}"
     if len(role_name) > 64:
         role_name = f"role-kb-mcp-{project_name[:20]}-{region}"[:64]
@@ -922,7 +922,7 @@ def _run_docker(cmd: List[str], description: str) -> None:
 
 def push_knowledge_base_mcp_image() -> Tuple[str, str]:
     """Build MCP/knowledge-base image and push to ECR. Returns (repository, tag)."""
-    logger.info("[6.2/14] Building Knowledge Base MCP Docker image and pushing to ECR")
+    logger.info("[7/25] Building Knowledge Base MCP Docker image and pushing to ECR")
 
     if not shutil.which("docker"):
         raise RuntimeError("docker is required to build the Knowledge Base MCP image")
@@ -985,7 +985,7 @@ def create_or_update_knowledge_base_mcp_runtime(
     sharing_url: str = "",
 ) -> Dict[str, str]:
     """Create or update AgentCore Runtime (MCP protocol) for Knowledge Base retrieve."""
-    logger.info("[6.3/14] Creating/updating Knowledge Base MCP AgentCore Runtime")
+    logger.info("[8/25] Creating/updating Knowledge Base MCP AgentCore Runtime")
     runtime_name = repository
     container_uri = (
         f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repository}:{image_tag}"
@@ -1082,7 +1082,7 @@ def _agentcore_gateway_role_name() -> str:
 
 def create_agentcore_gateway_role() -> str:
     """IAM service role for the project AgentCore Gateway (all MCP targets)."""
-    logger.info("[7.1/14] Creating project AgentCore Gateway IAM role")
+    logger.info("[9/25] Creating project AgentCore Gateway IAM role")
     gateway_name = _agentcore_gateway_name()
     role_name = _agentcore_gateway_role_name()
 
@@ -1352,7 +1352,7 @@ def _ensure_mcp_gateway_target(
 
 def ensure_project_agentcore_gateway() -> Dict[str, str]:
     """Create or reuse the shared project AgentCore Gateway (IAM inbound)."""
-    logger.info("[7.2/14] Ensuring project AgentCore Gateway")
+    logger.info("[10/25] Ensuring project AgentCore Gateway")
     gateway_name = _agentcore_gateway_name()
     gateway_role_arn = create_agentcore_gateway_role()
 
@@ -1476,7 +1476,7 @@ def _artifact_share_mcp_repository_name() -> str:
 
 def create_artifact_share_mcp_role() -> str:
     """IAM role assumed by the Artifact Share MCP AgentCore Runtime."""
-    logger.info("[8.1/14] Creating Artifact Share MCP Runtime IAM role")
+    logger.info("[11/25] Creating Artifact Share MCP Runtime IAM role")
     role_name = f"role-artifact-share-mcp-for-{project_name}-{region}"
     if len(role_name) > 64:
         role_name = f"role-artifact-share-mcp-{project_name[:20]}-{region}"[:64]
@@ -1579,7 +1579,7 @@ def create_artifact_share_mcp_role() -> str:
 
 def push_artifact_share_mcp_image() -> Tuple[str, str]:
     """Build MCP/artifact-share image and push to ECR. Returns (repository, tag)."""
-    logger.info("[8.2/14] Building Artifact Share MCP Docker image and pushing to ECR")
+    logger.info("[12/25] Building Artifact Share MCP Docker image and pushing to ECR")
 
     if not shutil.which("docker"):
         raise RuntimeError("docker is required to build the Artifact Share MCP image")
@@ -1626,7 +1626,7 @@ def create_or_update_artifact_share_mcp_runtime(
     sharing_url: str = "",
 ) -> Dict[str, str]:
     """Create or update AgentCore Runtime (MCP protocol) for S3 sharing uploads."""
-    logger.info("[8.3/14] Creating/updating Artifact Share MCP AgentCore Runtime")
+    logger.info("[13/25] Creating/updating Artifact Share MCP AgentCore Runtime")
     runtime_name = repository
     container_uri = (
         f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repository}:{image_tag}"
@@ -1794,7 +1794,7 @@ def _s3_files_provisioner() -> s3_files_vpc.S3FilesVpcProvisioner:
 def create_s3_bucket() -> str:
     """Create S3 bucket with CORS configuration."""
     bucket_name = _bucket_name()
-    logger.info(f"[1/9] Creating S3 bucket: {bucket_name}")
+    logger.info(f"[1/25] Creating S3 bucket: {bucket_name}")
 
     try:
         logger.debug(f"Creating bucket in region: {region}")
@@ -1948,7 +1948,7 @@ def upload_skills_to_s3(s3_bucket_name: str) -> int:
     Also deletes remote skill prefixes that are no longer present locally
     (e.g. renamed s3-sharing → artifact-share MCP).
     """
-    logger.info(f"[2/9] Uploading skills to s3://{s3_bucket_name}/{SKILLS_S3_PREFIX}/")
+    logger.info(f"[2/25] Uploading skills to s3://{s3_bucket_name}/{SKILLS_S3_PREFIX}/")
 
     if not os.path.isdir(SKILLS_DIR):
         logger.warning(f"Skills directory not found: {SKILLS_DIR}; skipping upload")
@@ -1998,7 +1998,7 @@ def upload_skills_to_s3(s3_bucket_name: str) -> int:
 
 def create_cloudfront_distribution(s3_bucket_name: str) -> Dict[str, str]:
     """Create project-scoped CloudFront distribution with S3 origin (file sharing)."""
-    logger.info("[9/12] Creating CloudFront distribution (S3 sharing)")
+    logger.info("[20/25] Creating CloudFront distribution (S3 sharing)")
     comment = _cloudfront_comment()
     oai_cmt = _oai_comment()
 
@@ -2131,7 +2131,7 @@ def create_harness_execution_role(
     agentcore_gateway_arn: Optional[str] = None,
 ) -> str:
     """Create IAM execution role for Bedrock AgentCore harness."""
-    logger.info("[9/14] Creating Harness execution IAM role")
+    logger.info("[14/25] Creating Harness execution IAM role")
     role_name = f"role-harness-for-{project_name}-{region}"
     if len(role_name) > 64:
         logger.error(
@@ -2419,7 +2419,7 @@ def _shared_memory_strategies() -> list:
 
 def create_agentcore_memory_role() -> str:
     """Create AgentCore Memory IAM role."""
-    logger.info("[4/9] Creating AgentCore Memory IAM role")
+    logger.info("[15/25] Creating AgentCore Memory IAM role")
     role_name = f"role-agentcore-memory-for-{project_name}-{region}"
 
     # Trust must include aws:SourceAccount / aws:SourceArn; CreateMemory rejects otherwise.
@@ -2488,7 +2488,7 @@ def create_agentcore_memory(role_arn: str, user_id: str = "installer") -> str:
     user_id is unused for strategy naming — kept for call-site compatibility.
     User isolation uses {actorId}/{sessionId} namespace templates from CreateEvent.
     """
-    logger.info("[5/9] Creating AgentCore Memory")
+    logger.info("[16/25] Creating AgentCore Memory")
 
     memory_client = MemoryClient(region_name=region)
     # CreateMemory name: [a-zA-Z][a-zA-Z0-9_]{0,47} — hyphens not allowed.
@@ -2869,7 +2869,7 @@ def create_or_get_harness(
     agentcore_gateway_arn: Optional[str] = None,
 ) -> Dict[str, str]:
     """Create AgentCore Harness or reuse an existing one by API name."""
-    logger.info("[8/12] Creating AgentCore Harness")
+    logger.info("[19/25] Creating AgentCore Harness")
 
     harness_api_name = harness_name_for_api(project_name)
     logger.info(f"  harnessName: {harness_api_name} (from projectName={project_name!r})")
@@ -3580,9 +3580,9 @@ def main():
         agent_memory_arn = _memory_arn_from_id(memory_id)
 
         provisioner = _s3_files_provisioner()
-        logger.info("[6/12] Ensuring VPC for Harness (S3 Files requires VPC mode)")
+        logger.info("[17/25] Ensuring VPC for Harness (S3 Files requires VPC mode)")
         vpc_info = provisioner.ensure_vpc()
-        logger.info("[7/12] Creating S3 Files session storage")
+        logger.info("[18/25] Creating S3 Files session storage")
         s3_files_info = provisioner.create_s3_files_session_storage(
             vpc_info,
             s3_bucket_name,
@@ -3598,7 +3598,6 @@ def main():
                 "agentcore_gateway_arn"
             ),
         )
-        logger.info("[9/12] Creating project S3 CloudFront (file sharing)")
         cloudfront_info = create_cloudfront_distribution(s3_bucket_name)
         sharing_url = f"https://{cloudfront_info.get('domain', '')}".rstrip("/")
         ensure_harness_sharing_env(
@@ -3610,14 +3609,14 @@ def main():
         )
         if sharing_url and sharing_url != prior_sharing_url:
             if knowledge_base_mcp_info:
-                logger.info("Refreshing Knowledge Base MCP SHARING_URL")
+                logger.info("[21/25] Refreshing Knowledge Base MCP SHARING_URL")
                 refresh_knowledge_base_mcp_env(
                     knowledge_base_mcp_info,
                     knowledge_base_id=knowledge_base_id,
                     sharing_url=sharing_url,
                 )
             if artifact_share_mcp_info:
-                logger.info("Refreshing Artifact Share MCP SHARING_URL")
+                logger.info("[22/25] Refreshing Artifact Share MCP SHARING_URL")
                 refresh_artifact_share_mcp_env(
                     artifact_share_mcp_info,
                     s3_bucket_name=s3_bucket_name,
@@ -3635,7 +3634,7 @@ def main():
                 logger=logger,
                 bucket_name=s3_bucket_name,
             )
-            logger.info("[10/12] Creating ECS roles / ALB / UI CloudFront")
+            logger.info("[23/25] Creating ECS roles / ALB / UI CloudFront")
             ecs_roles = deployer.create_ecs_roles()
             vpc_info = deployer.ensure_web_security_groups(vpc_info)
             deployer.prepare_s3files_for_ecs(
@@ -3676,7 +3675,7 @@ def main():
                 )
                 logger.info("  ./run_local.sh")
 
-            logger.info("[11/12] Building Docker image and deploying ECS")
+            logger.info("[24/25] Building Docker image and deploying ECS")
             repository_uri = deployer.create_ecr_repository()
             if args.skip_docker_build:
                 image_uri = deployer.resolve_ecr_image_uri(repository_uri)
@@ -3702,7 +3701,8 @@ def main():
                 s3_files_info=s3_files_info,
                 origin_header_value=origin_header_value,
             )
-            logger.info("[12/12] Waiting for CloudFront / ECS readiness")
+            logger.info("[25/25] Waiting for CloudFront / ECS readiness")
+
             deployer.check_application_ready(ui_cloudfront_info["domain"])
             deployment_success = True
 

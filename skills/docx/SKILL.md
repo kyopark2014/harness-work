@@ -10,27 +10,27 @@ A `.docx` is a ZIP archive of XML files. Choose your approach by task:
 
 | Task | Approach |
 |---|---|
-| **Create** a new document | Write a `docx` (npm) script — see gotchas below |
-| **Edit** an existing document | `unzip` → edit `word/document.xml` → `zip` (docx-js cannot open existing files) |
+| **Create** a new document | Write a Python script with `python-docx` — see gotchas below |
+| **Edit** an existing document | Prefer `python-docx` when possible; otherwise `unzip` → edit `word/document.xml` → `zip` |
 | **Read** content | `pandoc -t markdown file.docx` |
 
 > Script paths below are relative to this skill's directory.
 
-## Creating with docx-js — gotchas
+> **Runtime note:** Node.js/npm is **not** available here. Do **not** use `docx` (npm) / docx-js / `node`. Create documents with Python (`python-docx`) from the start. If import fails: `pip3 install python-docx`.
 
-`docx` is preinstalled — do not run `npm install` first; write the script and `require('docx')` directly. Only if that require fails: `npm install docx`. The model knows the API; these are the footguns:
+## Creating with python-docx — gotchas
 
-- **Page size defaults to A4.** For US Letter set `page: { size: { width: 12240, height: 15840 } }` (DXA; 1440 = 1″).
-- **Landscape:** pass portrait dimensions and `orientation: PageOrientation.LANDSCAPE` — docx-js swaps width/height internally.
-- **Tables need dual widths:** set `columnWidths` on the table AND `width` on every cell, both in `WidthType.DXA` (PERCENTAGE breaks in Google Docs). Column widths must sum to the table width.
-- **Table shading:** use `ShadingType.CLEAR`, never `SOLID` (renders black).
-- **Lists:** never insert `•` literally; use a `numbering` config with `LevelFormat.BULLET`.
-- **`ImageRun` requires `type:`** (`"png"`, `"jpg"`, …).
-- **`PageBreak` must be inside a `Paragraph`.**
-- **Never use `\n`** — use separate `Paragraph` elements.
-- **TOC:** headings must use built-in `HeadingLevel.*`; custom heading styles need `outlineLevel` set or they won't appear.
-- **Don't use a table as a horizontal rule** — use a paragraph bottom border instead.
-- **Dot-leader / right-aligned-on-same-line:** use `PositionalTab` (`alignment: PositionalTabAlignment.RIGHT`, `leader: PositionalTabLeader.DOT`) inside a `TextRun`, not literal `.` or space padding.
+Use `python-docx` only — never probe for `node` or `npm`. The model knows the API; these are the footguns:
+
+- **Page size:** set via `section.page_width` / `section.page_height` (e.g. `Inches(8.5)`, `Inches(11)` for US Letter). Default is often A4-like depending on template.
+- **Landscape:** swap width/height on the section (`section.orientation`, `page_width`, `page_height`).
+- **Never use `\n` inside a single run for structure** — use separate `Paragraph` elements (or `\n` only when you truly want a soft line break via a break).
+- **Lists:** use Word numbering/list styles; do not insert literal `•` characters as fake bullets.
+- **Images:** add with `run.add_picture(...)` / `doc.add_picture(...)`; keep sensible widths (`Inches(...)`).
+- **Page breaks:** `doc.add_page_break()` (or a paragraph with a page break), not raw control characters.
+- **Headings:** use built-in styles (`Heading 1`, …) so TOC / outline levels work.
+- **Tables:** set column widths explicitly when layout matters; do not rely on auto layout for print-ready docs.
+- **Horizontal rules:** prefer a paragraph bottom border, not a one-row table.
 
 ## Verify the output
 
@@ -88,4 +88,4 @@ The script writes `comments.xml`, `commentsExtended.xml`, `commentsIds.xml`, `co
 
 ## Dependencies
 
-`docx` (npm, preinstalled — install only if `require('docx')` fails) · `pandoc` · LibreOffice (`soffice`) · `pdftoppm` (Poppler)
+`python-docx` (install with `pip3 install python-docx` if missing) · `pandoc` · LibreOffice (`soffice`) · `pdftoppm` (Poppler). Node.js/npm is not available.

@@ -644,6 +644,18 @@ _HARNESS_SYSTEM_PROMPT_BASE = (
     "모르는 질문을 받으면 솔직히 모른다고 말합니다.\n"
     "한국어로 답변하세요.\n"
     "\n"
+    "## Runtime environment\n"
+    "- 이 환경에는 Node.js/npm이 없습니다. `node`, `npm`, `npx`를 시도하지 마세요 "
+    "(command not found / exit 127).\n"
+    "- 문서·슬라이드·스프레드시트 생성은 처음부터 Python을 사용하세요 "
+    "(예: python-docx, python-pptx, openpyxl). "
+    "docx-js / pptxgenjs 등 Node 패키지 경로는 사용하지 마세요.\n"
+    "- 필요 시 `pip3 install python-docx` / `pip3 install python-pptx` 등으로 설치한 뒤 바로 생성하세요.\n"
+    "\n"
+    "## Shell / Python packages\n"
+    "- Python 패키지 설치·실행에는 반드시 pip3를 사용하세요. pip는 이 환경에 없습니다.\n"
+    "- 예: pip3 install <package>, pip3 show <package> (pip 금지)\n"
+    "\n"
     "## Agent Workflow\n"
     "1. 사용자 입력을 받는다\n"
     "2. 요청에 맞는 skill/도구가 있으면 해당 지침에 따라 작업을 수행한다\n"
@@ -749,7 +761,10 @@ def run_harness(
             config=boto_config,
         )
 
-        skills = skill_mod.build_harness_skills(skill_list or [])
+        skills = skill_mod.build_harness_skills(
+            skill_list or [],
+            user_id=(actor_id or "").strip() or None,
+        )
         tools = mcp_config.build_harness_tools(mcp_servers or [])
 
         import chat as chat_mod
