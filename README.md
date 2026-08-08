@@ -939,6 +939,11 @@ installer가 CloudWatch 대시보드를 생성합니다. GenAI Observability(트
 | 프로젝트 모니터링 | `{projectName}-monitoring` | Harness 호출·토큰·예상 비용 |
 | Bedrock 사용량 | `Bedrock-Usage-Dashboard` | 계정 `AWS/Bedrock` 메트릭 (공용) |
 
+생성된 dashboard는 아래와 같습니다.
+
+<img width="900" alt="image" src="https://github.com/user-attachments/assets/f3c57f32-1677-4bde-9e27-43ee33ae33bd" />
+
+
 ### 메트릭 소스
 
 | 네임스페이스 | 출처 | 항목 |
