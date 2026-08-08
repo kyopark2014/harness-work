@@ -794,39 +794,176 @@ response = client.invoke_harness(**invoke_kwargs)
 
 ## Guardrail
 
-`installer.py`가 Amazon Bedrock Guardrail을 생성·업데이트합니다. Managed Harness에는 Guardrail 네이티브 필드가 없으므로, **ECS Web UI**가 `InvokeHarness` 전후에 `bedrock-runtime.apply_guardrail`을 호출합니다.
+`installer.py`가 Amazon Bedrock Guardrail을 생성·업데이트합니다. Managed Harness API에는 Guardrail 네이티브 필드가 없으므로, **ECS Web UI**가 `InvokeHarness` 전후에 `bedrock-runtime.apply_guardrail`을 호출합니다 (커스텀 Runtime의 Converse `guardrailConfig` / Strands `BedrockModel` 방식과 다름).
 
-| 필터 | 입력 | 출력 |
-|------|------|------|
-| `SEXUAL` | HIGH + BLOCK | HIGH + BLOCK |
-| `PROMPT_ATTACK` | HIGH + BLOCK | NONE |
+### 정책
 
-Web UI Sidebar의 **Guardrail** 토글(`guardrail_enabled`)이 켜져 있을 때만 적용됩니다. config 키: `guardrail_id`, `guardrail_version`, `guardrail_arn`, `guardrail_name`.
+| 필터 | 입력 | 출력 | 동작 |
+|------|------|------|------|
+| `SEXUAL` | HIGH | HIGH | 성적 표현이 포함된 질문·응답 차단 |
+| `PROMPT_ATTACK` | HIGH | NONE | jailbreak·프롬프트 인젝션 차단 (입력 전용) |
 
-순수 한국어 성적/탈옥 프롬프트는 Bedrock 필터가 약할 수 있습니다(영어·한영 혼합은 잘 차단).
+차단 메시지(한국어):
+
+- 입력: `요청이 안전 정책에 의해 차단되었습니다. 성적 표현 또는 프롬프트 공격이 감지되었습니다.`
+- 출력: `응답이 안전 정책에 의해 차단되었습니다.`
+
+### 적용 경로
+
+1. Sidebar **Guardrail** 토글 → task `guardrail_enabled` (기본 off)
+2. 채팅 시 `routes_chat` → `agentcore_client.run_harness(guardrail_enabled=...)`
+3. **INPUT**: `apply_guardrail` → 차단 시 InvokeHarness 생략
+4. **OUTPUT**: 스트림 종료 후 최종 assistant 텍스트만 검사 (중간 tool 스트림은 미검사)
+
+관련 코드: [`application/guardrail.py`](./application/guardrail.py), [`application/agentcore_client.py`](./application/agentcore_client.py).  
+ECS task role에 `bedrock:ApplyGuardrail`, `bedrock:GetGuardrail`이 필요합니다 ([`ecs_web.py`](./ecs_web.py)).
+
+### config.json
+
+| 키 | 설명 |
+|----|------|
+| `guardrail_id` | Guardrail ID |
+| `guardrail_version` | 버전 (`DRAFT`) |
+| `guardrail_arn` | ARN |
+| `guardrail_name` | `guardrail-for-{projectName}` |
+
+### 한계
+
+순수 한국어 성적/탈옥 프롬프트는 Bedrock 콘텐츠 필터가 약할 수 있습니다. 영어 또는 한영 혼합 패턴은 비교적 잘 차단됩니다.
 
 ---
 
 ## Observability
 
-Harness 호출은 traces / logs / metrics를 **자동**으로 CloudWatch에 보냅니다. installer는 계정 단위 **Transaction Search**(`aws/spans`)를 활성화합니다 (`observability.py`).
+Harness 호출은 model / tool / memory 등 단계별 **traces, logs, metrics를 자동**으로 CloudWatch에 보냅니다. 앱이 ADOT로 에이전트 루프를 계측할 필요가 없습니다 (관리형 이미지라 주입도 불가).
 
-- 활성화 후 GenAI Observability 콘솔의 **Harnesses** 탭에서 확인
-- Transaction Search ACTIVE까지 최대 10–15분 소요 가능
-- 커스텀 Runtime용 OTEL Dockerfile / Evaluations는 이번 범위에 포함하지 않음
+### installer가 하는 일
+
+[`observability.py`](./observability.py)의 Transaction Search 설정만 수행합니다.
+
+| 항목 | 설명 |
+|------|------|
+| CloudWatch Logs resource policy | X-Ray → `aws/spans` 기록 허용 |
+| X-Ray destination | `CloudWatchLogs` |
+| Indexing rule | Default sampling |
+| Telemetry evaluation | Observability Admin 시작 (가능 시) |
+
+커스텀 AgentCore Runtime용 **TRACES delivery source/destination** 은 구성하지 않습니다. Harness가 서비스 측에서 텔레메트리를 내보내기 때문입니다.
+
+### 확인 방법
+
+1. `python installer.py` 후 Agent를 1~2회 호출하고 2~5분 대기
+2. [GenAI Observability](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-configure.html) 콘솔 **Harnesses** 탭에서 session / trace 확인
+3. `aws/spans` 로그 그룹에 span이 쌓이는지 확인
+
+> Transaction Search가 계정에서 처음 활성화되면 ACTIVE까지 **최대 10–15분** 걸릴 수 있습니다.
+
+MCP Runtime(Knowledge Base / artifact-share) Dockerfile의 기존 OTEL은 그대로 유지되며, Harness 본체 Observability와는 별개입니다.
 
 ---
 
 ## Dashboard
 
-installer가 CloudWatch 대시보드를 생성합니다.
+installer가 CloudWatch 대시보드를 생성합니다. GenAI Observability(트레이스 UI)와 별개로, **운영 KPI·토큰·예상 비용**을 보는 용도입니다.
 
 | 대시보드 | 이름 | 내용 |
 |----------|------|------|
 | 프로젝트 모니터링 | `{projectName}-monitoring` | Harness 호출·토큰·예상 비용 |
-| Bedrock 사용량 | `Bedrock-Usage-Dashboard` | 계정 `AWS/Bedrock` 메트릭 |
+| Bedrock 사용량 | `Bedrock-Usage-Dashboard` | 계정 `AWS/Bedrock` 메트릭 (공용) |
 
-커스텀 토큰 메트릭은 ECS가 InvokeHarness 스트림의 `metadata.usage`로 `Harness/AgentCore` 네임스페이스에 `PutMetricData`합니다 (`application/cloudwatch_metrics.py`). ECS 이미지를 재배포해야 토큰 차트에 데이터가 쌓입니다.
+### 메트릭 소스
+
+| 네임스페이스 | 출처 | 항목 |
+|--------------|------|------|
+| `AWS/Bedrock-AgentCore` | AgentCore vended | Invocations, Latency, Errors, CPU/Memory 등 (dimension은 Harness ARN 기준; 콘솔에서 확인 후 조정 가능) |
+| `Harness/AgentCore` | ECS 앱 커스텀 | Input/Output/Total Tokens, EstimatedModelCostUSD, LLMInvocations, 캐시 관련 |
+
+커스텀 토큰 메트릭은 [`application/cloudwatch_metrics.py`](./application/cloudwatch_metrics.py)가 InvokeHarness 스트림의 `metadata.usage`로 `PutMetricData`합니다. ECS task role에 `cloudwatch:PutMetricData`(namespace `Harness/AgentCore`)가 필요합니다.
+
+config 키: `cloudwatch_dashboard_name`, `bedrock_usage_dashboard_name`.
+
+### 주의
+
+- **토큰 차트**는 Guardrail/메트릭 코드가 포함된 **ECS 이미지를 재배포**한 뒤 LLM 호출부터 쌓입니다. 대시보드만 먼저 만들어도 Bedrock/AgentCore vended 위젯은 동작할 수 있습니다.
+- 비용 위젯은 **추정치**이며 실제 청구와 다를 수 있습니다.
+- AgentCore vended 메트릭은 최대 약 60분 지연될 수 있습니다.
+
+### Prompt Caching
+
+[Amazon Bedrock Prompt Caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)은 요청의 `cachePoint` 앞 **고정 prefix**(system / tools / messages)를 캐시해 입력 토큰 비용·지연을 줄입니다. [Agentic AI Lens](https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/agentcost02-bp03.html)도 긴 system prompt(대략 1000+ 토큰)가 있는 에이전트에 caching을 권고합니다.
+
+#### Managed Harness에서의 한계
+
+이 프로젝트는 **관리형 AgentCore Harness**(`InvokeHarness`)를 사용합니다. 현재 공개 API에는 prompt caching 전용 스위치가 없고, `HarnessSystemContentBlock`도 **`text`만** 지원합니다 (`cachePoint` 없음).
+
+| 경로 | Prompt caching |
+|------|----------------|
+| **Managed Harness** (이 저장소) | API로 직접 opt-in 불가. prefix 안정화 + 지원 모델 + usage 메트릭으로 간접 확인 |
+| **Strands on AgentCore Runtime** (export 또는 직접 배포) | `cache_tools` + `CacheConfig(strategy="auto")` (+ system `cachePoint`)로 명시 적용 |
+
+다만 InvokeHarness 스트림 `metadata.usage`에는 이미 `cacheReadInputTokens` / `cacheWriteInputTokens`가 포함됩니다. managed runtime(내부 Strands) 또는 Nova 자동 caching이 동작하면 수치가 올라오고, `cloudwatch_metrics.py`가 대시보드에 반영합니다.
+
+#### Managed Harness에서 할 수 있는 것
+
+1. **system prompt를 안정적으로 유지** — tools → system → messages 순으로 고정 prefix를 앞에 두고, 유저·세션 가변 내용은 뒤에 둡니다.
+2. **모델 선택** — Claude / Nova 등 caching 지원 모델 사용. 최소 토큰은 모델별 상이합니다 (예: Sonnet 4.5 **4096**, Sonnet 4.6 **1024**). TTL은 기본 **5분**, 일부 모델은 `"ttl": "1h"`.
+3. **메트릭 확인** — InvokeHarness `metadata.usage`의 cache read/write 토큰 (위 Dashboard 위젯).
+
+> `build_harness_system_prompt`가 `actor_id`·경로를 system에 넣으면 **유저마다 prefix가 달라 cache miss**가 나기 쉽습니다. 고정 지침만 CreateHarness `systemPrompt`에 두고 actor/path는 user 메시지 쪽으로 옮기는 편이 캐시에 유리합니다.
+
+#### 명시적 적용: Strands Runtime
+
+세밀한 caching이 필요하면 [Harness export to code](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-export.html) 후 AgentCore Runtime에서 [Strands BedrockModel](https://strandsagents.com/docs/user-guide/concepts/model-providers/amazon-bedrock/) 설정을 씁니다.
+
+```python
+from strands import Agent
+from strands.models import BedrockModel, CacheConfig
+from strands.types.content import SystemContentBlock
+
+model = BedrockModel(
+    model_id="us.anthropic.claude-sonnet-4-6",
+    cache_tools="default",                      # tool 정의 캐시
+    cache_config=CacheConfig(strategy="auto"),  # agent loop / 대화 이력 자동 cachePoint
+)
+
+system_content = [
+    SystemContentBlock(text="긴 고정 system prompt..."),  # 모델별 최소 토큰 이상
+    SystemContentBlock(cachePoint={"type": "default"}),   # 필요 시 "ttl": "1h"
+]
+
+agent = Agent(model=model, system_prompt=system_content, tools=[...])
+```
+
+| 방식 | 역할 |
+|------|------|
+| `cachePoint` on system | 고정 system prompt |
+| `cache_tools="default"` | tool 스키마 |
+| `CacheConfig(strategy="auto")` | multi-turn / tool loop 대화 prefix |
+
+권장 조합은 **tools + auto** (필요 시 system `cachePoint`까지). Converse를 직접 쓸 때는 다음과 같습니다.
+
+```json
+"system": [
+  { "text": "고정 지침..." },
+  { "cachePoint": { "type": "default", "ttl": "1h" } }
+]
+```
+
+참고: [Prompt caching for faster model inference](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html) · [Strands Amazon Bedrock](https://strandsagents.com/docs/user-guide/concepts/model-providers/amazon-bedrock/).
+
+---
+
+## AgentCore Evaluations (미적용)
+
+[Amazon Bedrock AgentCore Evaluations](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/evaluations.html)(Online / On-demand, LLM-as-a-Judge)는 **이 프로젝트에 포함하지 않습니다.**
+
+| 이유 | 설명 |
+|------|------|
+| 관리형 Harness | 에이전트 루프가 AWS 관리 이미지 안에서 돌아 앱이 `strands-agents[otel]` / ADOT로 Evaluation용 span scope를 제어할 수 없음 |
+| Evaluation 전제 | Online Eval은 보통 `strands.telemetry.tracer` 등 **지원되는 OTEL scope**와 런타임 로그 그룹·service name 매핑이 필요 (strands-work 커스텀 Runtime 패턴) |
+| 현재 Observability 범위 | Transaction Search + Harness 자동 트레이스까지만 구성. Evaluation IAM 역할·online evaluation config·결과 로그 그룹은 생성하지 않음 |
+
+품질 모니터링이 필요하면 GenAI Observability **Harnesses** 탭의 trace를 직접 확인하거나, 별도 커스텀 Runtime(예: strands-work)에서 Evaluations를 사용하세요.
 
 ---
 
@@ -848,7 +985,10 @@ Agent 실행시 sidebar에서 task별로 session이 분리된 대화를 이어�
 - [Harness 모델](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-models.html)
 - [Harness 보안 / 실행 역할](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html)
 - [AgentCore Observability](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability.html)
+- [AgentCore Evaluations](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/evaluations.html) (이 저장소에서는 미적용 — 위 절 참고)
 - [AgentCore 요금](https://aws.amazon.com/bedrock/agentcore/pricing/)
+- [Bedrock Prompt Caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)
 - [Strands Agents](https://strandsagents.com/)
+- [Strands Amazon Bedrock (prompt caching)](https://strandsagents.com/docs/user-guide/concepts/model-providers/amazon-bedrock/)
 - [Boto3 CreateHarness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore-control/client/create_harness.html)
 - [Boto3 InvokeHarness](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore/client/invoke_harness.html)
