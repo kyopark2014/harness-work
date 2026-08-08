@@ -943,18 +943,32 @@ installer가 CloudWatch 대시보드를 생성합니다. GenAI Observability(트
 
 | 네임스페이스 | 출처 | 항목 |
 |--------------|------|------|
-| `AWS/Bedrock-AgentCore` | AgentCore vended | Invocations, Latency, Errors, CPU/Memory 등 (dimension은 Harness ARN 기준; 콘솔에서 확인 후 조정 가능) |
+| `AWS/Bedrock-AgentCore` | AgentCore vended | Invocations, Latency, Errors, CPU/Memory 등 (**backing Runtime ARN** 기준) |
 | `Harness/AgentCore` | ECS 앱 커스텀 | Input/Output/Total Tokens, EstimatedModelCostUSD, LLMInvocations, 캐시 관련 |
 
 커스텀 토큰 메트릭은 [`application/cloudwatch_metrics.py`](./application/cloudwatch_metrics.py)가 InvokeHarness 스트림의 `metadata.usage`로 `PutMetricData`합니다. ECS task role에 `cloudwatch:PutMetricData`(namespace `Harness/AgentCore`)가 필요합니다.
 
-config 키: `cloudwatch_dashboard_name`, `bedrock_usage_dashboard_name`.
+config 키: `cloudwatch_dashboard_name`, `bedrock_usage_dashboard_name`, `harness_runtime_arn`.
+
+### Vended CPU / Memory / Invocations (Runtime 디멘션)
+
+Managed Harness는 세션마다 내부 AgentCore Runtime microVM을 띄웁니다. CPU·Memory·Invocations vended 메트릭은 **Harness ARN이 아니라 그 Runtime ARN**으로 발행됩니다 ([runtime metrics](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-runtime-metrics.html)).
+
+| 항목 | 올바른 값 | 잘못된 값 (과거 대시보드) |
+|------|-----------|---------------------------|
+| Resource | `…:runtime/harness_<name>-…` | `…:harness/<harnessId>` |
+| Service (CPU/Mem) | `AgentCore.Runtime` | `AgentCore.Harness` |
+| Operation (Invocations) | `InvokeAgentRuntime` | `InvokeHarness` |
+| Name | `<runtimeBase>::DEFAULT` (예: `harness_harness_work::DEFAULT`) | `<harnessId>::DEFAULT` |
+
+`GetHarness`의 `environment.agentCoreRuntimeEnvironment.agentRuntimeArn`에서 Runtime ARN을 읽고, installer가 `harness_runtime_arn`으로 저장한 뒤 대시보드 위젯에 바인딩합니다. `create_cloudwatch_dashboard()`는 Harness ARN만 넘겨도 GetHarness/config로 Runtime ARN을 resolve합니다.
 
 ### 주의
 
 - **토큰 차트**는 Guardrail/메트릭 코드가 포함된 **ECS 이미지를 재배포**한 뒤 LLM 호출부터 쌓입니다. 대시보드만 먼저 만들어도 Bedrock/AgentCore vended 위젯은 동작할 수 있습니다.
 - 비용 위젯은 **추정치**이며 실제 청구와 다를 수 있습니다.
 - AgentCore vended 메트릭은 최대 약 60분 지연될 수 있습니다.
+- Runtime ARN이 바뀌면 (Harness 재생성 등) installer를 다시 돌려 대시보드·`harness_runtime_arn`을 갱신하세요.
 
 ### Prompt Caching
 

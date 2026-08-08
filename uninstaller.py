@@ -1197,6 +1197,7 @@ INSTALLER_CONFIG_KEYS = [
     "memoryId",
     "harnessId",
     "HARNESS_ARN",
+    "harness_runtime_arn",
     "s3_bucket",
     "s3_arn",
     "sharing_url",

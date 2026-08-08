@@ -2651,6 +2651,20 @@ def wait_for_harness_ready(harness_id: str, timeout_seconds: int = 300) -> str:
     raise TimeoutError(f"Harness {harness_id} did not reach READY within {timeout_seconds}s")
 
 
+def get_harness_runtime_arn(harness_id: str) -> Optional[str]:
+    """Return the managed Harness backing AgentCore Runtime ARN, if present."""
+    try:
+        h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
+    except ClientError as e:
+        logger.warning(f"  get_harness failed while resolving runtime ARN: {e}")
+        return None
+    env = (h.get("environment") or {}).get("agentCoreRuntimeEnvironment") or {}
+    arn = env.get("agentRuntimeArn")
+    if isinstance(arn, str) and ":runtime/" in arn:
+        return arn
+    return None
+
+
 def update_harness_safe(harness_id: str, *, timeout_seconds: int = 600, **kwargs) -> None:
     """UpdateHarness only when READY; retry on ConflictException (still UPDATING)."""
     deadline = time.time() + timeout_seconds
@@ -3012,11 +3026,20 @@ def create_or_get_harness(
     ensure_harness_system_prompt(harness_id)
     ensure_harness_tools(harness_id, agentcore_gateway_arn)
     harness_arn = wait_for_harness_ready(harness_id)
+    harness_runtime_arn = get_harness_runtime_arn(harness_id)
+    if harness_runtime_arn:
+        logger.info(f"  Harness backing Runtime: {harness_runtime_arn}")
+    else:
+        logger.warning(
+            "  Harness has no agentCoreRuntimeEnvironment.agentRuntimeArn; "
+            "CPU/Memory dashboard widgets may be empty"
+        )
 
     return {
         "harness_id": harness_id,
         "harness_arn": harness_arn,
         "harness_name": harness_api_name,
+        "harness_runtime_arn": harness_runtime_arn or "",
     }
 
 
@@ -3443,7 +3466,11 @@ def setup_agentcore_observability() -> Dict:
         return {"status": "error", "error": str(e)}
 
 
-def create_monitoring_dashboard(harness_arn: Optional[str]) -> Dict[str, str]:
+def create_monitoring_dashboard(
+    harness_arn: Optional[str],
+    *,
+    harness_runtime_arn: Optional[str] = None,
+) -> Dict[str, str]:
     """Create or update CloudWatch dashboards for Harness monitoring."""
     logger.info("Creating CloudWatch monitoring dashboard")
     info: Dict[str, str] = {}
@@ -3458,8 +3485,13 @@ def create_monitoring_dashboard(harness_arn: Optional[str]) -> Dict[str, str]:
             info["bedrock_usage_dashboard_name"] = bedrock_dashboard
             update_config("bedrock_usage_dashboard_name", bedrock_dashboard)
 
-        if harness_arn:
-            dashboard = create_cloudwatch_dashboard(project_name, harness_arn, region)
+        if harness_arn or harness_runtime_arn:
+            dashboard = create_cloudwatch_dashboard(
+                project_name,
+                harness_arn or harness_runtime_arn or "",
+                region,
+                runtime_arn=harness_runtime_arn,
+            )
             if dashboard:
                 info["cloudwatch_dashboard_name"] = dashboard
                 update_config("cloudwatch_dashboard_name", dashboard)
@@ -3516,6 +3548,8 @@ def build_config_from_deployment_state(
             config_data["harnessId"] = harness_info["harness_id"]
         if harness_info.get("harness_arn"):
             config_data["HARNESS_ARN"] = harness_info["harness_arn"]
+        if harness_info.get("harness_runtime_arn"):
+            config_data["harness_runtime_arn"] = harness_info["harness_runtime_arn"]
     if s3_bucket_name:
         config_data["s3_bucket"] = s3_bucket_name
         config_data["s3_arn"] = f"arn:aws:s3:::{s3_bucket_name}"
@@ -3823,7 +3857,8 @@ def main():
 
         logger.info("[19c/25] Creating CloudWatch monitoring dashboard")
         dashboard_info = create_monitoring_dashboard(
-            (harness_info or {}).get("harness_arn")
+            (harness_info or {}).get("harness_arn"),
+            harness_runtime_arn=(harness_info or {}).get("harness_runtime_arn"),
         )
 
         cloudfront_info = create_cloudfront_distribution(s3_bucket_name)
@@ -3984,6 +4019,8 @@ def main():
         logger.info(f"  Memory ARN: {agent_memory_arn}")
         logger.info(f"  Harness ID: {harness_info['harness_id']}")
         logger.info(f"  Harness ARN: {harness_info['harness_arn']}")
+        if harness_info.get("harness_runtime_arn"):
+            logger.info(f"  Harness Runtime ARN: {harness_info['harness_runtime_arn']}")
         if guardrail_info:
             logger.info(f"  Guardrail: {guardrail_info.get('guardrail_name')} "
                         f"({guardrail_info.get('guardrail_id')})")

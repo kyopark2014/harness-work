@@ -78,10 +78,13 @@ def _short_model_id(model_id: str) -> str:
 
 METRIC_NAMESPACE = "Harness/AgentCore"
 AGENTCORE_NAMESPACE = "AWS/Bedrock-AgentCore"
-AGENTCORE_SERVICE = "AgentCore.Harness"
+# Managed Harness sessions run on an internal AgentCore Runtime. Vended CPU /
+# Memory / Invocations metrics use Runtime dimensions (not Harness ARN).
+# See: https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-runtime-metrics.html
+AGENTCORE_SERVICE = "AgentCore.Runtime"
 BEDROCK_NAMESPACE = "AWS/Bedrock"
 BEDROCK_USAGE_DASHBOARD_NAME = "Bedrock-Usage-Dashboard"
-INVOKE_OPERATION = "InvokeHarness"
+INVOKE_OPERATION = "InvokeAgentRuntime"
 
 # Dashboard gauge axis maxima (monitoring thresholds, not hard service limits).
 LATENCY_GAUGE_MAX_MS = 30000  # Expected upper bound for InvokeAgentRuntime p99 latency
@@ -421,6 +424,68 @@ def dashboard_name(project_name: str) -> str:
     return f"{safe_name}-monitoring"
 
 
+def _is_agent_runtime_arn(arn: str) -> bool:
+    return ":runtime/" in (arn or "")
+
+
+def _is_harness_arn(arn: str) -> bool:
+    return ":harness/" in (arn or "")
+
+
+def _runtime_arn_from_harness_document(harness: dict[str, Any]) -> str | None:
+    """Pull managed Harness backing Runtime ARN from GetHarness payload."""
+    env = harness.get("environment") or {}
+    runtime_env = env.get("agentCoreRuntimeEnvironment") or {}
+    arn = runtime_env.get("agentRuntimeArn")
+    return arn if isinstance(arn, str) and _is_agent_runtime_arn(arn) else None
+
+
+def resolve_harness_runtime_arn(
+    harness_or_runtime_arn: str,
+    region: str,
+    *,
+    runtime_arn: str | None = None,
+) -> str:
+    """Resolve the Runtime ARN used by AWS/Bedrock-AgentCore vended metrics.
+
+    Managed Harness vends Invocations / CPUUsed / MemoryUsed against the internal
+    ``environment.agentCoreRuntimeEnvironment.agentRuntimeArn``, not the Harness ARN.
+    """
+    if runtime_arn and _is_agent_runtime_arn(runtime_arn):
+        return runtime_arn
+    if _is_agent_runtime_arn(harness_or_runtime_arn):
+        return harness_or_runtime_arn
+
+    # Prefer config.json when installer already stored the mapping.
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(script_dir, "config.json")
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        cfg_runtime = (config.get("harness_runtime_arn") or "").strip()
+        if _is_agent_runtime_arn(cfg_runtime):
+            return cfg_runtime
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+
+    if not _is_harness_arn(harness_or_runtime_arn):
+        raise ValueError(
+            "Expected a harness ARN (...:harness/...) or runtime ARN (...:runtime/...), "
+            f"got: {harness_or_runtime_arn!r}"
+        )
+
+    harness_id = harness_or_runtime_arn.rsplit("/", 1)[-1]
+    control = boto3.client("bedrock-agentcore-control", region_name=region)
+    harness = control.get_harness(harnessId=harness_id)["harness"]
+    resolved = _runtime_arn_from_harness_document(harness)
+    if not resolved:
+        raise ValueError(
+            f"Harness {harness_id!r} has no environment.agentCoreRuntimeEnvironment."
+            "agentRuntimeArn; cannot bind vended CPU/Memory metrics"
+        )
+    return resolved
+
+
 def _runtime_base_name(agent_runtime_arn: str) -> str:
     runtime_id = agent_runtime_arn.rsplit("/", 1)[-1]
     if "-" in runtime_id:
@@ -441,7 +506,7 @@ def _agentcore_invoke_metric(
     agent_runtime_arn: str,
     **options: Any,
 ) -> list[Any]:
-    """AgentCore InvokeHarness metric (Resource, Operation, Name)."""
+    """AgentCore Runtime invoke metric (Resource, Operation, Name)."""
     row: list[Any] = [
         AGENTCORE_NAMESPACE,
         metric_name,
@@ -462,7 +527,7 @@ def _agentcore_resource_metric(
     agent_runtime_arn: str,
     **options: Any,
 ) -> list[Any]:
-    """AgentCore Harness resource metric (Resource, Service, Name)."""
+    """AgentCore Runtime resource metric (Resource, Service, Name)."""
     row: list[Any] = [
         AGENTCORE_NAMESPACE,
         metric_name,
@@ -1550,16 +1615,32 @@ def create_bedrock_usage_dashboard(region: str) -> str | None:
 
 def create_cloudwatch_dashboard(
     project_name: str,
-    agent_runtime_arn: str,
+    harness_or_runtime_arn: str,
     region: str,
+    *,
+    runtime_arn: str | None = None,
 ) -> str | None:
-    """Create or update the CloudWatch monitoring dashboard. Returns dashboard name."""
-    if not agent_runtime_arn:
-        print("Warning: harness ARN missing; skipping CloudWatch dashboard creation")
+    """Create or update the CloudWatch monitoring dashboard. Returns dashboard name.
+
+    ``harness_or_runtime_arn`` may be the managed Harness ARN; vended widgets bind to
+    the backing Runtime ARN (resolved via GetHarness / config / explicit runtime_arn).
+    """
+    if not harness_or_runtime_arn and not runtime_arn:
+        print("Warning: harness/runtime ARN missing; skipping CloudWatch dashboard creation")
+        return None
+
+    try:
+        resolved_runtime_arn = resolve_harness_runtime_arn(
+            harness_or_runtime_arn or runtime_arn or "",
+            region,
+            runtime_arn=runtime_arn,
+        )
+    except Exception as exc:
+        print(f"Error resolving Harness runtime ARN for dashboard: {exc}")
         return None
 
     name = dashboard_name(project_name)
-    body = build_dashboard_body(project_name, agent_runtime_arn, region)
+    body = build_dashboard_body(project_name, resolved_runtime_arn, region)
 
     try:
         client = boto3.client("cloudwatch", region_name=region)
@@ -1569,6 +1650,7 @@ def create_cloudwatch_dashboard(
             f"?region={region}#dashboards/dashboard/{name}"
         )
         print(f"✓ CloudWatch dashboard created: {name}")
+        print(f"  Runtime ARN: {resolved_runtime_arn}")
         print(f"  URL: {url}")
         return name
     except Exception as exc:
