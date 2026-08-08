@@ -146,13 +146,28 @@ class EcsWebDeployer:
                             "bedrock:InvokeModelWithResponseStream",
                             "bedrock:GetInferenceProfile",
                             "bedrock:GetFoundationModel",
+                            "bedrock:ApplyGuardrail",
+                            "bedrock:GetGuardrail",
                         ],
                         "Resource": [
                             "arn:aws:bedrock:*::foundation-model/*",
                             f"arn:aws:bedrock:{self.region}:{self.account_id}:inference-profile/*",
                             f"arn:aws:bedrock:*:{self.account_id}:inference-profile/*",
+                            f"arn:aws:bedrock:{self.region}:{self.account_id}:guardrail/*",
+                            f"arn:aws:bedrock:{self.region}:{self.account_id}:guardrail-profile/*",
                         ],
-                    }
+                    },
+                    {
+                        "Sid": "CloudWatchCustomMetrics",
+                        "Effect": "Allow",
+                        "Action": ["cloudwatch:PutMetricData"],
+                        "Resource": ["*"],
+                        "Condition": {
+                            "StringEquals": {
+                                "cloudwatch:namespace": "Harness/AgentCore"
+                            }
+                        },
+                    },
                 ],
             },
         )

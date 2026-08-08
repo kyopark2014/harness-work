@@ -794,6 +794,71 @@ def delete_iam_roles():
     logger.info("✓ IAM roles processed")
 
 
+def _guardrail_name(project: str) -> str:
+    return f"guardrail-for-{project.replace('_', '-').lower()}"
+
+
+def _find_guardrail_by_name(bedrock_client, name: str) -> Optional[dict]:
+    next_token = None
+    while True:
+        kwargs: Dict = {"maxResults": 100}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        response = bedrock_client.list_guardrails(**kwargs)
+        for guardrail in response.get("guardrails", []):
+            if guardrail.get("name") == name:
+                return guardrail
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+    return None
+
+
+def delete_bedrock_guardrail(cfg: Dict) -> None:
+    """Delete Bedrock Guardrail created by the harness installer."""
+    logger.info("Deleting Bedrock Guardrail")
+    name = cfg.get("guardrail_name") or _guardrail_name(project_name)
+    guardrail_id = cfg.get("guardrail_id")
+    bedrock_client = boto3.client("bedrock", region_name=region)
+    try:
+        if not guardrail_id:
+            existing = _find_guardrail_by_name(bedrock_client, name)
+            if existing:
+                guardrail_id = existing.get("id")
+        if not guardrail_id:
+            logger.info(f"  Guardrail not found (may already be deleted): {name}")
+            return
+        bedrock_client.delete_guardrail(guardrailIdentifier=guardrail_id)
+        logger.info(f"  ✓ Deleted Bedrock Guardrail: {name} ({guardrail_id})")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("ResourceNotFoundException", "ResourceNotFound"):
+            logger.info(f"  Guardrail not found (already deleted): {name}")
+        else:
+            logger.warning(f"  Failed to delete guardrail: {e}")
+    except Exception as e:
+        logger.warning(f"  Failed to delete guardrail: {e}")
+
+
+def delete_cloudwatch_monitoring_dashboard(cfg: Dict) -> None:
+    """Delete project CloudWatch monitoring dashboard (keeps shared Bedrock usage dash)."""
+    logger.info("Deleting CloudWatch monitoring dashboard")
+    name = cfg.get("cloudwatch_dashboard_name")
+    if not name:
+        name = f"{project_name.replace(' ', '-')}-monitoring"
+    try:
+        cw = boto3.client("cloudwatch", region_name=region)
+        cw.delete_dashboards(DashboardNames=[name])
+        logger.info(f"  ✓ Deleted CloudWatch dashboard: {name}")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("ResourceNotFound", "ResourceNotFoundException"):
+            logger.info(f"  Dashboard not found (already deleted): {name}")
+        else:
+            logger.warning(f"  Failed to delete dashboard {name}: {e}")
+    except Exception as e:
+        logger.warning(f"  Failed to delete dashboard {name}: {e}")
+
 
 def _kb_mcp_runtime_name() -> str:
     return f"knowledge_base_of_{project_name}".replace("-", "_")
@@ -1384,6 +1449,9 @@ def main():
         delete_knowledge_base_mcp_runtime(cfg)
         delete_knowledge_bases()
         delete_s3_vectors_store()
+
+        delete_bedrock_guardrail(cfg)
+        delete_cloudwatch_monitoring_dashboard(cfg)
 
         delete_ecs_iam_roles(project_name, region, logger)
         delete_alb_origin_header_secret(project_name, region, logger)

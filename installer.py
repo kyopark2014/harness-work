@@ -3308,6 +3308,173 @@ def write_config(config_path: str, config_data: Dict, *, merge_existing: bool = 
         return False
 
 
+def update_config(key: str, value) -> bool:
+    """Merge a single key into application/config.json."""
+    return write_config(CONFIG_PATH, {key: value})
+
+
+# ============================================================================
+# Bedrock Guardrail
+# ============================================================================
+
+
+def guardrail_name_for_project(name: str) -> str:
+    """Return Bedrock Guardrail name for the project."""
+    safe_name = name.replace("_", "-").lower()
+    return f"guardrail-for-{safe_name}"
+
+
+def _bedrock_guardrail_content_policy() -> dict:
+    """Content filters: block sexual content and prompt attacks."""
+    return {
+        "filtersConfig": [
+            {
+                "type": "SEXUAL",
+                "inputStrength": "HIGH",
+                "outputStrength": "HIGH",
+                "inputAction": "BLOCK",
+                "outputAction": "BLOCK",
+                "inputModalities": ["TEXT"],
+                "outputModalities": ["TEXT"],
+            },
+            {
+                "type": "PROMPT_ATTACK",
+                "inputStrength": "HIGH",
+                "outputStrength": "NONE",
+                "inputAction": "BLOCK",
+                "outputAction": "NONE",
+                "inputModalities": ["TEXT"],
+            },
+        ]
+    }
+
+
+def _find_guardrail_by_name(bedrock_client, name: str) -> Optional[dict]:
+    """Return guardrail summary matching name, or None."""
+    next_token = None
+    while True:
+        kwargs: Dict = {"maxResults": 100}
+        if next_token:
+            kwargs["nextToken"] = next_token
+        response = bedrock_client.list_guardrails(**kwargs)
+        for guardrail in response.get("guardrails", []):
+            if guardrail.get("name") == name:
+                return guardrail
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+    return None
+
+
+def create_bedrock_guardrail() -> Dict[str, str]:
+    """Create or update Amazon Bedrock Guardrail for input/output safety."""
+    logger.info("Creating/updating Amazon Bedrock Guardrail")
+    name = guardrail_name_for_project(project_name)
+    description = (
+        f"Content safety guardrail for {project_name}: "
+        "blocks sexual content and prompt attacks."
+    )
+    blocked_input_message = (
+        "요청이 안전 정책에 의해 차단되었습니다. "
+        "성적 표현 또는 프롬프트 공격이 감지되었습니다."
+    )
+    blocked_output_message = "응답이 안전 정책에 의해 차단되었습니다."
+    content_policy = _bedrock_guardrail_content_policy()
+
+    bedrock_client = boto3.client("bedrock", region_name=region)
+    existing = _find_guardrail_by_name(bedrock_client, name)
+
+    if existing:
+        guardrail_id = existing["id"]
+        logger.info(f"  Existing guardrail found: {name} ({guardrail_id})")
+        response = bedrock_client.update_guardrail(
+            guardrailIdentifier=guardrail_id,
+            name=name,
+            description=description,
+            contentPolicyConfig=content_policy,
+            blockedInputMessaging=blocked_input_message,
+            blockedOutputsMessaging=blocked_output_message,
+        )
+        logger.info(
+            f"  ✓ Guardrail updated: version {response.get('version', 'DRAFT')}"
+        )
+    else:
+        logger.info(f"  Creating guardrail: {name}")
+        response = bedrock_client.create_guardrail(
+            name=name,
+            description=description,
+            contentPolicyConfig=content_policy,
+            blockedInputMessaging=blocked_input_message,
+            blockedOutputsMessaging=blocked_output_message,
+        )
+        guardrail_id = response["guardrailId"]
+        logger.info(f"  ✓ Guardrail created: {guardrail_id}")
+
+    guardrail_arn = response.get("guardrailArn") or existing.get("arn", "")
+    guardrail_version = "DRAFT"
+    info = {
+        "guardrail_id": guardrail_id,
+        "guardrail_version": guardrail_version,
+        "guardrail_arn": guardrail_arn,
+        "guardrail_name": name,
+    }
+    write_config(CONFIG_PATH, info)
+    logger.info(f"  - guardrail_id: {guardrail_id}")
+    logger.info(f"  - guardrail_version: {guardrail_version}")
+    logger.info(f"  - guardrail_name: {name}")
+    logger.info("  - filters: SEXUAL (HIGH), PROMPT_ATTACK (HIGH)")
+    return info
+
+
+def setup_agentcore_observability() -> Dict:
+    """Enable CloudWatch Transaction Search for Harness GenAI Observability."""
+    logger.info("Configuring AgentCore Observability (Transaction Search)")
+    try:
+        from observability import setup_agentcore_observability as configure_obs
+
+        result = configure_obs(region, account_id)
+        if result.get("warning"):
+            logger.warning(f"  Observability pending: {result['warning']}")
+        else:
+            logger.info("  ✓ AgentCore Observability configured")
+        return result
+    except Exception as e:
+        logger.warning(f"  AgentCore Observability setup failed (continuing): {e}")
+        return {"status": "error", "error": str(e)}
+
+
+def create_monitoring_dashboard(harness_arn: Optional[str]) -> Dict[str, str]:
+    """Create or update CloudWatch dashboards for Harness monitoring."""
+    logger.info("Creating CloudWatch monitoring dashboard")
+    info: Dict[str, str] = {}
+    try:
+        from application.cloudwatch_metrics import (
+            create_bedrock_usage_dashboard,
+            create_cloudwatch_dashboard,
+        )
+
+        bedrock_dashboard = create_bedrock_usage_dashboard(region)
+        if bedrock_dashboard:
+            info["bedrock_usage_dashboard_name"] = bedrock_dashboard
+            update_config("bedrock_usage_dashboard_name", bedrock_dashboard)
+
+        if harness_arn:
+            dashboard = create_cloudwatch_dashboard(project_name, harness_arn, region)
+            if dashboard:
+                info["cloudwatch_dashboard_name"] = dashboard
+                update_config("cloudwatch_dashboard_name", dashboard)
+                logger.info(
+                    f"  https://{region}.console.aws.amazon.com/cloudwatch/home"
+                    f"?region={region}#dashboards/dashboard/{dashboard}"
+                )
+        else:
+            logger.warning("  Harness ARN missing; skipped project monitoring dashboard")
+        return info
+    except Exception as e:
+        logger.warning(f"  CloudWatch dashboard creation failed (continuing): {e}")
+        return info
+
+
 def build_config_from_deployment_state(
     execution_role_arn: Optional[str] = None,
     agentcore_memory_role_arn: Optional[str] = None,
@@ -3570,6 +3737,8 @@ def main():
     image_build_tag = None
     app_environment = None
     cognito_info = None
+    guardrail_info = None
+    dashboard_info = None
     deployment_success = False
 
     try:
@@ -3637,6 +3806,9 @@ def main():
             mount_sg_id=str(s3_files_info.get("mount_sg_id") or "") or None,
         )
 
+        logger.info("[18c/25] Creating/updating Bedrock Guardrail")
+        guardrail_info = create_bedrock_guardrail()
+
         harness_info = create_or_get_harness(
             execution_role_arn,
             agent_memory_arn,
@@ -3645,6 +3817,15 @@ def main():
                 "agentcore_gateway_arn"
             ),
         )
+
+        logger.info("[19b/25] Configuring AgentCore Observability")
+        setup_agentcore_observability()
+
+        logger.info("[19c/25] Creating CloudWatch monitoring dashboard")
+        dashboard_info = create_monitoring_dashboard(
+            (harness_info or {}).get("harness_arn")
+        )
+
         cloudfront_info = create_cloudfront_distribution(s3_bucket_name)
         sharing_url = f"https://{cloudfront_info.get('domain', '')}".rstrip("/")
         ensure_harness_sharing_env(
@@ -3803,6 +3984,20 @@ def main():
         logger.info(f"  Memory ARN: {agent_memory_arn}")
         logger.info(f"  Harness ID: {harness_info['harness_id']}")
         logger.info(f"  Harness ARN: {harness_info['harness_arn']}")
+        if guardrail_info:
+            logger.info(f"  Guardrail: {guardrail_info.get('guardrail_name')} "
+                        f"({guardrail_info.get('guardrail_id')})")
+        if dashboard_info:
+            dash = dashboard_info.get("cloudwatch_dashboard_name")
+            if dash:
+                logger.info(f"  CloudWatch Dashboard: {dash}")
+                logger.info(
+                    f"    https://{region}.console.aws.amazon.com/cloudwatch/home"
+                    f"?region={region}#dashboards/dashboard/{dash}"
+                )
+            bedrock_dash = dashboard_info.get("bedrock_usage_dashboard_name")
+            if bedrock_dash:
+                logger.info(f"  Bedrock Usage Dashboard: {bedrock_dash}")
         if cognito_info:
             logger.info(
                 f"  Cognito User Pool: {cognito_info.get('cognito_user_pool_id')} "

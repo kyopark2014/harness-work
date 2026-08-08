@@ -383,6 +383,7 @@ def _run_harness_thread(
     result_holder: dict[str, Any],
     files: list[str] | None = None,
     actor_id: str | None = None,
+    guardrail_enabled: bool = False,
 ) -> None:
     sink = QueueNotificationSink(message_queue)
 
@@ -399,6 +400,7 @@ def _run_harness_thread(
             runtime_session_id=runtime_session_id,
             actor_id=actor_id,
             files=files or [],
+            guardrail_enabled=guardrail_enabled,
         )
         if not isinstance(response, str):
             response = json.dumps(response, ensure_ascii=False)
@@ -442,6 +444,7 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
             "result_holder": result_holder,
             "files": files,
             "actor_id": user_id,
+            "guardrail_enabled": bool(task.get("guardrail_enabled")),
         },
         daemon=True,
     )

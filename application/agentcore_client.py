@@ -738,6 +738,7 @@ def run_harness(
     runtime_session_id=None,
     actor_id=None,
     files=None,
+    guardrail_enabled=False,
 ):
     """
     Run the provisioned AgentCore Harness (deployment/test_invoke_harness.py shape).
@@ -750,6 +751,8 @@ def run_harness(
     files: optional CloudFront/S3 image URLs attached in the chat UI.
     actor_id: account login id (cookie); used as InvokeHarness actorId and embedded
     in systemPrompt for RAG/S3 MCP tools.
+    guardrail_enabled: when True, apply Bedrock Guardrail on INPUT before invoke
+    and on OUTPUT after the stream completes.
     """
     tool_info_list.clear()
     tool_result_list.clear()
@@ -783,6 +786,23 @@ def run_harness(
     system_prompt = build_harness_system_prompt(
         (actor_id or "").strip() or None
     )
+
+    if guardrail_enabled and effective_prompt:
+        try:
+            import guardrail as guardrail_mod
+        except ImportError:
+            from application import guardrail as guardrail_mod
+
+        blocked, blocked_message = guardrail_mod.check_input_guardrail(
+            effective_prompt,
+            region=bedrock_region,
+            enabled=True,
+        )
+        if blocked:
+            logger.info("Guardrail blocked InvokeHarness input")
+            if notification_queue is not None:
+                notification_queue.result(blocked_message)
+            return blocked_message, []
 
     try:
         import skill as skill_mod
@@ -1141,6 +1161,37 @@ def run_harness(
                     f"{reference['content']}...\n"
                 )
             result += ref
+
+        if guardrail_enabled and isinstance(result, str) and result.strip():
+            try:
+                import guardrail as guardrail_mod
+            except ImportError:
+                from application import guardrail as guardrail_mod
+
+            blocked, blocked_message = guardrail_mod.check_output_guardrail(
+                result,
+                region=bedrock_region,
+                enabled=True,
+            )
+            if blocked:
+                logger.info("Guardrail blocked InvokeHarness output")
+                result = blocked_message
+
+        try:
+            import cloudwatch_metrics
+        except ImportError:
+            try:
+                from application import cloudwatch_metrics
+            except ImportError:
+                cloudwatch_metrics = None
+        if cloudwatch_metrics is not None and last_usage:
+            model_id = (
+                (model_cfg or {})
+                .get("bedrockModelConfig", {})
+                .get("modelId")
+                or "unknown"
+            )
+            cloudwatch_metrics.publish_token_metrics(model_id, last_usage)
 
         if notification_queue is not None:
             notification_queue.result(result)

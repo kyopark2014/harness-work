@@ -17,6 +17,7 @@ import {
   SettingsIcon,
   SkillIcon,
   CloseIcon,
+  GuardrailIcon,
 } from "./SidebarIcons";
 
 type DrawerKind = "skill" | "mcp" | "model" | "appearance" | null;
@@ -279,6 +280,22 @@ export function Sidebar({
                 <McpIcon className="sidebar-icon" />
                 <span>MCP ({mcpServers.length})</span>
               </button>
+              <label className="sidebar-menu-btn settings-toggle">
+                <GuardrailIcon className="sidebar-icon" />
+                <span>Guardrail</span>
+                <input
+                  type="checkbox"
+                  checked={activeTask?.guardrail_enabled ?? false}
+                  disabled={!activeTask}
+                  onChange={(e) => {
+                    if (!activeTask) return;
+                    onPatchTask(activeTask.id, {
+                      guardrail_enabled: e.target.checked,
+                    });
+                    handleSettingApplied();
+                  }}
+                />
+              </label>
               <label className="sidebar-menu-btn settings-toggle">
                 <KnowledgeGraphIcon className="sidebar-icon" />
                 <span>Knowledge Graph</span>

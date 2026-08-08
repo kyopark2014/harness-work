@@ -786,8 +786,47 @@ response = client.invoke_harness(**invoke_kwargs)
 | IAM 실행 역할 | Bedrock · ECR · S3 · S3 Files 최소 권한 |
 | VPC | private subnet + NAT; S3 Files는 VPC 필수 |
 | Memory | `actorId` 스코프 사용자 격리 |
+| Guardrail | Bedrock Guardrail (SEXUAL / PROMPT_ATTACK); ECS에서 `apply_guardrail` |
 
 호출 측: `bedrock-agentcore:InvokeHarness` (+ 관련 runtime 권한).
+
+---
+
+## Guardrail
+
+`installer.py`가 Amazon Bedrock Guardrail을 생성·업데이트합니다. Managed Harness에는 Guardrail 네이티브 필드가 없으므로, **ECS Web UI**가 `InvokeHarness` 전후에 `bedrock-runtime.apply_guardrail`을 호출합니다.
+
+| 필터 | 입력 | 출력 |
+|------|------|------|
+| `SEXUAL` | HIGH + BLOCK | HIGH + BLOCK |
+| `PROMPT_ATTACK` | HIGH + BLOCK | NONE |
+
+Web UI Sidebar의 **Guardrail** 토글(`guardrail_enabled`)이 켜져 있을 때만 적용됩니다. config 키: `guardrail_id`, `guardrail_version`, `guardrail_arn`, `guardrail_name`.
+
+순수 한국어 성적/탈옥 프롬프트는 Bedrock 필터가 약할 수 있습니다(영어·한영 혼합은 잘 차단).
+
+---
+
+## Observability
+
+Harness 호출은 traces / logs / metrics를 **자동**으로 CloudWatch에 보냅니다. installer는 계정 단위 **Transaction Search**(`aws/spans`)를 활성화합니다 (`observability.py`).
+
+- 활성화 후 GenAI Observability 콘솔의 **Harnesses** 탭에서 확인
+- Transaction Search ACTIVE까지 최대 10–15분 소요 가능
+- 커스텀 Runtime용 OTEL Dockerfile / Evaluations는 이번 범위에 포함하지 않음
+
+---
+
+## Dashboard
+
+installer가 CloudWatch 대시보드를 생성합니다.
+
+| 대시보드 | 이름 | 내용 |
+|----------|------|------|
+| 프로젝트 모니터링 | `{projectName}-monitoring` | Harness 호출·토큰·예상 비용 |
+| Bedrock 사용량 | `Bedrock-Usage-Dashboard` | 계정 `AWS/Bedrock` 메트릭 |
+
+커스텀 토큰 메트릭은 ECS가 InvokeHarness 스트림의 `metadata.usage`로 `Harness/AgentCore` 네임스페이스에 `PutMetricData`합니다 (`application/cloudwatch_metrics.py`). ECS 이미지를 재배포해야 토큰 차트에 데이터가 쌓입니다.
 
 ---
 
