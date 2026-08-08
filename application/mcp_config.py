@@ -19,6 +19,19 @@ CONFIG_PATH = os.path.join(WORKING_DIR, "config.json")
 # (KB retrieve + artifact-share Runtime targets).
 _GATEWAY_MCP_LABELS = frozenset({"knowledge base", "artifact-share"})
 
+# Always-on MCP servers for every InvokeHarness call and UI defaults.
+# share_artifact / retrieve are required by the harness system prompt.
+BASE_MCP_SERVERS: tuple[str, ...] = ("knowledge base", "artifact-share")
+
+
+def merge_base_mcp_servers(mcp_servers: list[str] | None) -> list[str]:
+    """Return selected MCP labels with BASE_MCP_SERVERS always included."""
+    merged: list[str] = []
+    for label in list(BASE_MCP_SERVERS) + list(mcp_servers or []):
+        if label and label not in merged:
+            merged.append(label)
+    return merged
+
 
 def _load_app_config() -> dict:
     try:
@@ -96,12 +109,15 @@ MCP_OPTIONS = list(HARNESS_MCP_CATALOG.keys())
 
 
 def build_harness_tools(mcp_servers: list[str]) -> list[dict]:
-    """Build InvokeHarness ``tools`` from selected MCP option labels."""
+    """Build InvokeHarness ``tools`` from selected MCP option labels.
+
+    ``knowledge base`` and ``artifact-share`` are always included (shared Gateway).
+    """
     tools: list[dict] = []
     seen_names: set[str] = set()
     gateway_attached = False
 
-    for server in mcp_servers or []:
+    for server in merge_base_mcp_servers(mcp_servers):
         if server in _GATEWAY_MCP_LABELS:
             if gateway_attached:
                 continue

@@ -84,7 +84,14 @@ def save_favorite_tools(
     if skills is not None:
         favorites["SKILL"] = [v for v in skills if isinstance(v, str) and v.strip()]
     if mcp_servers is not None:
-        favorites["MCP"] = [v for v in mcp_servers if isinstance(v, str) and v.strip()]
+        try:
+            from application import mcp_config
+        except ImportError:
+            import mcp_config  # type: ignore
+
+        favorites["MCP"] = mcp_config.merge_base_mcp_servers(
+            [v for v in mcp_servers if isinstance(v, str) and v.strip()]
+        )
 
     with open(favorite_tools_path, "w", encoding="utf-8") as f:
         json.dump(favorites, f, ensure_ascii=False, indent=2)
@@ -92,10 +99,19 @@ def save_favorite_tools(
 
 
 def get_initial_tool_defaults() -> tuple[list[str], list[str]]:
-    """Return initial skill/MCP defaults from favorite_tools.json."""
+    """Return initial skill/MCP defaults from favorite_tools.json.
+
+    Always includes base MCP servers (knowledge base, artifact-share).
+    """
     favorite_tools = load_favorite_tools()
     default_skills = favorite_tools.get("SKILL") or []
     default_mcp_servers = favorite_tools.get("MCP") or []
+    try:
+        from application import mcp_config
+    except ImportError:
+        import mcp_config  # type: ignore
+
+    default_mcp_servers = mcp_config.merge_base_mcp_servers(default_mcp_servers)
     return default_skills, default_mcp_servers
 
 
