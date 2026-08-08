@@ -104,21 +104,20 @@ def _is_builtin_skill(name: str) -> bool:
 
 
 def _is_user_skill(user_id: str | None, name: str) -> bool:
-    """True if skill-creator output exists locally or as SKILL.md on S3."""
+    """True if skill-creator output exists as SKILL.md on S3 (session prefix).
+
+    ECS app-data mount no longer contains skills; always resolve via S3.
+    """
     if not user_id or not name:
         return False
     try:
+        import boto3
         import utils
-
-        skills_dir = utils.get_user_skills_dir(user_id)
-        if os.path.isfile(os.path.join(skills_dir, name, "SKILL.md")):
-            return True
 
         user_segment = utils.sanitize_user_path_segment(user_id)
         bucket = (utils.load_config() or {}).get("s3_bucket") or utils.s3_bucket
         if not user_segment or not bucket:
             return False
-        import boto3
 
         key = (
             f"{S3_FILES_SESSION_PREFIX}/{user_segment}/skills/{name}/SKILL.md"
@@ -153,7 +152,7 @@ def _parse_skill_md_text(raw: str) -> tuple[dict, str]:
 def _list_user_skills_from_s3(user_id: str | None) -> list[dict]:
     """List skill-creator skills under s3://{bucket}/agentcore-sessions/{user}/skills/.
 
-    Used when /mnt/workspace (or SESSION_STORAGE_DIR) is not mounted locally.
+    ECS mounts app-data only; user skills always come from this S3 prefix.
     Only directories that contain SKILL.md are included (skips *-workspace eval dirs).
     """
     if not user_id:
@@ -205,20 +204,7 @@ def _list_user_skills_from_s3(user_id: str | None) -> list[dict]:
 
 
 def _list_user_skills(user_id: str | None) -> list[dict]:
-    """Local SESSION_STORAGE mount first, else S3 agentcore-sessions listing."""
-    if not user_id:
-        return []
-    try:
-        import utils
-
-        user_skills_dir = utils.get_user_skills_dir(user_id)
-        if os.path.isdir(user_skills_dir):
-            return [
-                {"name": s.name, "description": s.description}
-                for s in SkillManager(user_skills_dir).registry.values()
-            ]
-    except Exception as e:
-        logger.warning(f"Failed to discover local user skills for {user_id}: {e}")
+    """List skill-creator skills from S3 agentcore-sessions (not app-data mount)."""
     return _list_user_skills_from_s3(user_id)
 
 

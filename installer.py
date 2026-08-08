@@ -2239,7 +2239,24 @@ def create_harness_execution_role(
                 "Sid": "AgentCoreSkillS3GetObject",
                 "Effect": "Allow",
                 "Action": ["s3:GetObject"],
-                "Resource": [f"arn:aws:s3:::{_bucket_name()}/*"],
+                # Intentionally exclude app-data/* (ECS tasks.db / graph / settings).
+                "Resource": [
+                    f"arn:aws:s3:::{_bucket_name()}/skills/*",
+                    f"arn:aws:s3:::{_bucket_name()}/agentcore-sessions/*",
+                    f"arn:aws:s3:::{_bucket_name()}/artifacts/*",
+                    f"arn:aws:s3:::{_bucket_name()}/images/*",
+                    f"arn:aws:s3:::{_bucket_name()}/docs/*",
+                ],
+            },
+            {
+                "Sid": "DenyHarnessAccessToAppData",
+                "Effect": "Deny",
+                "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:DeleteObject",
+                ],
+                "Resource": [f"arn:aws:s3:::{_bucket_name()}/app-data/*"],
             },
             # Sharing prefix writes (CloudFront); artifact-share MCP also uses its own role
             {
@@ -3301,6 +3318,7 @@ def build_config_from_deployment_state(
     cloudfront_info: Optional[Dict[str, str]] = None,
     ui_cloudfront_info: Optional[Dict[str, str]] = None,
     s3_files_info: Optional[Dict[str, object]] = None,
+    s3_files_app_data_info: Optional[Dict[str, object]] = None,
     vpc_info: Optional[Dict[str, object]] = None,
     ecs_info: Optional[Dict[str, str]] = None,
     image_uri: Optional[str] = None,
@@ -3353,6 +3371,16 @@ def build_config_from_deployment_state(
         config_data["agent_runtime_vpc_subnets"] = s3_files_info.get("subnets", [])
         config_data["agent_runtime_security_groups"] = s3_files_info.get(
             "security_groups", []
+        )
+    if s3_files_app_data_info:
+        config_data["s3_files_app_data_file_system_id"] = s3_files_app_data_info.get(
+            "file_system_id", ""
+        )
+        config_data["s3_files_app_data_access_point_arn"] = s3_files_app_data_info.get(
+            "access_point_arn", ""
+        )
+        config_data["s3_files_app_data_mount_path"] = s3_files_app_data_info.get(
+            "mount_path", s3_files_vpc.APP_DATA_MOUNT_PATH
         )
     if ecs_info:
         config_data["ecs_cluster_arn"] = ecs_info.get("cluster_arn", "")
@@ -3533,6 +3561,7 @@ def main():
     agent_memory_arn = None
     vpc_info = None
     s3_files_info = None
+    s3_files_app_data_info = None
     harness_info = None
     cloudfront_info = None
     ui_cloudfront_info = None
@@ -3594,12 +3623,18 @@ def main():
         provisioner = _s3_files_provisioner()
         logger.info("[17/25] Ensuring VPC for Harness (S3 Files requires VPC mode)")
         vpc_info = provisioner.ensure_vpc()
-        logger.info("[18/25] Creating S3 Files session storage")
+        logger.info("[18/25] Creating S3 Files session storage (Harness)")
         s3_files_info = provisioner.create_s3_files_session_storage(
             vpc_info,
             s3_bucket_name,
             execution_role_arn,
             execution_role_name,
+        )
+        logger.info("[18b/25] Creating S3 Files app-data storage (ECS)")
+        s3_files_app_data_info = provisioner.create_s3_files_app_data_storage(
+            vpc_info,
+            s3_bucket_name,
+            mount_sg_id=str(s3_files_info.get("mount_sg_id") or "") or None,
         )
 
         harness_info = create_or_get_harness(
@@ -3651,10 +3686,9 @@ def main():
             vpc_info = deployer.ensure_web_security_groups(vpc_info)
             deployer.prepare_s3files_for_ecs(
                 vpc_info,
-                s3_files_info,
+                s3_files_app_data_info,
                 ecs_roles["task_role_arn"],
                 ecs_roles["task_role_name"],
-                execution_role_arn,
             )
             origin_header_value = deployer.get_or_create_alb_origin_header()
             alb_info = deployer.create_alb(vpc_info)
@@ -3672,6 +3706,7 @@ def main():
                 cloudfront_info=cloudfront_info,
                 ui_cloudfront_info=ui_cloudfront_info,
                 s3_files_info=s3_files_info,
+                s3_files_app_data_info=s3_files_app_data_info,
                 vpc_info=vpc_info,
                 knowledge_base_id=knowledge_base_id,
                 data_source_id=data_source_id,
@@ -3710,7 +3745,7 @@ def main():
                 image_uri,
                 app_environment,
                 log_group_name,
-                s3_files_info=s3_files_info,
+                s3_files_info=s3_files_app_data_info,
                 origin_header_value=origin_header_value,
             )
             logger.info("[25/25] Waiting for CloudFront / ECS readiness")
@@ -3745,11 +3780,23 @@ def main():
         logger.info(f"  Vector Bucket: {s3_vectors_info.get('vectorBucketName')}")
         logger.info(f"  Vector Index: {s3_vectors_info.get('indexName')}")
         logger.info(f"  VPC: {vpc_info.get('vpc_id')}")
-        logger.info(f"  S3 Files Access Point: {s3_files_info.get('access_point_arn')}")
         logger.info(
-            f"  S3 Files Mount: {s3_files_info.get('mount_path')} "
-            f"(networkMode=VPC)"
+            f"  S3 Files (Harness) AP: {s3_files_info.get('access_point_arn')}"
         )
+        logger.info(
+            f"  S3 Files (Harness) Mount: {s3_files_info.get('mount_path')} "
+            f"(prefix=agentcore-sessions/, networkMode=VPC)"
+        )
+        if s3_files_app_data_info:
+            logger.info(
+                f"  S3 Files (ECS app-data) AP: "
+                f"{s3_files_app_data_info.get('access_point_arn')}"
+            )
+            logger.info(
+                f"  S3 Files (ECS app-data) Mount: "
+                f"{s3_files_app_data_info.get('mount_path')} "
+                f"(prefix=app-data/)"
+            )
         logger.info(f"  Execution Role: {execution_role_arn}")
         logger.info(f"  AgentCore Memory Role: {agentcore_memory_role_arn}")
         logger.info(f"  Memory ID: {memory_id}")
@@ -3804,6 +3851,7 @@ def main():
             cloudfront_info=cloudfront_info,
             ui_cloudfront_info=ui_cloudfront_info,
             s3_files_info=s3_files_info,
+            s3_files_app_data_info=s3_files_app_data_info,
             vpc_info=vpc_info,
             ecs_info=ecs_info,
             image_uri=image_uri,

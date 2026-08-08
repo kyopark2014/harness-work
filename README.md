@@ -115,7 +115,7 @@ python uninstaller.py
 | Dockerfile | multi-stage: Node로 React 빌드 → Python/uvicorn :8501 |
 | `ecs_web.py` | ECR · ECS Fargate · ALB · UI 전용 CloudFront |
 | `APP_CONFIG_JSON` | ECS 태스크 환경변수 → entrypoint가 `application/config.json`에 기록 |
-| S3 Files | ECS에도 `/mnt/app-data` 마운트 → `tasks.db` 영속 |
+| S3 Files | ECS는 **별도** `app-data/` FS를 `/mnt/app-data`에 마운트 (`tasks.db`·graph·settings). Harness는 `agentcore-sessions/` → `/mnt/workspace`. Skills는 S3 API |
 | Cognito | User Pool + App Client (`USER_PASSWORD_AUTH`) · HMAC 세션 쿠키 |
 
 ### Cognito / 세션
@@ -214,7 +214,14 @@ python uninstaller.py
 
 ## S3 Files + VPC 설정
 
-S3 Files 마운트는 **VPC 네트워크 모드**가 필요합니다. `s3_files_vpc.py`가 VPC(public/private + NAT)·S3 Files 파일시스템·Access Point·보안 그룹을 만들고, `installer.py`가 그 결과를 `CreateHarness`의 `environment`에 넣습니다.
+S3 Files 마운트는 **VPC 네트워크 모드**가 필요합니다. `s3_files_vpc.py`가 VPC(public/private + NAT)·**두 개의** S3 Files 파일시스템·Access Point·보안 그룹을 만듭니다.
+
+| FS prefix | 마운트 | 소비자 | 내용 |
+|-----------|--------|--------|------|
+| `agentcore-sessions/` | `/mnt/workspace` | Harness runtime | artifacts, skill-creator skills |
+| `app-data/` | `/mnt/app-data` | ECS Web UI only | `tasks.db`, graph, settings |
+
+Harness IAM은 `app-data/*`에 Deny가 걸려 있어 에이전트가 채팅 DB를 읽을 수 없습니다. UI의 user skills 목록은 `agentcore-sessions/{user}/skills/`를 **S3 API**로 조회합니다.
 
 ### 프로비저닝 흐름 (`installer.py`)
 
@@ -231,9 +238,13 @@ vpc_info = provisioner.ensure_vpc()
 s3_files_info = provisioner.create_s3_files_session_storage(
     vpc_info, s3_bucket_name, execution_role_arn, execution_role_name
 )
+app_data_info = provisioner.create_s3_files_app_data_storage(
+    vpc_info, s3_bucket_name, mount_sg_id=s3_files_info["mount_sg_id"]
+)
 harness_info = create_or_get_harness(
     execution_role_arn, agent_memory_arn, s3_files_info=s3_files_info
 )
+# ECS mounts app_data_info only (not session FS)
 ```
 
 ### Harness `environment` (VPC + 마운트)
@@ -303,6 +314,9 @@ VPC 모드에서 managed harness 이미지(`…dkr.ecr…/harness-<region>:lates
   "s3_files_file_system_id": "fs-…",
   "s3_files_access_point_arn": "arn:aws:s3files:…:access-point/fsap-…",
   "s3_files_mount_path": "/mnt/workspace",
+  "s3_files_app_data_file_system_id": "fs-…",
+  "s3_files_app_data_access_point_arn": "arn:aws:s3files:…:access-point/fsap-…",
+  "s3_files_app_data_mount_path": "/mnt/app-data",
   "agent_runtime_vpc_subnets": ["subnet-…"],
   "agent_runtime_security_groups": ["sg-…"],
   "HARNESS_ARN": "arn:aws:bedrock-agentcore:…:harness/…"

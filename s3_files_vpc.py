@@ -9,7 +9,9 @@ from typing import Dict, List, Optional
 from botocore.exceptions import ClientError
 
 SESSION_STORAGE_MOUNT_PATH = "/mnt/workspace"
+APP_DATA_MOUNT_PATH = "/mnt/app-data"
 S3_FILES_SESSION_PREFIX = "agentcore-sessions/"
+S3_FILES_APP_DATA_PREFIX = "app-data/"
 VPC_CIDR = "10.52.0.0/16"
 
 
@@ -485,24 +487,49 @@ class S3FilesVpcProvisioner:
             time.sleep(15)
         return role_arn
 
-    def _find_file_system(self, s3_bucket_arn: str) -> Optional[Dict[str, str]]:
+    def _normalize_prefix(self, prefix: str) -> str:
+        if not prefix:
+            return ""
+        return prefix if prefix.endswith("/") else f"{prefix}/"
+
+    def _file_system_name_tag(self, item: Dict) -> str:
+        for tag in item.get("tags") or []:
+            if tag.get("key") == "Name" or tag.get("Key") == "Name":
+                return tag.get("value") or tag.get("Value") or ""
+        return item.get("name") or ""
+
+    def _find_file_system(
+        self, s3_bucket_arn: str, prefix: str, name_tag: str
+    ) -> Optional[Dict[str, str]]:
+        want_prefix = self._normalize_prefix(prefix)
         paginator = self.s3files.get_paginator("list_file_systems")
         for page in paginator.paginate():
             for item in page.get("fileSystems", []):
-                if item.get("bucket") == s3_bucket_arn:
+                if item.get("bucket") != s3_bucket_arn:
+                    continue
+                item_prefix = self._normalize_prefix(item.get("prefix") or "")
+                item_name = self._file_system_name_tag(item)
+                if item_prefix == want_prefix or item_name == name_tag:
                     return {
                         "file_system_id": item.get("fileSystemId", ""),
                         "file_system_arn": item.get("fileSystemArn", ""),
+                        "prefix": item_prefix,
                     }
         return None
 
     def _get_or_create_file_system(
-        self, s3_bucket_arn: str, role_arn: str
+        self,
+        s3_bucket_arn: str,
+        role_arn: str,
+        *,
+        prefix: str,
+        name_tag: str,
     ) -> Dict[str, str]:
-        existing = self._find_file_system(s3_bucket_arn)
+        existing = self._find_file_system(s3_bucket_arn, prefix, name_tag)
         if existing and existing.get("file_system_id"):
             self.logger.info(
-                f"  Reusing S3 Files file system: {existing['file_system_id']}"
+                f"  Reusing S3 Files file system: {existing['file_system_id']} "
+                f"(prefix={existing.get('prefix') or prefix})"
             )
             return existing
 
@@ -510,17 +537,20 @@ class S3FilesVpcProvisioner:
         self._ensure_bucket_versioning(bucket)
         resp = self.s3files.create_file_system(
             bucket=s3_bucket_arn,
-            prefix=S3_FILES_SESSION_PREFIX,
+            prefix=self._normalize_prefix(prefix),
             roleArn=role_arn,
             acceptBucketWarning=True,
-            tags=[{"key": "Name", "value": f"s3files-for-{self.project_name}"}],
+            tags=[{"key": "Name", "value": name_tag}],
         )
         fs_id = resp["fileSystemId"]
-        self.logger.info(f"  Created S3 Files file system: {fs_id}")
+        self.logger.info(
+            f"  Created S3 Files file system: {fs_id} (prefix={prefix})"
+        )
         self._wait_status(self.s3files.get_file_system, "fileSystemId", fs_id)
         return {
             "file_system_id": fs_id,
             "file_system_arn": resp.get("fileSystemArn", ""),
+            "prefix": self._normalize_prefix(prefix),
         }
 
     def _ensure_mount_targets(
@@ -549,14 +579,37 @@ class S3FilesVpcProvisioner:
             self.logger.info(f"  Created mount target {mt_id} in {subnet_id}")
             self._wait_status(self.s3files.get_mount_target, "mountTargetId", mt_id)
 
-    def _get_or_create_access_point(self, file_system_id: str) -> str:
+    def _access_point_name_tag(self, item: Dict) -> str:
+        for tag in item.get("tags") or []:
+            if tag.get("key") == "Name" or tag.get("Key") == "Name":
+                return tag.get("value") or tag.get("Value") or ""
+        return item.get("name") or ""
+
+    def _get_or_create_access_point(
+        self, file_system_id: str, *, name_tag: str
+    ) -> str:
+        aps: List[Dict] = []
         paginator = self.s3files.get_paginator("list_access_points")
         for page in paginator.paginate(fileSystemId=file_system_id):
-            for item in page.get("accessPoints", []):
-                arn = item.get("accessPointArn")
-                if arn:
-                    self.logger.info(f"  Reusing S3 Files access point: {arn}")
-                    return arn
+            aps.extend(page.get("accessPoints") or [])
+
+        for item in aps:
+            arn = item.get("accessPointArn")
+            if not arn:
+                continue
+            if self._access_point_name_tag(item) == name_tag:
+                self.logger.info(
+                    f"  Reusing S3 Files access point: {arn} (name={name_tag})"
+                )
+                return arn
+
+        # Fallback: single-AP FS created before name tagging — reuse only when
+        # there is exactly one AP and the requested tag is the session default.
+        if len(aps) == 1 and name_tag == f"s3files-ap-for-{self.project_name}":
+            arn = aps[0].get("accessPointArn")
+            if arn:
+                self.logger.info(f"  Reusing legacy S3 Files access point: {arn}")
+                return arn
 
         resp = self.s3files.create_access_point(
             fileSystemId=file_system_id,
@@ -569,10 +622,10 @@ class S3FilesVpcProvisioner:
                     "permissions": "0777",
                 },
             },
-            tags=[{"key": "Name", "value": f"s3files-ap-for-{self.project_name}"}],
+            tags=[{"key": "Name", "value": name_tag}],
         )
         arn = resp["accessPointArn"]
-        self.logger.info(f"  Created S3 Files access point: {arn}")
+        self.logger.info(f"  Created S3 Files access point: {arn} (name={name_tag})")
         self._wait_status(
             self.s3files.get_access_point, "accessPointId", resp["accessPointId"]
         )
@@ -702,7 +755,12 @@ class S3FilesVpcProvisioner:
 
         s3_bucket_arn = f"arn:aws:s3:::{s3_bucket_name}"
         sync_role_arn = self._get_or_create_sync_role(s3_bucket_arn)
-        file_system = self._get_or_create_file_system(s3_bucket_arn, sync_role_arn)
+        file_system = self._get_or_create_file_system(
+            s3_bucket_arn,
+            sync_role_arn,
+            prefix=S3_FILES_SESSION_PREFIX,
+            name_tag=f"s3files-for-{self.project_name}",
+        )
         file_system_id = file_system["file_system_id"]
 
         harness_sg_id = self.create_security_group(
@@ -740,7 +798,10 @@ class S3FilesVpcProvisioner:
         )
         self._ensure_nfs_access(harness_sg_id, mount_sg_id)
         self._ensure_mount_targets(file_system_id, private_subnets, [mount_sg_id])
-        access_point_arn = self._get_or_create_access_point(file_system_id)
+        access_point_arn = self._get_or_create_access_point(
+            file_system_id,
+            name_tag=f"s3files-ap-for-{self.project_name}",
+        )
         self._put_file_system_policy(
             file_system_id,
             access_point_arn,
@@ -756,6 +817,7 @@ class S3FilesVpcProvisioner:
         self.logger.info(f"  File system: {file_system_id}")
         self.logger.info(f"  Access point: {access_point_arn}")
         self.logger.info(f"  Mount path: {SESSION_STORAGE_MOUNT_PATH}")
+        self.logger.info(f"  Prefix: {S3_FILES_SESSION_PREFIX}")
         self.logger.info(f"  Subnets: {', '.join(private_subnets)}")
         self.logger.info(f"  Security group: {harness_sg_id}")
 
@@ -764,11 +826,166 @@ class S3FilesVpcProvisioner:
             "file_system_arn": file_system.get("file_system_arn", ""),
             "access_point_arn": access_point_arn,
             "mount_path": SESSION_STORAGE_MOUNT_PATH,
+            "prefix": S3_FILES_SESSION_PREFIX,
             "vpc_id": vpc_id,
             "subnets": private_subnets,
             "security_groups": [harness_sg_id],
             "mount_sg_id": mount_sg_id,
             "harness_sg_id": harness_sg_id,
+        }
+
+    def _copy_s3_prefix_if_missing(
+        self, bucket: str, src_prefix: str, dst_prefix: str
+    ) -> int:
+        """Copy src→dst objects when destination prefix is empty. Returns count."""
+        dst_probe = self.s3.list_objects_v2(
+            Bucket=bucket, Prefix=dst_prefix, MaxKeys=1
+        )
+        if dst_probe.get("KeyCount", 0) > 0:
+            return 0
+        copied = 0
+        paginator = self.s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=src_prefix):
+            for obj in page.get("Contents") or []:
+                src_key = obj.get("Key") or ""
+                if not src_key.startswith(src_prefix):
+                    continue
+                dst_key = dst_prefix + src_key[len(src_prefix) :]
+                self.s3.copy_object(
+                    Bucket=bucket,
+                    Key=dst_key,
+                    CopySource={"Bucket": bucket, "Key": src_key},
+                )
+                copied += 1
+        return copied
+
+    def _migrate_app_data_from_sessions(self, s3_bucket_name: str) -> None:
+        """Move ECS-owned data off agentcore-sessions into app-data (once).
+
+        Migrates ``application-database/``, per-user ``graph/``, and
+        ``settings.json``. Skills/artifacts stay under agentcore-sessions.
+        """
+        try:
+            n = self._copy_s3_prefix_if_missing(
+                s3_bucket_name,
+                f"{S3_FILES_SESSION_PREFIX}application-database/",
+                f"{S3_FILES_APP_DATA_PREFIX}application-database/",
+            )
+            if n:
+                self.logger.info(
+                    f"  Migrated {n} application-database object(s) → app-data/"
+                )
+
+            paginator = self.s3.get_paginator("list_objects_v2")
+            users: List[str] = []
+            for page in paginator.paginate(
+                Bucket=s3_bucket_name,
+                Prefix=S3_FILES_SESSION_PREFIX,
+                Delimiter="/",
+            ):
+                for entry in page.get("CommonPrefixes") or []:
+                    child = (entry.get("Prefix") or "").rstrip("/")
+                    name = child.rsplit("/", 1)[-1] if child else ""
+                    if name and name != "application-database":
+                        users.append(name)
+
+            graph_copied = 0
+            settings_copied = 0
+            for user in users:
+                graph_copied += self._copy_s3_prefix_if_missing(
+                    s3_bucket_name,
+                    f"{S3_FILES_SESSION_PREFIX}{user}/graph/",
+                    f"{S3_FILES_APP_DATA_PREFIX}{user}/graph/",
+                )
+                src_settings = f"{S3_FILES_SESSION_PREFIX}{user}/settings.json"
+                dst_settings = f"{S3_FILES_APP_DATA_PREFIX}{user}/settings.json"
+                try:
+                    self.s3.head_object(Bucket=s3_bucket_name, Key=dst_settings)
+                except ClientError:
+                    try:
+                        self.s3.head_object(Bucket=s3_bucket_name, Key=src_settings)
+                    except ClientError:
+                        continue
+                    self.s3.copy_object(
+                        Bucket=s3_bucket_name,
+                        Key=dst_settings,
+                        CopySource={
+                            "Bucket": s3_bucket_name,
+                            "Key": src_settings,
+                        },
+                    )
+                    settings_copied += 1
+
+            if graph_copied:
+                self.logger.info(
+                    f"  Migrated {graph_copied} graph object(s) → app-data/"
+                )
+            if settings_copied:
+                self.logger.info(
+                    f"  Migrated {settings_copied} settings.json → app-data/"
+                )
+        except ClientError as e:
+            self.logger.warning(f"  app-data migration skipped: {e}")
+
+    def create_s3_files_app_data_storage(
+        self,
+        vpc_info: Dict[str, object],
+        s3_bucket_name: str,
+        *,
+        mount_sg_id: Optional[str] = None,
+    ) -> Dict[str, object]:
+        """Provision a separate S3 Files FS for ECS (tasks.db / graph / settings).
+
+        Uses ``app-data/`` prefix so Harness session storage
+        (``agentcore-sessions/``) cannot see the web app database.
+        """
+        self.logger.info("Creating S3 Files app-data storage for ECS")
+        vpc_id = str(vpc_info["vpc_id"])
+        private_subnets = list(vpc_info.get("private_subnets") or [])
+        if not private_subnets:
+            raise RuntimeError("At least one private subnet is required for S3 Files")
+
+        s3_bucket_arn = f"arn:aws:s3:::{s3_bucket_name}"
+        sync_role_arn = self._get_or_create_sync_role(s3_bucket_arn)
+        file_system = self._get_or_create_file_system(
+            s3_bucket_arn,
+            sync_role_arn,
+            prefix=S3_FILES_APP_DATA_PREFIX,
+            name_tag=f"s3files-app-data-for-{self.project_name}",
+        )
+        file_system_id = file_system["file_system_id"]
+
+        if not mount_sg_id:
+            mount_sg_id = self.create_security_group(
+                vpc_id=vpc_id,
+                group_name=f"s3files-mount-sg-for-{self.project_name}",
+                description=f"S3 Files mount SG for {self.project_name}",
+            )
+
+        self._ensure_mount_targets(
+            file_system_id, private_subnets, [str(mount_sg_id)]
+        )
+        access_point_arn = self._get_or_create_access_point(
+            file_system_id,
+            name_tag=f"s3files-ap-app-data-for-{self.project_name}",
+        )
+        self._migrate_app_data_from_sessions(s3_bucket_name)
+
+        self.logger.info("✓ S3 Files app-data storage ready")
+        self.logger.info(f"  File system: {file_system_id}")
+        self.logger.info(f"  Access point: {access_point_arn}")
+        self.logger.info(f"  Mount path: {APP_DATA_MOUNT_PATH}")
+        self.logger.info(f"  Prefix: {S3_FILES_APP_DATA_PREFIX}")
+
+        return {
+            "file_system_id": file_system_id,
+            "file_system_arn": file_system.get("file_system_arn", ""),
+            "access_point_arn": access_point_arn,
+            "mount_path": APP_DATA_MOUNT_PATH,
+            "prefix": S3_FILES_APP_DATA_PREFIX,
+            "vpc_id": vpc_id,
+            "subnets": private_subnets,
+            "mount_sg_id": mount_sg_id,
         }
 
 

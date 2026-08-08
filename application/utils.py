@@ -21,8 +21,13 @@ favorite_tools_path = os.path.join(script_dir, "favorite_tools.json")
 
 
 def _default_session_storage_dir() -> str:
-    """Prefer shared S3 Files mount (AgentCore /mnt/workspace or ECS /mnt/app-data)."""
-    for candidate in ("/mnt/workspace", "/mnt/app-data"):
+    """Resolve session/app storage mount.
+
+    - ECS: ``/mnt/app-data`` (S3 Files prefix ``app-data/``) for tasks.db,
+      graph, and settings. Skills are loaded via S3 API, not this mount.
+    - Harness runtime: ``/mnt/workspace`` (prefix ``agentcore-sessions/``).
+    """
+    for candidate in ("/mnt/app-data", "/mnt/workspace"):
         if os.path.isdir(candidate):
             return candidate
     return os.path.join(script_dir, ".session_storage")
@@ -125,13 +130,20 @@ def sanitize_user_path_segment(user_id: str | None) -> str | None:
 
 
 def get_user_skills_dir(user_id: str | None) -> str:
-    """Absolute path to {SESSION_STORAGE_DIR}/{user_id}/skills (does not create)."""
+    """Logical local path for user skills (Harness runtime mount only).
+
+    Web UI discovers skill-creator skills via S3
+    (``agentcore-sessions/{user}/skills/``), not under app-data.
+    """
     segment = sanitize_user_path_segment(user_id) or "default"
-    return os.path.join(SESSION_STORAGE_DIR, segment, "skills")
+    # Prefer workspace mount when present (runtime); else app-data is unused
+    # for skills listing — callers should use S3.
+    root = "/mnt/workspace" if os.path.isdir("/mnt/workspace") else SESSION_STORAGE_DIR
+    return os.path.join(root, segment, "skills")
 
 
 def ensure_user_skills_dir(user_id: str | None) -> str:
-    """Create {SESSION_STORAGE_DIR}/{user_id}/skills if needed and return it."""
+    """Create user skills dir under the Harness workspace mount when available."""
     skills_dir = get_user_skills_dir(user_id)
     os.makedirs(skills_dir, exist_ok=True)
     logger.info("user skills dir ready: %s", skills_dir)

@@ -399,19 +399,30 @@ def _wait_s3files_gone(describe_fn, id_key: str, resource_id: str, timeout: int 
     raise TimeoutError(f"Timed out waiting for S3 Files {resource_id} deletion")
 
 
-def _find_s3files_fs_id(cfg: dict) -> str:
-    if cfg.get("s3_files_file_system_id"):
-        return cfg["s3_files_file_system_id"]
+def _find_s3files_fs_ids(cfg: dict) -> List[str]:
+    """Return session + app-data FS ids (config first, then all FS on project bucket)."""
+    ids: List[str] = []
+    for key in (
+        "s3_files_file_system_id",
+        "s3_files_app_data_file_system_id",
+    ):
+        fs_id = (cfg.get(key) or "").strip()
+        if fs_id and fs_id not in ids:
+            ids.append(fs_id)
+
     bucket_arn = f"arn:aws:s3:::{_bucket_name()}"
     try:
         paginator = s3files_client.get_paginator("list_file_systems")
         for page in paginator.paginate():
             for item in page.get("fileSystems", []):
-                if item.get("bucket") == bucket_arn:
-                    return item.get("fileSystemId") or ""
+                if item.get("bucket") != bucket_arn:
+                    continue
+                fs_id = item.get("fileSystemId") or ""
+                if fs_id and fs_id not in ids:
+                    ids.append(fs_id)
     except ClientError as e:
         logger.warning(f"  Could not list S3 Files file systems: {e}")
-    return ""
+    return ids
 
 
 def delete_s3files_sync_role():
@@ -430,14 +441,7 @@ def delete_s3files_sync_role():
             logger.warning(f"  Could not delete sync role {role_name}: {e}")
 
 
-def delete_s3_files_session_storage(cfg: dict):
-    logger.info("[3/8] Deleting S3 Files session storage")
-    fs_id = _find_s3files_fs_id(cfg)
-    if not fs_id:
-        logger.info("  No S3 Files file system found")
-        delete_s3files_sync_role()
-        return
-
+def _delete_one_s3files_filesystem(fs_id: str) -> None:
     logger.info(f"  File system: {fs_id}")
 
     try:
@@ -493,8 +497,20 @@ def delete_s3_files_session_storage(cfg: dict):
         if not _is_s3files_not_found(e):
             logger.warning(f"  Could not delete file system {fs_id}: {e}")
 
+
+def delete_s3_files_session_storage(cfg: dict):
+    logger.info("[3/8] Deleting S3 Files storage (session + app-data)")
+    fs_ids = _find_s3files_fs_ids(cfg)
+    if not fs_ids:
+        logger.info("  No S3 Files file system found")
+        delete_s3files_sync_role()
+        return
+
+    for fs_id in fs_ids:
+        _delete_one_s3files_filesystem(fs_id)
+
     delete_s3files_sync_role()
-    logger.info("✓ S3 Files session storage deleted")
+    logger.info("✓ S3 Files storage deleted")
 
 
 # --- VPC ---------------------------------------------------------------------
@@ -1126,6 +1142,9 @@ INSTALLER_CONFIG_KEYS = [
     "s3_files_file_system_id",
     "s3_files_access_point_arn",
     "s3_files_mount_path",
+    "s3_files_app_data_file_system_id",
+    "s3_files_app_data_access_point_arn",
+    "s3_files_app_data_mount_path",
     "agent_runtime_vpc_subnets",
     "agent_runtime_security_groups",
     "ecs_cluster_arn",

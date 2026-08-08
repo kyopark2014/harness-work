@@ -864,19 +864,27 @@ class EcsWebDeployer:
     def prepare_s3files_for_ecs(
         self,
         vpc_info: Dict,
-        s3_files_info: Dict,
+        app_data_info: Dict,
         ecs_task_role_arn: str,
         ecs_task_role_name: str,
-        harness_execution_role_arn: str,
+        harness_execution_role_arn: str = "",
     ) -> None:
-        file_system_id = str(s3_files_info.get("file_system_id") or "")
-        access_point_arn = str(s3_files_info.get("access_point_arn") or "")
+        """Grant ECS mount access to the dedicated app-data S3 Files FS only.
+
+        Harness keeps its own agentcore-sessions FS/AP; do not add the ECS
+        role (or share app-data) with that filesystem.
+        ``harness_execution_role_arn`` is accepted for call-site compatibility
+        but intentionally unused.
+        """
+        del harness_execution_role_arn  # not used — app-data is ECS-only
+        file_system_id = str(app_data_info.get("file_system_id") or "")
+        access_point_arn = str(app_data_info.get("access_point_arn") or "")
         if not file_system_id or not access_point_arn:
-            self.logger.warning("  Skipping S3 Files ECS prep: missing FS/AP")
+            self.logger.warning("  Skipping S3 Files ECS prep: missing app-data FS/AP")
             return
 
         ecs_sg_id = vpc_info.get("ecs_sg_id")
-        mount_sg_id = s3_files_info.get("mount_sg_id")
+        mount_sg_id = app_data_info.get("mount_sg_id")
         if not mount_sg_id:
             mount_sg_id = self._find_sg_by_name(
                 str(vpc_info["vpc_id"]),
@@ -885,18 +893,13 @@ class EcsWebDeployer:
         if ecs_sg_id and mount_sg_id:
             self._ensure_nfs(str(ecs_sg_id), str(mount_sg_id))
 
-        principals = [
-            a for a in [harness_execution_role_arn, ecs_task_role_arn] if a
-        ]
-        if principals:
+        if ecs_task_role_arn:
             policy = {
                 "Version": "2012-10-17",
                 "Statement": [
                     {
                         "Effect": "Allow",
-                        "Principal": {
-                            "AWS": principals if len(principals) > 1 else principals[0]
-                        },
+                        "Principal": {"AWS": ecs_task_role_arn},
                         "Action": [
                             "s3files:ClientMount",
                             "s3files:ClientWrite",
@@ -915,19 +918,21 @@ class EcsWebDeployer:
                     fileSystemId=file_system_id,
                     policy=json.dumps(policy),
                 )
-                self.logger.info("  ✓ Updated S3 Files FS policy for ECS + Harness")
+                self.logger.info(
+                    "  ✓ Applied S3 Files app-data FS policy for ECS only"
+                )
             except ClientError as e:
-                self.logger.warning(f"  S3 Files FS policy update failed: {e}")
+                self.logger.warning(f"  S3 Files app-data FS policy update failed: {e}")
 
         fs_arn = (
-            s3_files_info.get("file_system_arn")
+            app_data_info.get("file_system_arn")
             or f"arn:aws:s3files:{self.region}:{self.account_id}:file-system/{file_system_id}"
         )
         iam_policy = {
             "Version": "2012-10-17",
             "Statement": [
                 {
-                    "Sid": "S3FilesClientAccess",
+                    "Sid": "S3FilesAppDataClientAccess",
                     "Effect": "Allow",
                     "Action": [
                         "s3files:ClientMount",
@@ -940,13 +945,13 @@ class EcsWebDeployer:
                     },
                 },
                 {
-                    "Sid": "S3FilesGetAccessPoint",
+                    "Sid": "S3FilesAppDataGetAccessPoint",
                     "Effect": "Allow",
                     "Action": ["s3files:GetAccessPoint"],
                     "Resource": access_point_arn,
                 },
                 {
-                    "Sid": "S3FilesListMountTargets",
+                    "Sid": "S3FilesAppDataListMountTargets",
                     "Effect": "Allow",
                     "Action": ["s3files:ListMountTargets"],
                     "Resource": fs_arn,
@@ -958,7 +963,9 @@ class EcsWebDeployer:
             f"s3files-ecs-task-policy-for-{self.project_name}",
             iam_policy,
         )
-        self.logger.info(f"  ✓ Attached S3 Files policy to {ecs_task_role_name}")
+        self.logger.info(
+            f"  ✓ Attached app-data S3 Files policy to {ecs_task_role_name}"
+        )
 
     def _ensure_nfs(self, client_sg_id: str, mount_sg_id: str) -> None:
         try:
@@ -1257,9 +1264,13 @@ class EcsWebDeployer:
                 [
                     {"name": "TASK_DB_MOUNT", "value": app_data_mount},
                     {"name": "TASK_DB_PROJECT", "value": self.project_name},
+                    # graph/settings live on app-data; skills are loaded via S3 API
+                    {"name": "SESSION_STORAGE_DIR", "value": app_data_mount},
                 ]
             )
-            self.logger.info(f"  ECS will mount S3 Files at {app_data_mount}")
+            self.logger.info(
+                f"  ECS will mount app-data S3 Files at {app_data_mount}"
+            )
 
         task_kwargs: Dict[str, object] = {
             "family": task_family,
