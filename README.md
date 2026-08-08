@@ -690,6 +690,74 @@ response = client.invoke_harness(**invoke_kwargs)
 
 ---
 
+## AgentCore Memory
+
+앱이 `CreateEvent` / `recall_memory`를 직접 호출하지 않고, **Memory ARN을 Harness에 바인딩**하면 플랫폼이 short-term·long-term 저장·조회를 담당합니다. 앱 역할은 Memory 프로비저닝 + `InvokeHarness` 시 `actorId` 전달입니다.
+
+```mermaid
+flowchart LR
+  INST["installer.py"] --> Mem["AgentCore Memory<br/>UserPreference / Summary / Semantic"]
+  INST --> H["CreateHarness<br/>agentCoreMemoryConfiguration.arn"]
+  Mem -.->|ARN 바인딩| H
+  UI["run_harness"] -->|"InvokeHarness<br/>actorId + runtimeSessionId"| H
+  H -->|"플랫폼이 STM/LTM 처리"| Mem
+```
+
+### 프로비저닝
+
+`installer.py` 흐름:
+
+1. `create_agentcore_memory_role()` — 추출용 Bedrock `InvokeModel` 권한 (trust: `bedrock-agentcore.amazonaws.com`)
+2. `create_agentcore_memory()` — 프로젝트당 Memory 1개 + shared 전략 3개
+3. `create_or_get_harness(..., agent_memory_arn)` — `memory.agentCoreMemoryConfiguration.arn`으로 바인딩
+4. `ensure_harness_memory_binding()` — 기존 Harness ARN이 다르면 `UpdateHarness`로 맞춤
+
+`application/config.json`에 `memory_id`, `agent_memory_arn`, `agentcore_memory_role`이 저장됩니다. 삭제는 `uninstaller.py`의 `DeleteMemory` 경로를 따릅니다.
+
+| 전략 | Namespace | 역할 |
+|------|-----------|------|
+| **UserPreference** | `/users/{actorId}/preferences` | 명시·암시 선호 추출 |
+| **Summary** | `/users/{actorId}/sessions/{sessionId}` | 세션 요약 누적 |
+| **Semantic** | `/users/{actorId}/facts` | 장기 사실 추출·통합 |
+
+- 전략은 **memory당 공유 3개**만 둡니다 (유저별 전략 생성 안 함 → strategy quota 회피).
+- 추출 모델: Claude Haiku (`us.anthropic.claude-haiku-4-5-…`), 프롬프트는 한국어.
+- `event_expiry_days=365`.
+
+### 런타임
+
+`application/agentcore_client.py`의 `run_harness()`가 `InvokeHarness`에 다음을 넣습니다.
+
+| 파라미터 | 값 |
+|----------|-----|
+| `actorId` | 로그인 user id (없으면 `projectName` fallback) |
+| `runtimeSessionId` | React task / 세션 id |
+
+유저 격리는 Memory 리소스가 아니라 **`actorId` + namespace prefix** (`/users/{actorId}/…`)로 합니다. README [보안 요약](#보안-요약)의 Memory 행과 동일합니다.
+
+대화 컨텍스트는 Memory와 별도로 Harness `truncation.sliding_window`(최근 50메시지)로도 유지됩니다.
+
+### strands-work와의 차이
+
+| | **harness-work** | **strands-work** |
+|--|------------------|------------------|
+| 연결 | `CreateHarness.memory.agentCoreMemoryConfiguration` | Runtime이 Memory API 직접 호출 |
+| 쓰기 | Harness 관리 (앱 `CreateEvent` 없음) | 턴 종료 시 `save_to_memory` → `CreateEvent` |
+| 읽기 | Harness 내부 recall | MCP `recall_memory` |
+| 토글 | UI `memory_enabled`는 task DB에만 있고 Invoke에 미연결 | `memory_enabled`로 MCP 추가·저장 on/off |
+| 프롬프트 | `recall_memory` 지시 없음 (artifact / `actor_id` 중심) | 개인 맥락 전 `recall_memory` 호출 명시 |
+
+요약: harness-work는 **Memory as Harness feature**, strands-work는 **Memory as app/MCP tool**입니다.
+
+### 참고
+
+- UI/task의 `memory_enabled`는 기본 `true`로 저장되지만 `run_harness` 경로에서는 쓰이지 않습니다. Memory는 설치 시 항상 Harness에 붙습니다.
+- `skills/korea-weather`의 `recall_home_location.py`는 `mcp_memory`를 가정합니다. 이 저장소에는 해당 모듈이 없어 **skill 직접 Memory 조회는 동작하지 않을 수 있습니다.** 실제 LTM은 Harness 바인딩에 의존합니다.
+
+관련 코드: [`installer.py`](./installer.py) (`create_agentcore_memory*`, `ensure_harness_memory_binding`, `create_or_get_harness`), [`application/agentcore_client.py`](./application/agentcore_client.py) (`run_harness`의 `actorId`).
+
+---
+
 ## 도구 타입 참고
 
 | 도구 타입 | 설명 |
