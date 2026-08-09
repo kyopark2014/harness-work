@@ -11,6 +11,8 @@ from typing import Any
 
 import networkx as nx
 
+from .ask_panel import ASK_PANEL_CSS, ASK_PANEL_HTML, ASK_PANEL_JS
+
 # agentcore_knowledge_graph.html 과 같은 팔레트
 GROUP_COLORS = [
     "#FF6B35",
@@ -207,7 +209,7 @@ def _render_template(payload: dict[str, Any]) -> str:
     )
     data_json = data_json.replace("</", "<\\/")
 
-    return f"""<!DOCTYPE html>
+    doc = f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
@@ -434,6 +436,7 @@ def _render_template(payload: dict[str, Any]) -> str:
     font-weight: 700;
   }}
   .ctrl-btn:disabled {{ opacity: 0.55; cursor: wait; }}
+<<<ASK_PANEL_CSS>>>
 </style>
 </head>
 <body>
@@ -478,8 +481,10 @@ def _render_template(payload: dict[str, Any]) -> str:
       <button type="button" class="ctrl-btn" onclick="stabilize()">레이아웃 재정렬</button>
       <button type="button" class="ctrl-btn" id="legend-toggle-btn" onclick="toggleLegend()">범례 숨기기</button>
       <button type="button" class="ctrl-btn" onclick="filterGroup(null)">필터 해제</button>
+      <button type="button" class="ctrl-btn ask-btn" onclick="toggleAskPanel()" title="문서검색">문서검색</button>
     </div>
   </div>
+<<<ASK_PANEL_HTML>>>
 </div>
 
 <script>
@@ -836,7 +841,13 @@ document.getElementById('search').addEventListener('input', (ev) => {{
   }}));
   if (hits.length === 1) network.focus(hits[0], {{ scale: 1.1, animation: true }});
 }});
+<<<ASK_PANEL_JS>>>
 </script>
 </body>
 </html>
 """
+    return (
+        doc.replace("<<<ASK_PANEL_CSS>>>", ASK_PANEL_CSS)
+        .replace("<<<ASK_PANEL_HTML>>>", ASK_PANEL_HTML)
+        .replace("<<<ASK_PANEL_JS>>>", ASK_PANEL_JS)
+    )
