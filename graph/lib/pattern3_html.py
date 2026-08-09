@@ -243,7 +243,7 @@ def _render_template(payload: dict[str, Any]) -> str:
     position: absolute;
     top: 18px;
     left: 18px;
-    z-index: 4;
+    z-index: 20;
     width: min(320px, calc(100vw - 36px));
   }}
   .search-box {{
@@ -276,7 +276,7 @@ def _render_template(payload: dict[str, Any]) -> str:
     position: absolute;
     left: 18px;
     bottom: 18px;
-    z-index: 4;
+    z-index: 20;
     width: min(280px, calc(100vw - 36px));
     max-height: min(52vh, 420px);
     display: flex;
@@ -356,7 +356,7 @@ def _render_template(payload: dict[str, Any]) -> str:
     position: absolute;
     top: 18px;
     right: 18px;
-    z-index: 4;
+    z-index: 20;
     width: min(300px, calc(100vw - 36px));
     background: rgba(28, 33, 44, 0.96);
     border: 1px solid rgba(255,255,255,0.08);
@@ -400,11 +400,12 @@ def _render_template(payload: dict[str, Any]) -> str:
     position: absolute;
     right: 18px;
     bottom: 18px;
-    z-index: 4;
+    z-index: 20;
     display: flex;
     flex-direction: column;
     gap: 8px;
     align-items: flex-end;
+    pointer-events: auto;
   }}
   .controls-row {{
     display: flex;
@@ -470,9 +471,10 @@ def _render_template(payload: dict[str, Any]) -> str:
       <button type="button" class="ctrl-btn pattern-btn active" data-pattern="pattern3" onclick="selectPattern('pattern3')" title="Holistic View (현재)">Holistic View</button>
     </div>
     <div class="controls-row">
-      <button class="ctrl-btn" onclick="network.fit({{ animation: {{ duration: 400 }} }})">전체 보기</button>
-      <button class="ctrl-btn" onclick="stabilize()">레이아웃 재정렬</button>
-      <button class="ctrl-btn" onclick="filterGroup(null)">필터 해제</button>
+      <button type="button" class="ctrl-btn" id="fit-view-btn">전체 보기</button>
+      <button type="button" class="ctrl-btn" onclick="stabilize()">레이아웃 재정렬</button>
+      <button type="button" class="ctrl-btn" id="legend-toggle-btn" onclick="toggleLegend()">범례 숨기기</button>
+      <button type="button" class="ctrl-btn" onclick="filterGroup(null)">필터 해제</button>
     </div>
   </div>
 </div>
@@ -484,6 +486,7 @@ const rawEdges = DATA.rawEdges;
 const nodeDescriptions = DATA.descriptions;
 const legend = DATA.legend;
 let activeGroup = null;
+let legendHidden = false;
 
 function darkenColor(hex, factor) {{
   const r = Math.floor(parseInt(hex.slice(1,3), 16) * (1-factor));
@@ -502,8 +505,61 @@ function hideDetail() {{
   document.getElementById('node-detail').style.display = 'none';
 }}
 
-function toggleLegend() {{
-  document.querySelector('.legend-panel').classList.toggle('is-hidden');
+function syncLegendToggleLabel() {{
+  const btn = document.getElementById('legend-toggle-btn');
+  if (btn) btn.textContent = legendHidden ? '범례 보이기' : '범례 숨기기';
+}}
+
+function toggleLegend(force) {{
+  const panel = document.querySelector('.legend-panel');
+  if (!panel) return;
+  legendHidden = typeof force === 'boolean' ? force : !legendHidden;
+  panel.classList.toggle('is-hidden', legendHidden);
+  syncLegendToggleLabel();
+}}
+
+const NODE_COUNT = rawNodes.length;
+const SMALL_GRAPH = NODE_COUNT < 120;
+const STAB_ITERS = SMALL_GRAPH ? 220 : NODE_COUNT > 300 ? 140 : 180;
+let network = null;
+
+function stopPhysics() {{
+  if (!network) return;
+  try {{ network.stopSimulation(); }} catch (e) {{}}
+  network.setOptions({{
+    physics: {{ enabled: false, stabilization: {{ enabled: false }} }}
+  }});
+}}
+
+function whenCanvasReady(fn) {{
+  let tries = 0;
+  const tick = () => {{
+    const el = document.getElementById('mynetwork');
+    const w = el ? el.clientWidth : 0;
+    const h = el ? el.clientHeight : 0;
+    if (w >= 60 && h >= 60) {{
+      fn();
+      return;
+    }}
+    if (tries++ < 80) {{
+      setTimeout(tick, 40);
+      return;
+    }}
+    fn();
+  }};
+  requestAnimationFrame(tick);
+}}
+
+function fitView() {{
+  whenCanvasReady(() => {{
+    try {{
+      network.redraw();
+      network.fit({{
+        animation: {{ duration: 400, easingFunction: 'easeInOutQuad' }},
+        padding: 40
+      }});
+    }} catch (e) {{}}
+  }});
 }}
 
 function markLegendActive(group) {{
@@ -583,6 +639,30 @@ const visEdges = rawEdges.map((e, i) => ({{
   smooth: {{ type: 'dynamic', roundness: 0.3 }},
   title: e.label + (e.confidence ? ` [${{e.confidence}}]` : '')
 }}));
+if (SMALL_GRAPH) {{
+  // Community seed so the first open has visible settle motion.
+  const groups = {{}};
+  visNodes.forEach((n) => {{
+    const g = n.group == null ? 0 : n.group;
+    if (!groups[g]) groups[g] = [];
+    groups[g].push(n);
+  }});
+  const keys = Object.keys(groups);
+  const R = Math.max(420, Math.sqrt(visNodes.length) * 70);
+  keys.forEach((g, gi) => {{
+    const angle = (2 * Math.PI * gi) / Math.max(keys.length, 1);
+    const cx = Math.cos(angle) * R;
+    const cy = Math.sin(angle) * R;
+    const members = groups[g];
+    const local = Math.max(80, Math.sqrt(members.length) * 28);
+    members.forEach((n, i) => {{
+      const a = (2 * Math.PI * i) / Math.max(members.length, 1);
+      const r = local * (0.25 + 0.75 * ((i % 7) / 7));
+      n.x = cx + Math.cos(a) * r + (Math.random() - 0.5) * 40;
+      n.y = cy + Math.sin(a) * r + (Math.random() - 0.5) * 40;
+    }});
+  }});
+}}
 
 const container = document.getElementById('mynetwork');
 const networkData = {{
@@ -591,6 +671,7 @@ const networkData = {{
 }};
 
 const options = {{
+  groups: {{ useDefaultGroups: false }},
   nodes: {{
     shape: 'ellipse',
     scaling: {{ label: {{ enabled: true, min: 8, max: 14 }} }}
@@ -610,7 +691,13 @@ const options = {{
       damping: 0.45,
       avoidOverlap: 0.9
     }},
-    stabilization: {{ enabled: true, iterations: 220, updateInterval: 25 }}
+    // Small graphs: live physics (batch stabilize / improvedLayout hides first-open motion).
+    stabilization: {{
+      enabled: !SMALL_GRAPH,
+      iterations: STAB_ITERS,
+      updateInterval: 25,
+      fit: false
+    }}
   }},
   interaction: {{
     hover: true,
@@ -619,11 +706,15 @@ const options = {{
     dragView: true,
     keyboard: {{ enabled: true, bindToWindow: false }}
   }},
-  layout: {{ improvedLayout: true }}
+  layout: {{ improvedLayout: false }}
 }};
 
-const network = new vis.Network(container, networkData, options);
+network = new vis.Network(container, networkData, options);
 container.setAttribute('tabindex', '0');
+document.getElementById('fit-view-btn').addEventListener('pointerdown', (ev) => {{
+  ev.preventDefault();
+  fitView();
+}}, true);
 
 network.on('click', function(params) {{
   if (params.nodes.length === 0) {{
@@ -652,10 +743,24 @@ network.on('click', function(params) {{
 network.on('hoverNode', () => {{ container.style.cursor = 'pointer'; }});
 network.on('blurNode', () => {{ container.style.cursor = 'default'; }});
 
-network.once('stabilizationIterationsDone', function() {{
-  // Holistic: always fit the full graph
-  network.fit({{ animation: {{ duration: 700, easingFunction: 'easeInOutQuad' }} }});
-}});
+if (SMALL_GRAPH) {{
+  try {{ network.startSimulation(); }} catch (e) {{}}
+  let opened = false;
+  const done = () => {{
+    if (opened) return;
+    opened = true;
+    network.fit({{ animation: {{ duration: 700, easingFunction: 'easeInOutQuad' }} }});
+  }};
+  network.once('stabilized', done);
+  setTimeout(done, 4500);
+}} else {{
+  network.once('stabilizationIterationsDone', function() {{
+    stopPhysics();
+    whenCanvasReady(() => {{
+      network.fit({{ animation: {{ duration: 700, easingFunction: 'easeInOutQuad' }} }});
+    }});
+  }});
+}}
 
 function filterGroup(group) {{
   activeGroup = group;
@@ -672,18 +777,54 @@ function filterGroup(group) {{
 }}
 
 function stabilize() {{
-  const ids = networkData.nodes.getIds();
-  const spread = Math.max(1000, Math.sqrt(ids.length) * 220);
-  networkData.nodes.update(ids.map(id => ({{
-    id,
-    x: (Math.random() - 0.5) * spread,
-    y: (Math.random() - 0.5) * spread
-  }})));
-  network.setOptions({{ physics: {{ enabled: true }} }});
-  network.once('stabilizationIterationsDone', function() {{
-    network.fit({{ animation: {{ duration: 600 }} }});
+  const maxDegLocal = Math.max(...rawNodes.map(n => n.degree || 1), 1);
+  const spread = Math.max(1000, Math.sqrt(rawNodes.length) * 220);
+  networkData.nodes.update(rawNodes.map(n => {{
+    const hubish = (n.degree || 1) >= maxDegLocal * 0.45;
+    return {{
+      id: n.id,
+      x: (Math.random() - 0.5) * spread,
+      y: (Math.random() - 0.5) * spread,
+      fixed: false,
+      color: {{
+        background: hubish ? n.color : darkenColor(n.color, 0.08),
+        border: lightenColor(n.color, 0.2),
+        highlight: {{ background: lightenColor(n.color, 0.18), border: '#ffffff' }},
+        hover: {{ background: lightenColor(n.color, 0.12), border: lightenColor(n.color, 0.28) }}
+      }},
+      shadow: {{ enabled: hubish, color: n.color + '55', size: 10, x: 0, y: 0 }}
+    }};
+  }}));
+  if (SMALL_GRAPH) {{
+    network.setOptions({{
+      groups: {{ useDefaultGroups: false }},
+      layout: {{ improvedLayout: false }},
+      physics: {{ enabled: true, stabilization: {{ enabled: false }} }}
+    }});
+    try {{ network.startSimulation(); }} catch (e) {{}}
+    let finished = false;
+    const finish = () => {{
+      if (finished) return;
+      finished = true;
+      network.fit({{ animation: {{ duration: 600 }} }});
+    }};
+    network.once('stabilized', finish);
+    setTimeout(finish, 4500);
+    return;
+  }}
+  network.setOptions({{
+    groups: {{ useDefaultGroups: false }},
+    layout: {{ improvedLayout: false }},
+    physics: {{
+      enabled: true,
+      stabilization: {{ enabled: true, iterations: STAB_ITERS, updateInterval: 25, fit: false }}
+    }}
   }});
-  network.stabilize(220);
+  network.once('stabilizationIterationsDone', function() {{
+    stopPhysics();
+    fitView();
+  }});
+  network.stabilize(STAB_ITERS);
 }}
 
 function selectPattern(pattern) {{

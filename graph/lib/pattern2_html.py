@@ -238,7 +238,7 @@ def _render_template(payload: dict[str, Any]) -> str:
     position: absolute;
     top: 18px;
     left: 18px;
-    z-index: 4;
+    z-index: 20;
     width: min(320px, calc(100vw - 36px));
   }}
   .search-box {{
@@ -271,7 +271,7 @@ def _render_template(payload: dict[str, Any]) -> str:
     position: absolute;
     left: 18px;
     bottom: 18px;
-    z-index: 4;
+    z-index: 20;
     width: min(280px, calc(100vw - 36px));
     max-height: min(52vh, 420px);
     display: flex;
@@ -351,7 +351,7 @@ def _render_template(payload: dict[str, Any]) -> str:
     position: absolute;
     top: 18px;
     right: 18px;
-    z-index: 4;
+    z-index: 20;
     width: min(300px, calc(100vw - 36px));
     background: rgba(28, 33, 44, 0.96);
     border: 1px solid rgba(255,255,255,0.08);
@@ -395,11 +395,12 @@ def _render_template(payload: dict[str, Any]) -> str:
     position: absolute;
     right: 18px;
     bottom: 18px;
-    z-index: 4;
+    z-index: 20;
     display: flex;
     flex-direction: column;
     gap: 8px;
     align-items: flex-end;
+    pointer-events: auto;
   }}
   .controls-row {{
     display: flex;
@@ -465,9 +466,10 @@ def _render_template(payload: dict[str, Any]) -> str:
       <button type="button" class="ctrl-btn pattern-btn" data-pattern="pattern3" onclick="selectPattern('pattern3')" title="Holistic View">Holistic View</button>
     </div>
     <div class="controls-row">
-      <button class="ctrl-btn" onclick="network.fit({{ animation: {{ duration: 400 }} }})">전체 보기</button>
-      <button class="ctrl-btn" onclick="stabilize()">레이아웃 재정렬</button>
-      <button class="ctrl-btn" onclick="filterGroup(null)">필터 해제</button>
+      <button type="button" class="ctrl-btn" id="fit-view-btn">전체 보기</button>
+      <button type="button" class="ctrl-btn" onclick="stabilize()">레이아웃 재정렬</button>
+      <button type="button" class="ctrl-btn" id="legend-toggle-btn" onclick="toggleLegend()">범례 숨기기</button>
+      <button type="button" class="ctrl-btn" onclick="filterGroup(null)">필터 해제</button>
     </div>
   </div>
 </div>
@@ -479,6 +481,7 @@ const rawEdges = DATA.rawEdges;
 const nodeDescriptions = DATA.descriptions;
 const legend = DATA.legend;
 let activeGroup = null;
+let legendHidden = false;
 
 function lightenColor(hex, factor) {{
   const r = Math.min(255, Math.floor(parseInt(hex.slice(1,3), 16) + 255 * factor));
@@ -491,8 +494,77 @@ function hideDetail() {{
   document.getElementById('node-detail').style.display = 'none';
 }}
 
-function toggleLegend() {{
-  document.querySelector('.legend-panel').classList.toggle('is-hidden');
+function syncLegendToggleLabel() {{
+  const btn = document.getElementById('legend-toggle-btn');
+  if (btn) btn.textContent = legendHidden ? '범례 보이기' : '범례 숨기기';
+}}
+
+function toggleLegend(force) {{
+  const panel = document.querySelector('.legend-panel');
+  if (!panel) return;
+  legendHidden = typeof force === 'boolean' ? force : !legendHidden;
+  panel.classList.toggle('is-hidden', legendHidden);
+  syncLegendToggleLabel();
+}}
+
+const NODE_COUNT = rawNodes.length;
+// Always auto-stabilize on open; small graphs keep the classic visible settle.
+const SMALL_GRAPH = NODE_COUNT < 120;
+const STAB_ITERS = SMALL_GRAPH ? 260 : NODE_COUNT >= 200 ? 60 : 120;
+let network = null;
+
+function stopPhysics() {{
+  if (!network) return;
+  try {{ network.stopSimulation(); }} catch (e) {{}}
+  network.setOptions({{
+    physics: {{ enabled: false, stabilization: {{ enabled: false }} }}
+  }});
+}}
+
+function whenCanvasReady(fn) {{
+  let tries = 0;
+  const tick = () => {{
+    const el = document.getElementById('mynetwork');
+    const w = el ? el.clientWidth : 0;
+    const h = el ? el.clientHeight : 0;
+    if (w >= 60 && h >= 60) {{
+      fn();
+      return;
+    }}
+    if (tries++ < 80) {{
+      setTimeout(tick, 40);
+      return;
+    }}
+    fn();
+  }};
+  requestAnimationFrame(tick);
+}}
+
+function fitView() {{
+  stopPhysics();
+  whenCanvasReady(() => {{
+    try {{
+      network.redraw();
+      network.fit({{
+        animation: {{ duration: 350, easingFunction: 'easeInOutQuad' }},
+        padding: 48
+      }});
+      const scale = network.getScale();
+      if (!Number.isFinite(scale) || scale < 0.02) {{
+        network.moveTo({{ scale: 0.3, position: {{ x: 0, y: 0 }}, animation: false }});
+      }}
+    }} catch (e) {{}}
+  }});
+}}
+
+function seedLayout(nodes) {{
+  const spread = Math.max(480, Math.sqrt(nodes.length) * 80);
+  nodes.forEach((n, i) => {{
+    const angle = (2 * Math.PI * i) / Math.max(nodes.length, 1);
+    const ring = 0.35 + 0.65 * ((i % 9) / 9);
+    n.x = Math.cos(angle) * spread * ring;
+    n.y = Math.sin(angle) * spread * ring;
+  }});
 }}
 
 function markLegendActive(group) {{
@@ -564,6 +636,7 @@ const visEdges = rawEdges.map((e, i) => ({{
   smooth: {{ type: 'continuous', roundness: 0.45 }},
   title: e.label + (e.confidence ? ` [${{e.confidence}}]` : '')
 }}));
+seedLayout(visNodes);
 
 const container = document.getElementById('mynetwork');
 const networkData = {{
@@ -572,6 +645,7 @@ const networkData = {{
 }};
 
 const options = {{
+  groups: {{ useDefaultGroups: false }},
   nodes: {{
     shape: 'dot',
     scaling: {{ min: 4, max: 12 }}
@@ -582,7 +656,15 @@ const options = {{
   physics: {{
     enabled: true,
     solver: 'barnesHut',
-    barnesHut: {{
+    barnesHut: SMALL_GRAPH ? {{
+      // Softer so the first-open settle is visible (not instantaneous).
+      gravitationalConstant: -3200,
+      centralGravity: 0.05,
+      springLength: 120,
+      springConstant: 0.04,
+      damping: 0.4,
+      avoidOverlap: 0.35
+    }} : {{
       gravitationalConstant: -14000,
       centralGravity: 0.12,
       springLength: 85,
@@ -590,7 +672,13 @@ const options = {{
       damping: 0.45,
       avoidOverlap: 0.12
     }},
-    stabilization: {{ enabled: true, iterations: 260, updateInterval: 25 }}
+    // Small graphs: live physics so the first open shows settle motion.
+    stabilization: {{
+      enabled: !SMALL_GRAPH,
+      iterations: STAB_ITERS,
+      updateInterval: 25,
+      fit: false
+    }}
   }},
   interaction: {{
     hover: true,
@@ -600,11 +688,16 @@ const options = {{
     hideEdgesOnDrag: false,
     keyboard: {{ enabled: true, bindToWindow: false }}
   }},
-  layout: {{ improvedLayout: true }}
+  layout: {{ improvedLayout: false }}
 }};
 
-const network = new vis.Network(container, networkData, options);
+network = new vis.Network(container, networkData, options);
 container.setAttribute('tabindex', '0');
+document.getElementById('fit-view-btn').addEventListener('pointerdown', (ev) => {{
+  ev.preventDefault();
+  stopPhysics();
+  fitView();
+}}, true);
 
 network.on('click', function(params) {{
   if (params.nodes.length === 0) {{
@@ -634,13 +727,34 @@ network.on('click', function(params) {{
 network.on('hoverNode', () => {{ container.style.cursor = 'pointer'; }});
 network.on('blurNode', () => {{ container.style.cursor = 'default'; }});
 
-network.once('stabilizationIterationsDone', function() {{
+function finishInitialLayout() {{
   if (DATA.hub) {{
     network.focus(DATA.hub, {{ scale: 0.9, animation: {{ duration: 700 }} }});
   }} else {{
-    network.fit();
+    network.fit({{ animation: {{ duration: 500 }} }});
   }}
-}});
+}}
+
+if (SMALL_GRAPH) {{
+  try {{ network.startSimulation(); }} catch (e) {{}}
+  let opened = false;
+  const done = () => {{
+    if (opened) return;
+    opened = true;
+    finishInitialLayout();
+  }};
+  network.once('stabilized', done);
+  setTimeout(done, 4500);
+}} else {{
+  network.once('stabilizationIterationsDone', function() {{
+    stopPhysics();
+    if (DATA.hub) {{
+      network.focus(DATA.hub, {{ scale: 0.9, animation: {{ duration: 700 }} }});
+    }} else {{
+      whenCanvasReady(() => fitView());
+    }}
+  }});
+}}
 
 function filterGroup(group) {{
   activeGroup = group;
@@ -657,18 +771,50 @@ function filterGroup(group) {{
 }}
 
 function stabilize() {{
-  const ids = networkData.nodes.getIds();
-  const spread = Math.max(900, Math.sqrt(ids.length) * 200);
-  networkData.nodes.update(ids.map(id => ({{
-    id,
+  const spread = Math.max(900, Math.sqrt(rawNodes.length) * 200);
+  networkData.nodes.update(rawNodes.map(n => ({{
+    id: n.id,
     x: (Math.random() - 0.5) * spread,
-    y: (Math.random() - 0.5) * spread
+    y: (Math.random() - 0.5) * spread,
+    fixed: false,
+    color: {{
+      background: n.color,
+      border: n.color,
+      highlight: {{ background: lightenColor(n.color, 0.2), border: lightenColor(n.color, 0.2) }},
+      hover: {{ background: lightenColor(n.color, 0.12), border: lightenColor(n.color, 0.12) }}
+    }}
   }})));
-  network.setOptions({{ physics: {{ enabled: true }} }});
-  network.once('stabilizationIterationsDone', function() {{
-    network.fit({{ animation: {{ duration: 600 }} }});
+  if (SMALL_GRAPH) {{
+    // Live physics (like Holistic): batch stabilize/improvedLayout hides the motion.
+    network.setOptions({{
+      groups: {{ useDefaultGroups: false }},
+      layout: {{ improvedLayout: false }},
+      physics: {{ enabled: true, stabilization: {{ enabled: false }} }}
+    }});
+    try {{ network.startSimulation(); }} catch (e) {{}}
+    let finished = false;
+    const finish = () => {{
+      if (finished) return;
+      finished = true;
+      network.fit({{ animation: {{ duration: 600 }} }});
+    }};
+    network.once('stabilized', finish);
+    setTimeout(finish, 4500);
+    return;
+  }}
+  network.setOptions({{
+    groups: {{ useDefaultGroups: false }},
+    layout: {{ improvedLayout: false }},
+    physics: {{
+      enabled: true,
+      stabilization: {{ enabled: true, iterations: STAB_ITERS, updateInterval: 10, fit: false }}
+    }}
   }});
-  network.stabilize(260);
+  network.once('stabilizationIterationsDone', function() {{
+    stopPhysics();
+    fitView();
+  }});
+  network.stabilize(STAB_ITERS);
 }}
 
 function selectPattern(pattern) {{
