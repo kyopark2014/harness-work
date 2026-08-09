@@ -2849,7 +2849,7 @@ def _default_harness_tools(
         tools.append(
             {
                 "type": "agentcore_gateway",
-                "name": "knowledge_base",
+                "name": "project_gateway",
                 "config": {
                     "agentCoreGateway": {
                         "gatewayArn": agentcore_gateway_arn,
@@ -2861,11 +2861,16 @@ def _default_harness_tools(
     return tools
 
 
+# Legacy InvokeHarness tool name (KB-only era); renamed to project_gateway.
+_LEGACY_PROJECT_GATEWAY_TOOL_NAME = "knowledge_base"
+_PROJECT_GATEWAY_TOOL_NAME = "project_gateway"
+
+
 def ensure_harness_tools(
     harness_id: str,
     agentcore_gateway_arn: Optional[str] = None,
 ) -> None:
-    """Ensure Knowledge Base MCP Gateway (and defaults) are present on the harness."""
+    """Ensure project MCP Gateway (and defaults) are present on the harness."""
     desired = _default_harness_tools(agentcore_gateway_arn)
     h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
     current = h.get("tools") or []
@@ -2873,13 +2878,18 @@ def ensure_harness_tools(
         t.get("name"): t for t in current if isinstance(t, dict) and t.get("name")
     }
     changed = False
+    if (
+        _LEGACY_PROJECT_GATEWAY_TOOL_NAME in current_by_name
+        and _PROJECT_GATEWAY_TOOL_NAME not in current_by_name
+    ):
+        changed = True
     for tool in desired:
         name = tool.get("name")
         existing = current_by_name.get(name)
         if not existing:
             changed = True
             break
-        if name == "knowledge_base":
+        if name == _PROJECT_GATEWAY_TOOL_NAME:
             cur_arn = (
                 ((existing.get("config") or {}).get("agentCoreGateway") or {}).get(
                     "gatewayArn"
@@ -2904,6 +2914,7 @@ def ensure_harness_tools(
         f"(agentcore gateway={'set' if agentcore_gateway_arn else 'none'})"
     )
     merged_by_name = dict(current_by_name)
+    merged_by_name.pop(_LEGACY_PROJECT_GATEWAY_TOOL_NAME, None)
     for tool in desired:
         merged_by_name[tool["name"]] = tool
     update_harness_safe(

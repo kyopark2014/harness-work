@@ -535,7 +535,28 @@ pip3 install openpyxl
 
 ### 카탈로그 (`application/mcp_config.py`)
 
-UI 라벨 → Harness `tools` 항목:
+#### AgentCore Harness 공식 tool type
+
+AWS 문서([Tools](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-tools.html)) 기준, Harness `tools`는 선언형이며 지원 type은 아래 5개입니다 (+ 세션 기본 builtin `shell` / `file_operations`). `CreateHarness` · `UpdateHarness` · `InvokeHarness` 모두에 `tools`를 넘길 수 있습니다.
+
+| `type` | 역할 | config |
+|--------|------|--------|
+| `remote_mcp` | URL로 원격 MCP 직접 연결 (Gateway 불필요) | `remoteMcp.url`, optional `headers` (Token Vault `${arn:...}` 가능) |
+| `agentcore_gateway` | Gateway ARN 참조 → Gateway target/tool 전부 노출 | `agentCoreGateway.gatewayArn`, optional `outboundAuth` (`awsIam` / `oauth` / none) |
+| `agentcore_browser` | 관리형 브라우저 자동화 | `agentCoreBrowser` (빈 객체 가능) |
+| `agentcore_code_interpreter` | 샌드박스 Python/JS/TS 실행 | `agentCoreCodeInterpreter` |
+| `inline_function` | **클라이언트 측** 실행 (HITL 등). 이 프로젝트 카탈로그에는 미사용 | `inlineFunction.description` + `inputSchema` |
+
+문서 가이드 요약:
+
+- **`remote_mcp`**: 이미 보안된 MCP·Gateway 거버넌스가 불필요할 때. URL(+ headers)만 받으며 **AWS SigV4 서명은 하지 않음**.
+- **`agentcore_gateway`**: inbound/outbound auth·정책·credential brokering이 필요할 때. IAM outbound 예시는 `outboundAuth: { "awsIam": {} }`.
+- OAuth·자격증명 회전이 필요하면 raw header `remote_mcp`보다 **Gateway + AgentCore Identity**를 권장.
+- first-party `agentcore_web_search`는 예정; 지금은 Gateway에 Web Search connector를 붙인 뒤 `agentcore_gateway`로 연결.
+- `allowedTools`로 `@server` / `@server/tool` 형태로 MCP tool 범위를 좁힐 수 있음.
+- `name`은 Harness tool 식별자이며 AWS Gateway 리소스 이름과 무관. Gateway 하나면 tool entry도 하나면 됨.
+
+#### UI 라벨 → Harness `tools`
 
 ```python
 HARNESS_MCP_CATALOG = {
@@ -552,15 +573,15 @@ HARNESS_MCP_CATALOG = {
         },
     },
     "knowledge base": {
-        # 같은 프로젝트 Gateway ARN (runtime에 config.json에서 채움)
+        # 실제 Invoke 시에는 _project_mcp_gateway_tool()이 ARN·outboundAuth 채움
         "type": "agentcore_gateway",
-        "name": "knowledge_base",
+        "name": "project_gateway",
         "config": {"agentCoreGateway": {"gatewayArn": ""}},
     },
     "artifact-share": {
         # knowledge base와 동일 Gateway (artifact-share Runtime target)
         "type": "agentcore_gateway",
-        "name": "knowledge_base",
+        "name": "project_gateway",
         "config": {"agentCoreGateway": {"gatewayArn": ""}},
     },
     "browser-use": {
@@ -576,20 +597,28 @@ HARNESS_MCP_CATALOG = {
 }
 ```
 
+| UI 라벨 | `type` | 비고 |
+|---------|--------|------|
+| `websearch` | `remote_mcp` | Exa 공개 MCP URL |
+| `aws_documentation` | `remote_mcp` | AWS Knowledge MCP URL |
+| `knowledge base` / `artifact-share` | `agentcore_gateway` | 라벨만 다르고 **동일** `project_gateway` (ARN은 `config.json`의 `agentcore_gateway_arn`) |
+| `browser-use` | `agentcore_browser` | |
+| `code interpreter` | `agentcore_code_interpreter` | |
+
 `build_harness_tools(selected_labels)`가 위 카탈로그를 합쳐 `tools` 배열을 만듭니다.
-`knowledge base`와 `artifact-share`는 **하나의 프로젝트 IAM Gateway**에 연결됩니다 (라벨만 다르고 Gateway ARN은 공유).
+`knowledge base`와 `artifact-share`는 `_GATEWAY_MCP_LABELS`로 묶여 **하나의 프로젝트 IAM Gateway**(`_project_mcp_gateway_tool`)에만 연결됩니다.
 
 **기본 MCP**: `knowledge base` · `artifact-share`는 `BASE_MCP_SERVERS`로 UI 기본 선택·`favorite_tools.json`·매 호출의 `tools`에 **항상** 포함됩니다 (`share_artifact` / `retrieve`가 system prompt에 필수).
 
 ### CreateHarness 기본 tools vs Invoke 시 override
 
-`installer`가 Harness를 만들 때 기본 tools(exa, aws_knowledge, browser, code, knowledge_base Gateway)를 넣습니다. UI에서 고른 목록은 **호출마다** `InvokeHarness(tools=…)`로 override되지만, Gateway MCP(`knowledge base` / `artifact-share`)는 항상 병합됩니다.
+`installer`가 Harness를 만들 때 기본 tools(exa, aws_knowledge, browser, code, `project_gateway`)를 넣습니다. UI에서 고른 목록은 **호출마다** `InvokeHarness(tools=…)`로 override되지만, Gateway MCP(`knowledge base` / `artifact-share`)는 항상 병합됩니다.
 
 ### Knowledge Base + Artifact Share MCP: Runtime + Gateway (IAM)
 
 `MCP/knowledge-base/`와 `MCP/artifact-share/`를 각각 **AgentCore Runtime(MCP protocol, IAM 인증)** 으로 배포합니다. Harness가 Runtime을 **직접 `remote_mcp`로 연결할 수 없어** 프로젝트 공용 **AgentCore Gateway**(`name={projectName}`, 예: `harness-work`)를 두고, 두 Runtime을 Gateway **target**으로 붙인 뒤 Harness에는 `agentcore_gateway` 도구로 연결합니다.
 
-#### 왜 Gateway가 필요한가
+### AgentCore Gateway를 사용하는 이유
 
 1. AgentCore Runtime MCP 엔드포인트는 기본이 **IAM SigV4**입니다.
 2. Harness 도구 타입 `remote_mcp`는 URL(+ optional headers)만 받으며 **AWS SigV4 서명을 하지 않습니다**.
@@ -608,6 +637,26 @@ Harness execution role
 | Harness → Gateway | SigV4 (`InvokeGateway`) | Harness execution role + `outboundAuth.awsIam` |
 | Gateway → Runtime MCP | SigV4 (`InvokeAgentRuntime`) | Gateway service role + target `GATEWAY_IAM_ROLE` |
 | Runtime → Bedrock KB / S3 | Runtime task role | Retrieve / PutObject 등 |
+
+막히는 지점은 “인증이 IAM이냐”가 아니라 **직접 Runtime URL로 갈 때 쓸 수 있는 도구 타입**입니다.
+
+| 도구 타입 | 하는 일 | SigV4 |
+|-----------|---------|-------|
+| `remote_mcp` | URL(+ optional headers)로 일반 HTTP MCP | **없음** |
+| `agentcore_gateway` | Gateway ARN + `outboundAuth.awsIam`로 `InvokeGateway` | **있음** |
+
+1. AgentCore Runtime MCP 엔드포인트는 기본이 **IAM SigV4**입니다.
+2. Harness 도구 타입 `remote_mcp`는 URL(+ optional headers)만 받으며 **AWS SigV4 서명을 하지 않습니다**.
+3. Runtime MCP URL을 `remote_mcp`로 등록하면 MCP 초기화에서 **HTTP 403 Forbidden**이 납니다. 실행 롤에 `InvokeAgentRuntime`이 있어도, **클라이언트가 서명을 안 하면** 권한이 있어도 통과하지 못합니다.
+
+Gateway는 SigV4 **중계기**입니다.
+
+1. **Harness → Gateway**: `agentcore_gateway`가 플랫폼에서 SigV4를 지원 → 연결 가능
+2. **Gateway → Runtime**: Gateway가 `GATEWAY_IAM_ROLE`로 Runtime에 다시 SigV4 → Runtime도 만족
+
+즉 Agent↔Gateway와 Gateway↔Runtime이 둘 다 SigV4인 건 맞고, **Harness에는 Gateway용 SigV4 클라이언트가 있고, Runtime MCP URL용(`remote_mcp`)에는 없다**는 게 차이입니다. Gateway를 끼운 이유는 인증 방식이 달라서가 아니라, Harness가 Runtime MCP를 SigV4로 부를 first-class 도구가 없기 때문입니다.
+
+관련: `application/mcp_config.py` (`_project_mcp_gateway_tool`), `installer.py` (`ensure_project_agentcore_gateway`).
 
 #### installer가 만드는 리소스
 
@@ -628,6 +677,8 @@ Harness execution role
 
 ## UI → InvokeHarness 데이터 흐름
 
+Web UI의 sidebar에서 SKILL/MCP와 모델을 선택하고 아래와 같이 run_harness()를 실행합니다. 
+
 ```text
 React Sidebar (Skill · MCP · 모델 선택)
 React ChatInput (+ 이미지 첨부 → files: CDN URL[])
@@ -639,6 +690,12 @@ React ChatInput (+ 이미지 첨부 → files: CDN URL[])
          files=[...],                 # optional image CDN URLs
      )
 ```
+
+Skill에 대한 정보는 build_harness_skills()를 이용해 가져옵니다. 이때 Amazon S3에 올려놓은 preload된 skill, skill-creater로 생성되어 user 영역에 있는 skill과 필요하다면 github을 통해 필요한 skill 정보를 가져옵니다. 
+
+MCP tool에 대한 정보는 build_harness_tools()을 이용해 type으로 remote_mcp, agentcore_gateway, agentcore_browser, agentcore_code_interpreter을 지정합니다.
+
+Model에 따라 bedrock과 mantle api를 harness_model_config()로 선택합니다. 이후 invoke_harness를 이용해 harness agent로 요청을 전달합니다.
 
 ```python
 # agentcore_client.run_harness (요약)
@@ -686,7 +743,7 @@ response = client.invoke_harness(**invoke_kwargs)
 | **한도** | `maxIterations=20`, `maxTokens=50000`, `timeoutSeconds=300` |
 | **네트워크** | `VPC` + private subnet + NAT |
 | **파일시스템** | S3 Files → `/mnt/workspace` |
-| **기본 tools** | exa, aws_knowledge, browser, code, **knowledge_base Gateway** (`knowledge base` + `artifact-share` 항상 포함) |
+| **기본 tools** | exa, aws_knowledge, browser, code, **project_gateway** (`knowledge base` + `artifact-share` 항상 포함) |
 | **Skills** | CreateHarness 시 미설정 → Invoke 시 UI 선택으로 주입 |
 | **KB / Artifact MCP** | Runtime + 프로젝트 Gateway targets → `agentcore_gateway` |
 

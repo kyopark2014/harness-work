@@ -57,7 +57,7 @@ def _project_mcp_gateway_tool() -> dict | None:
         return None
     return {
         "type": "agentcore_gateway",
-        "name": "knowledge_base",
+        "name": "project_gateway",
         "config": {
             "agentCoreGateway": {
                 "gatewayArn": gateway_arn,
@@ -84,13 +84,13 @@ HARNESS_MCP_CATALOG: dict[str, dict] = {
     "knowledge base": {
         # gatewayArn filled at runtime from application/config.json
         "type": "agentcore_gateway",
-        "name": "knowledge_base",
+        "name": "project_gateway",
         "config": {"agentCoreGateway": {"gatewayArn": ""}},
     },
     "artifact-share": {
         # Same project Gateway as knowledge base (artifact-share Runtime target).
         "type": "agentcore_gateway",
-        "name": "knowledge_base",
+        "name": "project_gateway",
         "config": {"agentCoreGateway": {"gatewayArn": ""}},
     },
     "browser-use": {
