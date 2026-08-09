@@ -40,12 +40,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return data;
 }
 
+export type GraphPattern = "pattern1" | "pattern2" | "pattern3";
+
 export interface SessionInfo {
   user_id: string;
   name?: string | null;
   picture?: string | null;
   llm_gateway_ready?: boolean;
   knowledge_graph_enabled?: boolean;
+  graph_pattern?: GraphPattern | string;
 }
 
 export interface GraphStatus {
@@ -92,7 +95,10 @@ export const api = {
       body: JSON.stringify({ username, password }),
     }),
   clearSession: () => request<void>("/api/session", { method: "DELETE" }),
-  patchSessionSettings: (body: { knowledge_graph_enabled?: boolean }) =>
+  patchSessionSettings: (body: {
+    knowledge_graph_enabled?: boolean;
+    graph_pattern?: GraphPattern | string;
+  }) =>
     request<SessionInfo>("/api/session/settings", {
       method: "PATCH",
       body: JSON.stringify(body),

@@ -61,6 +61,7 @@ class SessionResponse(BaseModel):
 
 class SessionSettingsPatch(BaseModel):
     knowledge_graph_enabled: bool | None = None
+    graph_pattern: str | None = None
 
 
 def _cognito_settings() -> tuple[str, str, str]:
@@ -180,6 +181,9 @@ def _session_response(user_id: str) -> SessionResponse:
         knowledge_graph_enabled=bool(
             settings.get("knowledge_graph_enabled", True)
         ),
+        graph_pattern=utils.normalize_graph_pattern(
+            settings.get("graph_pattern", utils.DEFAULT_GRAPH_PATTERN)
+        ),
     )
 
 
@@ -229,13 +233,28 @@ def patch_session_settings(
 ) -> SessionResponse:
     """Update per-user feature settings (e.g. Knowledge Graph toggle)."""
     user_id = require_user_id(request)
-    updates: dict[str, bool] = {}
+    updates: dict[str, object] = {}
     if body.knowledge_graph_enabled is not None:
         updates["knowledge_graph_enabled"] = body.knowledge_graph_enabled
+    if body.graph_pattern is not None:
+        updates["graph_pattern"] = utils.normalize_graph_pattern(body.graph_pattern)
+    prev_pattern = utils.get_graph_pattern(user_id)
     if updates:
         utils.save_user_settings(user_id, **updates)
     if updates.get("knowledge_graph_enabled") is True:
         _kick_graph_job(user_id)
+    new_pattern = updates.get("graph_pattern")
+    if (
+        isinstance(new_pattern, str)
+        and new_pattern != prev_pattern
+        and utils.is_knowledge_graph_enabled(user_id)
+    ):
+        try:
+            from application.graph_jobs import republish_graph_html
+
+            republish_graph_html(user_id, pattern=new_pattern)
+        except Exception:
+            logger.exception("Failed to republish graph HTML for %s", user_id)
     return _session_response(user_id)
 
 

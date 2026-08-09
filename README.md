@@ -800,10 +800,30 @@ flowchart LR
 
 ## Knowledge Graph
 
-채팅 이력을 Graphify 스타일 지식 그래프로 만듭니다. 상세는 [`graph/README.md`](./graph/README.md)를 참고하세요.
+대화·코퍼스에서 엔티티·관계를 추출해 사용자별 지식 그래프를 만들고, Web UI의 Knowledge Graph 모달에서 탐색합니다. 파이프라인·용어 상세는 [graph/README.md](./graph/README.md)를 참고하세요.
+
+### Graph Extraction
+
+추출 결과(`graph.json`)는 HTML로 렌더되며, 그래프 화면 컨트롤에서 **시각화 패턴**을 고를 수 있습니다. 선택값은 사용자 `settings.json`의 `graph_pattern`에 저장되고, 재추출 없이 HTML만 다시 생성합니다.
+
+| 패턴 | 메뉴 이름 | 파일 | 특징 |
+|------|-----------|------|------|
+| **pattern1** | Force Atlas | [pattern1_html.py](./graph/lib/pattern1_html.py) | `forceAtlas2Based` 레이아웃. 커뮤니티 색의 큰 노드·그림자, **컬러 곡선 엣지·화살표·관계 라벨**. 허브 중심 탐색에 적합. |
+| **pattern2** | Neo4j Explore | [pattern2_html.py](./graph/lib/pattern2_html.py) | 어두운 캔버스, **작은 점 노드**, 얇은 회색 **곡선 엣지**, 허브만 라벨. Neo4j Explore/Bloom에 가까운 overview. |
+| **pattern3** | Holistic View | [pattern3_html.py](./graph/lib/pattern3_html.py) | **어두운 배경**의 전체-fit overview. ellipse 노드에 라벨을 많이 표시하고, 회색 방향 엣지에 **관계명**을 항상 표시. |
+
+공통 UI: 좌상단 검색(`Search entities...`), 좌하단 그룹 범례·`Browse all`(빈 캔버스 클릭으로 범례 토글), 우하단 패턴 전환·전체 보기·레이아웃 재정렬.
+
+구현 디스패치: [patterns.py](./graph/lib/patterns.py) (`pattern1` \| `pattern2` \| `pattern3`).
+
 
 | 항목 | 내용 |
 |------|------|
+| 트리거 | 로그인 / 세션 복원 / 채팅 완료 / Settings에서 KG ON |
+| UI | 사이드바 브랜드 클릭 → `GET /api/graph` iframe |
+| 파이프라인 | `tasks.db` → corpus → LLM 추출 → `graph.html` |
+| CLI | `cd graph && python run_pipeline.py --user <id>` |
+|------|
 | 트리거 | 로그인 / 세션 복원 / 채팅 완료 / Settings에서 KG ON |
 | UI | 사이드바 브랜드 클릭 → `GET /api/graph` iframe |
 | 파이프라인 | `tasks.db` → corpus → LLM 추출 → `graph.html` |
