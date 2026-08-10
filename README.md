@@ -872,7 +872,7 @@ flowchart LR
 | **pattern2** | Neo4j Explore | [pattern2_html.py](./graph/lib/pattern2_html.py) | 어두운 캔버스, **작은 점 노드**, 얇은 회색 **곡선 엣지**, 허브만 라벨. Neo4j Explore/Bloom에 가까운 overview. |
 | **pattern3** | Holistic View | [pattern3_html.py](./graph/lib/pattern3_html.py) | **어두운 배경**의 전체-fit overview. ellipse 노드에 라벨을 많이 표시하고, 회색 방향 엣지에 **관계명**을 항상 표시. |
 
-공통 UI: 좌상단 검색(`Search entities...`), 좌하단 그룹 범례·`Browse all`(빈 캔버스 클릭으로 범례 토글), 우하단 패턴 전환·전체 보기·레이아웃 재정렬.
+공통 UI: 좌상단 **문서검색**(Enter로 쿼리, 검색창·결과가 하나의 카드), 좌하단 그룹 범례·`Browse all`(빈 캔버스 클릭으로 범례 토글), 우하단 패턴 전환·전체 보기·레이아웃 재정렬.
 
 구현 디스패치: [patterns.py](./graph/lib/patterns.py) (`pattern1` \| `pattern2` \| `pattern3`).
 

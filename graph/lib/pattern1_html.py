@@ -249,7 +249,7 @@ def _render_template(payload: dict[str, Any]) -> str:
     top: 18px;
     left: 18px;
     z-index: 20;
-    width: min(320px, calc(100vw - 36px));
+    width: min(315px, calc(100vw - 36px));
   }}
   .search-box {{
     display: flex;
@@ -455,8 +455,10 @@ def _render_template(payload: dict[str, Any]) -> str:
         <circle cx="11" cy="11" r="7"/>
         <path d="m20 20-3.5-3.5"/>
       </svg>
-      <input id="search" type="search" placeholder="Search entities..." autocomplete="off">
+      <input id="search" type="search" placeholder="Search entities..." autocomplete="off" data-doc-search="1">
+      <button type="button" class="ask-close" aria-label="닫기" onclick="closeAskPanel()">×</button>
     </div>
+<<<ASK_PANEL_HTML>>>
   </div>
 
   <div id="node-detail">
@@ -487,10 +489,8 @@ def _render_template(payload: dict[str, Any]) -> str:
       <button type="button" class="ctrl-btn" onclick="stabilize()">레이아웃 재정렬</button>
       <button type="button" class="ctrl-btn" id="legend-toggle-btn" onclick="toggleLegend()">범례 숨기기</button>
       <button type="button" class="ctrl-btn" onclick="filterGroup(null)">필터 해제</button>
-      <button type="button" class="ctrl-btn ask-btn" onclick="toggleAskPanel()" title="문서검색">문서검색</button>
     </div>
   </div>
-<<<ASK_PANEL_HTML>>>
 </div>
 
 <script>
@@ -833,24 +833,6 @@ function selectPattern(pattern) {{
   }}, 15000);
 }}
 
-document.getElementById('search').addEventListener('input', (ev) => {{
-  const q = (ev.target.value || '').trim().toLowerCase();
-  if (!q) {{
-    networkData.nodes.update(rawNodes.map(n => ({{
-      id: n.id,
-      hidden: false,
-      opacity: (!activeGroup || n.group === activeGroup) ? 1 : 0.12
-    }})));
-    return;
-  }}
-  const hits = [];
-  networkData.nodes.update(rawNodes.map(n => {{
-    const hit = (n.label || '').toLowerCase().includes(q) || String(n.id).toLowerCase().includes(q);
-    if (hit) hits.push(n.id);
-    return {{ id: n.id, hidden: !hit, opacity: 1 }};
-  }}));
-  if (hits.length === 1) network.focus(hits[0], {{ scale: 1.1, animation: true }});
-}});
 <<<ASK_PANEL_JS>>>
 </script>
 </body>
