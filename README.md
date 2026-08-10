@@ -863,6 +863,9 @@ flowchart LR
 
 추출 결과(`graph.json`)는 HTML로 렌더되며, 그래프 화면 컨트롤에서 **시각화 패턴**을 고를 수 있습니다. 선택값은 사용자 `settings.json`의 `graph_pattern`에 저장되고, 재추출 없이 HTML만 다시 생성합니다.
 
+**하이브리드 문서검색:** `application/config.json`의 `hybrid_graph_search`가 `"enable"`이면 Titan 임베딩 vector search로 시작 노드를 보강합니다(`graph/lib/embeddings.py`, `out/node_embeddings.json`). 그 외 값이면 lexical(label/본문)만 사용합니다.
+
+
 | 패턴 | 메뉴 이름 | 파일 | 특징 |
 |------|-----------|------|------|
 | **pattern1** | Force Atlas | [pattern1_html.py](./graph/lib/pattern1_html.py) | `forceAtlas2Based` 레이아웃. 커뮤니티 색의 큰 노드·그림자, **컬러 곡선 엣지·화살표·관계 라벨**. 허브 중심 탐색에 적합. |
