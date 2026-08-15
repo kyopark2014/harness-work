@@ -602,8 +602,101 @@ const PHYSICS_BASE = {{
   }}
 }};
 
+const PHYSICS_SETTLE = SPARSE_GRAPH ? {{
+  // Force Atlas barely moves on wiki-scale isolate-heavy graphs; use Barnes-Hut
+  // for opening settle + user relayout so fit/재정렬 are visibly effective.
+  enabled: true,
+  solver: 'barnesHut',
+  barnesHut: {{
+    gravitationalConstant: -12000,
+    centralGravity: 0.18,
+    springLength: 95,
+    springConstant: 0.05,
+    damping: 0.42,
+    avoidOverlap: 0.45
+  }},
+  stabilization: {{
+    enabled: false,
+    iterations: STAB_ITERS,
+    updateInterval: 25,
+    fit: false
+  }}
+}} : null;
+
+function physicsForLiveSettle() {{
+  // User rearrange / opening settle: always prefer Barnes-Hut on sparse graphs.
+  // Force Atlas (pattern1/3) looks "dead" on wiki isolate-heavy graphs even after
+  // setOptions — Neo4j worked because it was barnesHut from the start.
+  if (PHYSICS_SETTLE) return Object.assign({{}}, PHYSICS_SETTLE);
+  if (PHYSICS_BASE && PHYSICS_BASE.solver === 'barnesHut') {{
+    return Object.assign({{}}, PHYSICS_BASE, {{
+      enabled: true,
+      stabilization: Object.assign({{}}, PHYSICS_BASE.stabilization || {{}}, {{ enabled: false }})
+    }});
+  }}
+  // Non-sparse Force Atlas / Holistic: still use a barnesHut rearrange profile
+  // so 전체보기/재정렬 remain visibly effective.
+  return {{
+    enabled: true,
+    solver: 'barnesHut',
+    barnesHut: {{
+      gravitationalConstant: -8000,
+      centralGravity: 0.12,
+      springLength: 110,
+      springConstant: 0.04,
+      damping: 0.4,
+      avoidOverlap: 0.35
+    }},
+    stabilization: {{
+      enabled: false,
+      iterations: STAB_ITERS,
+      updateInterval: 25,
+      fit: false
+    }}
+  }};
+}}
+
+
+
+function safeVisLabel(s) {{
+  // vis-network LabelSplitter builds RegExp from label tokens. Unescaped
+  // "(" in labels like "(INVERTER & SYSTEM MENUS)" throws
+  // "Invalid regular expression: Unterminated group" and breaks layout.
+  return String(s == null ? '' : s)
+    .split('\\n').join(' ')
+    .split('(').join('\\uFF08')
+    .split(')').join('\\uFF09')
+    .split('[').join('\\uFF3B')
+    .split(']').join('\\uFF3D');
+}}
+
+function graphDbg(tag, extra) {{
+  try {{
+    const el = document.getElementById('mynetwork');
+    const payload = Object.assign({{
+      tag,
+      t: Date.now(),
+      hasNetwork: !!network,
+      settleGen,
+      settleTimer: !!settleTimer,
+      nodeCount: typeof rawNodes !== 'undefined' ? rawNodes.length : null,
+      isolateCount: typeof isolateCount !== 'undefined' ? isolateCount : null,
+      sparse: typeof SPARSE_GRAPH !== 'undefined' ? SPARSE_GRAPH : null,
+      canvas: el ? {{ w: el.clientWidth, h: el.clientHeight }} : null,
+      scale: (network && network.getScale) ? network.getScale() : null
+    }}, extra || {{}});
+    console.log('[graph-ctrl]', payload);
+  }} catch (err) {{
+    console.warn('[graph-ctrl] log failed', tag, err);
+  }}
+}}
+
+
+
+
 
 function stopPhysics() {{
+  graphDbg('stopPhysics');
   if (!network) return;
   try {{ network.stopSimulation(); }} catch (e) {{}}
   network.setOptions({{
@@ -631,24 +724,37 @@ function whenCanvasReady(fn) {{
 }}
 
 function fitView() {{
-  if (!network) return;
+  graphDbg('fitView:click');
+  if (!network) {{
+    graphDbg('fitView:abort', {{ reason: 'no-network' }});
+    return;
+  }}
   cancelSettle();
   stopPhysics();
-  const doFit = () => {{
+  const doFit = (phase) => {{
     try {{
+      const before = network.getScale();
       network.redraw();
-      network.fit({{
-        animation: {{ duration: 350, easingFunction: 'easeInOutQuad' }},
-        padding: 48
-      }});
-      const scale = network.getScale();
-      if (!Number.isFinite(scale) || scale < 0.05) {{
-        network.moveTo({{ scale: 0.35, position: {{ x: 0, y: 0 }}, animation: false }});
+      // Prefer a hard fit first — animated fit is a no-op when the camera
+      // already matches a huge isolate cloud (common on wiki graphs).
+      network.fit({{ animation: false, padding: 56 }});
+      let scale = network.getScale();
+      if (!Number.isFinite(scale) || scale < 0.04 || scale > 8) {{
+        network.moveTo({{ scale: 0.45, position: {{ x: 0, y: 0 }}, animation: false }});
+        scale = network.getScale();
       }}
-    }} catch (e) {{}}
+      network.fit({{
+        animation: {{ duration: 400, easingFunction: 'easeInOutQuad' }},
+        padding: 56
+      }});
+      graphDbg('fitView:done', {{ phase: phase || 'direct', before, after: network.getScale() }});
+    }} catch (e) {{
+      graphDbg('fitView:error', {{ phase: phase || 'direct', error: String(e) }});
+      console.error('[graph-ctrl] fitView error', e);
+    }}
   }};
-  doFit();
-  whenCanvasReady(doFit);
+  doFit('immediate');
+  whenCanvasReady(() => doFit('whenCanvasReady'));
 }}
 
 function seedLayout(nodes) {{
@@ -687,7 +793,7 @@ const visNodes = rawNodes.map(n => {{
   const short = name.length > 34 ? name.slice(0, 33) + '…' : name;
   return {{
     id: n.id,
-    label: showLabel ? short : '',
+    label: showLabel ? safeVisLabel(short) : '',
     group: n.group,
     size: 4.2 + 2.8 * ((n.degree || 1) / maxDeg),
     color: {{
@@ -747,33 +853,8 @@ const options = {{
   edges: {{
     smooth: {{ type: 'continuous', roundness: 0.45 }}
   }},
-  physics: {{
-    enabled: true,
-    solver: 'barnesHut',
-    barnesHut: SMALL_GRAPH ? {{
-      // Softer so the first-open settle is visible (not instantaneous).
-      gravitationalConstant: -3200,
-      centralGravity: 0.05,
-      springLength: 120,
-      springConstant: 0.04,
-      damping: 0.4,
-      avoidOverlap: 0.35
-    }} : {{
-      gravitationalConstant: -14000,
-      centralGravity: 0.12,
-      springLength: 85,
-      springConstant: 0.03,
-      damping: 0.45,
-      avoidOverlap: 0.12
-    }},
-    // Live settle for all sizes — short batch stabilize freezes circular layouts.
-    stabilization: {{
-      enabled: false,
-      iterations: STAB_ITERS,
-      updateInterval: 25,
-      fit: false
-    }}
-  }},
+  // Prefer sparse settle solver when present; else Neo4j barnesHut base.
+  physics: (PHYSICS_SETTLE || PHYSICS_BASE),
   interaction: {{
     hover: true,
     tooltipDelay: 100,
@@ -788,6 +869,7 @@ const options = {{
 network = new vis.Network(container, networkData, options);
 container.setAttribute('tabindex', '0');
 document.getElementById('fit-view-btn').addEventListener('click', (ev) => {{
+  graphDbg('fit-view-btn:listener');
   ev.preventDefault();
   fitView();
 }});
@@ -829,32 +911,46 @@ function finishInitialLayout() {{
 }}
 
 function cancelSettle() {{
+  const prev = settleGen;
   settleGen += 1;
   if (settleTimer) {{
     clearTimeout(settleTimer);
     settleTimer = null;
   }}
+  graphDbg('cancelSettle', {{ prevGen: prev, nextGen: settleGen }});
 }}
 
 function beginLiveSettle(onDone) {{
-  if (!network) return;
+  if (!network) {{
+    graphDbg('beginLiveSettle:abort', {{ reason: 'no-network' }});
+    return;
+  }}
   cancelSettle();
   const gen = settleGen;
-  // Always re-apply full solver options. Partial physics setOptions can leave
-  // forceAtlas2Based in a dead state on sparse graphs (wiki).
+  const phys = physicsForLiveSettle();
+  graphDbg('beginLiveSettle:start', {{
+    gen,
+    ms: LIVE_SETTLE_MS,
+    solver: phys && phys.solver,
+    sparseSettle: !!PHYSICS_SETTLE
+  }});
   network.setOptions({{
     groups: {{ useDefaultGroups: false }},
     layout: {{ improvedLayout: false }},
-    physics: Object.assign({{}}, PHYSICS_BASE, {{
-      enabled: true,
-      stabilization: Object.assign({{}}, PHYSICS_BASE.stabilization || {{}}, {{ enabled: false }})
-    }})
+    physics: phys
   }});
-  try {{ network.startSimulation(); }} catch (e) {{}}
+  try {{ network.startSimulation(); }} catch (e) {{
+    graphDbg('beginLiveSettle:startSimulation-error', {{ error: String(e) }});
+    console.error('[graph-ctrl] startSimulation', e);
+  }}
   // Time-box only — do not use 'stabilized' (fires too early on sparse graphs).
   settleTimer = setTimeout(() => {{
-    if (gen !== settleGen) return;
+    if (gen !== settleGen) {{
+      graphDbg('beginLiveSettle:skip-stale', {{ gen, settleGen }});
+      return;
+    }}
     settleTimer = null;
+    graphDbg('beginLiveSettle:timeout-done', {{ gen }});
     stopPhysics();
     if (typeof onDone === 'function') onDone();
   }}, LIVE_SETTLE_MS);
@@ -885,24 +981,31 @@ function filterGroup(group) {{
 }}
 
 function stabilize() {{
-  if (!network || typeof networkData === 'undefined') return;
+  graphDbg('stabilize:click');
+  if (!network || typeof networkData === 'undefined') {{
+    graphDbg('stabilize:abort', {{ reason: !network ? 'no-network' : 'no-networkData' }});
+    return;
+  }}
   const spread = Math.max(900, Math.sqrt(rawNodes.length) * 200);
+  const beforeScale = network.getScale();
   networkData.nodes.update(rawNodes.map(n => ({{
     id: n.id,
     x: (Math.random() - 0.5) * spread,
     y: (Math.random() - 0.5) * spread,
-    fixed: false,
-    color: {{
-      background: n.color,
-      border: n.color,
-      highlight: {{ background: lightenColor(n.color, 0.2), border: lightenColor(n.color, 0.2) }},
-      hover: {{ background: lightenColor(n.color, 0.12), border: lightenColor(n.color, 0.12) }}
-    }}
+    fixed: false
   }})));
   applyNodeVisibility();
+  graphDbg('stabilize:reseeded', {{ spread, beforeScale }});
   runBatchStabilize(() => {{
     whenCanvasReady(() => {{
-      try {{ network.fit({{ animation: {{ duration: 600 }} }}); }} catch (e) {{}}
+      try {{
+        network.fit({{ animation: false, padding: 56 }});
+        network.fit({{ animation: {{ duration: 500 }} }});
+        graphDbg('stabilize:fit-done', {{ afterScale: network.getScale() }});
+      }} catch (e) {{
+        graphDbg('stabilize:fit-error', {{ error: String(e) }});
+        console.error('[graph-ctrl] stabilize fit', e);
+      }}
     }});
   }});
 }}
@@ -923,6 +1026,11 @@ function selectPattern(pattern) {{
 }}
 
 syncIsolateToggleLabel();
+graphDbg('boot', {{
+  pattern: document.querySelector('.pattern-btn.active')?.dataset?.pattern || null,
+  liveMs: typeof LIVE_SETTLE_MS !== 'undefined' ? LIVE_SETTLE_MS : null,
+  settleSolver: PHYSICS_SETTLE ? PHYSICS_SETTLE.solver : (PHYSICS_BASE && PHYSICS_BASE.solver)
+}});
 
 <<<ASK_PANEL_JS>>>
 </script>
