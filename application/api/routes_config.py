@@ -63,7 +63,8 @@ def get_config(request: Request):
     user_id = get_optional_user_id(request)  # cookie presence is optional for config
     skill_options = _skill_options(user_id)
     mcp_options = list(mcp_config.MCP_OPTIONS)
-    default_skills, default_mcp = utils.get_initial_tool_defaults()
+    # Prefer per-user settings.json; fall back to favorite_tools.json.
+    default_skills, default_mcp = utils.get_user_tool_defaults(user_id)
     default_skills = [s for s in default_skills if s in skill_options]
     default_mcp = [m for m in default_mcp if m in mcp_options]
     config = utils.load_config()

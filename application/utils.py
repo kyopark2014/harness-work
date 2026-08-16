@@ -115,6 +115,35 @@ def get_initial_tool_defaults() -> tuple[list[str], list[str]]:
     return default_skills, default_mcp_servers
 
 
+def get_user_tool_defaults(user_id: str | None) -> tuple[list[str], list[str]]:
+    """Per-user skill/MCP defaults from settings.json, else favorite_tools.json."""
+    fav_skills, fav_mcp = get_initial_tool_defaults()
+    settings = load_user_settings(user_id)
+    skills = settings.get("skills")
+    mcp_servers = settings.get("mcp_servers")
+    return (
+        list(skills) if isinstance(skills, list) else fav_skills,
+        list(mcp_servers) if isinstance(mcp_servers, list) else fav_mcp,
+    )
+
+
+def save_user_tool_defaults(
+    user_id: str | None,
+    *,
+    skills: list[str] | None = None,
+    mcp_servers: list[str] | None = None,
+) -> dict[str, object]:
+    """Persist the user's last skill/MCP selection into settings.json."""
+    updates: dict[str, object] = {}
+    if skills is not None:
+        updates["skills"] = skills
+    if mcp_servers is not None:
+        updates["mcp_servers"] = mcp_servers
+    if not updates:
+        return load_user_settings(user_id)
+    return save_user_settings(user_id, **updates)
+
+
 config = load_config()
 
 bedrock_region = config["region"]
@@ -241,8 +270,29 @@ def get_user_settings_path(user_id: str | None) -> str:
     return os.path.join(SESSION_STORAGE_DIR, segment, "settings.json")
 
 
+def _normalize_string_list(value: object) -> list[str]:
+    """Return a cleaned list of non-empty strings (stable order, no duplicates)."""
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        name = item.strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
 def load_user_settings(user_id: str | None) -> dict[str, object]:
-    """Load per-user UI/feature settings. Missing file → defaults (KG on)."""
+    """Load per-user UI/feature settings. Missing file → defaults (KG on).
+
+    ``skills`` / ``mcp_servers`` are omitted until the user has saved them so
+    callers can fall back to favorite_tools.json.
+    """
     settings = dict(_DEFAULT_USER_SETTINGS)
     path = get_user_settings_path(user_id)
     if not os.path.isfile(path):
@@ -255,6 +305,10 @@ def load_user_settings(user_id: str | None) -> dict[str, object]:
                 settings["knowledge_graph_enabled"] = bool(raw["knowledge_graph_enabled"])
             if "graph_pattern" in raw:
                 settings["graph_pattern"] = normalize_graph_pattern(raw.get("graph_pattern"))
+            if "skills" in raw:
+                settings["skills"] = _normalize_string_list(raw.get("skills"))
+            if "mcp_servers" in raw:
+                settings["mcp_servers"] = _normalize_string_list(raw.get("mcp_servers"))
     except (OSError, json.JSONDecodeError) as e:
         logger.warning("Failed to load user settings %s: %s", path, e)
     return settings
@@ -276,6 +330,10 @@ def save_user_settings(user_id: str | None, **updates: object) -> dict[str, obje
             settings[key] = bool(value)
         elif key == "graph_pattern":
             settings[key] = normalize_graph_pattern(value)
+        elif key == "skills":
+            settings[key] = _normalize_string_list(value)
+        elif key == "mcp_servers":
+            settings[key] = _normalize_string_list(value)
     path = get_user_settings_path(user_id)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2, ensure_ascii=False)
