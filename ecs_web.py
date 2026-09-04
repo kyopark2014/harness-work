@@ -158,6 +158,18 @@ class EcsWebDeployer:
                         ],
                     },
                     {
+                        "Sid": "KnowledgeBaseIngestion",
+                        "Effect": "Allow",
+                        "Action": [
+                            "bedrock:StartIngestionJob",
+                            "bedrock:GetIngestionJob",
+                            "bedrock:ListIngestionJobs",
+                        ],
+                        "Resource": [
+                            f"arn:aws:bedrock:{self.region}:{self.account_id}:knowledge-base/*",
+                        ],
+                    },
+                    {
                         "Sid": "CloudWatchCustomMetrics",
                         "Effect": "Allow",
                         "Action": ["cloudwatch:PutMetricData"],

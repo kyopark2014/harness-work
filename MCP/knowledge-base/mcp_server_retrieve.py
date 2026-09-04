@@ -4,7 +4,7 @@ import logging
 import sys
 
 import mcp_retrieve
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,7 +14,7 @@ logging.basicConfig(
 logger = logging.getLogger("retrieve-server")
 
 try:
-    mcp = FastMCP(
+    mcp = MCPServer(
         name="knowledge-base",
         instructions=(
             "You retrieve documents from the project Knowledge Base using RAG. "

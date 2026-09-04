@@ -3483,6 +3483,48 @@ def setup_agentcore_observability() -> Dict:
         return {"status": "error", "error": str(e)}
 
 
+def setup_agentcore_evaluations(harness_runtime_arn: Optional[str]) -> Dict:
+    """Create evaluation IAM role and online evaluation config for Managed Harness."""
+    logger.info("Configuring AgentCore Evaluations (online evaluation)")
+    try:
+        from evaluation import setup_agentcore_evaluation
+
+        result = setup_agentcore_evaluation(
+            harness_runtime_arn,
+            region,
+            account_id,
+            project_name,
+        )
+        role_arn = result.get("evaluation_execution_role_arn")
+        config_name = result.get("online_evaluation_config_name")
+        if role_arn:
+            update_config("evaluation_execution_role_arn", role_arn)
+        if config_name:
+            update_config("online_evaluation_config_name", config_name)
+        config_id = result.get("online_evaluation_config_id")
+        if config_id:
+            update_config("online_evaluation_config_id", config_id)
+        if result.get("service_name"):
+            update_config("evaluation_service_name", result["service_name"])
+        if result.get("log_group"):
+            update_config("evaluation_log_group", result["log_group"])
+        if result.get("session_timeout_minutes") is not None:
+            update_config(
+                "evaluation_session_timeout_minutes",
+                result["session_timeout_minutes"],
+            )
+
+        warning = result.get("warning")
+        if warning:
+            logger.warning(f"  Evaluations skipped: {warning}")
+        elif result.get("status") != "skipped":
+            logger.info("  ✓ AgentCore Evaluations configured")
+        return result
+    except Exception as e:
+        logger.warning(f"  AgentCore Evaluations setup failed (continuing): {e}")
+        return {"status": "error", "error": str(e)}
+
+
 def create_monitoring_dashboard(
     harness_arn: Optional[str],
     *,
@@ -3872,7 +3914,10 @@ def main():
         logger.info("[19b/25] Configuring AgentCore Observability")
         setup_agentcore_observability()
 
-        logger.info("[19c/25] Creating CloudWatch monitoring dashboard")
+        logger.info("[19c/25] Configuring AgentCore Evaluations")
+        setup_agentcore_evaluations((harness_info or {}).get("harness_runtime_arn"))
+
+        logger.info("[19d/25] Creating CloudWatch monitoring dashboard")
         dashboard_info = create_monitoring_dashboard(
             (harness_info or {}).get("harness_arn"),
             harness_runtime_arn=(harness_info or {}).get("harness_runtime_arn"),

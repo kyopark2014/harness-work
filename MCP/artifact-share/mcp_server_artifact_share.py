@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 import boto3
 from botocore.exceptions import ClientError
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -304,7 +304,7 @@ def _copy_to_sharing(filepath: str, actor_id: str) -> str:
 
 
 try:
-    mcp = FastMCP(
+    mcp = MCPServer(
         name="artifact-share",
         instructions=(
             "You copy Harness ARTIFACTS_DIR files to the CloudFront sharing "

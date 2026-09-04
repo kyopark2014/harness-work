@@ -4,7 +4,7 @@ AWS Infrastructure Uninstaller for harness-work.
 
 Deletes resources created by installer.py:
   Cognito, session signing key, ECS Web UI, ALB, UI CloudFront, Harness,
-  Memory, Knowledge Base, S3 Vectors, S3 Files, VPC/NAT, project S3 /
+  online evaluation, Memory, Knowledge Base, S3 Vectors, S3 Files, VPC/NAT, project S3 /
   S3 CloudFront, IAM roles.
 """
 
@@ -814,6 +814,115 @@ def _find_guardrail_by_name(bedrock_client, name: str) -> Optional[dict]:
     return None
 
 
+def _online_evaluation_config_name(project_name: str) -> str:
+    return f"{project_name.replace('-', '_')}_harness_online_eval"
+
+
+def _evaluation_role_name(project_name: str) -> str:
+    return f"AmazonBedrockAgentCoreEvaluationRoleFor{project_name}"
+
+
+def _find_online_evaluation_config(client, config_name: str) -> Optional[dict]:
+    next_token = None
+    while True:
+        params: Dict = {}
+        if next_token:
+            params["nextToken"] = next_token
+        response = client.list_online_evaluation_configs(**params)
+        for item in response.get("onlineEvaluationConfigs", []):
+            if item.get("onlineEvaluationConfigName") == config_name:
+                return item
+        next_token = response.get("nextToken")
+        if not next_token:
+            return None
+
+
+def delete_online_evaluation(cfg: Dict) -> None:
+    """Delete online evaluation config and its evaluation IAM role/policy."""
+    logger.info("Deleting AgentCore online evaluation")
+    project = cfg.get("projectName") or project_name
+    config_name = (
+        cfg.get("online_evaluation_config_name")
+        or _online_evaluation_config_name(project)
+    )
+    config_id = cfg.get("online_evaluation_config_id")
+    account = cfg.get("accountId") or account_id
+
+    client = boto3.client("bedrock-agentcore-control", region_name=region)
+    if not config_id:
+        existing = _find_online_evaluation_config(client, config_name)
+        if existing:
+            config_id = existing.get("onlineEvaluationConfigId")
+
+    if config_id:
+        try:
+            client.delete_online_evaluation_config(onlineEvaluationConfigId=config_id)
+            logger.info(f"  ✓ Deleted online evaluation config: {config_name} ({config_id})")
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("ResourceNotFoundException", "ResourceNotFound"):
+                logger.info(
+                    f"  Online evaluation config not found (already deleted): {config_name}"
+                )
+            else:
+                logger.warning(f"  Failed to delete online evaluation config: {e}")
+    else:
+        logger.info(f"  Online evaluation config not found (already deleted): {config_name}")
+
+    role_name = _evaluation_role_name(project)
+    policy_name = f"{role_name}Policy"
+    iam_client = boto3.client("iam")
+    try:
+        attached = iam_client.list_attached_role_policies(RoleName=role_name)
+        for policy in attached.get("AttachedPolicies", []):
+            try:
+                iam_client.detach_role_policy(
+                    RoleName=role_name,
+                    PolicyArn=policy["PolicyArn"],
+                )
+                logger.info(f"  ✓ Detached policy from evaluation role: {policy['PolicyArn']}")
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                if code not in ("NoSuchEntity", "NoSuchEntityException"):
+                    logger.warning(f"  Failed to detach {policy['PolicyArn']}: {e}")
+
+        inline = iam_client.list_role_policies(RoleName=role_name)
+        for inline_name in inline.get("PolicyNames", []):
+            try:
+                iam_client.delete_role_policy(RoleName=role_name, PolicyName=inline_name)
+                logger.info(f"  ✓ Deleted inline policy: {inline_name}")
+            except Exception as e:
+                logger.warning(f"  Failed to delete inline policy {inline_name}: {e}")
+
+        iam_client.delete_role(RoleName=role_name)
+        logger.info(f"  ✓ Deleted evaluation IAM role: {role_name}")
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchEntity", "NoSuchEntityException"):
+            logger.info(f"  Evaluation IAM role not found (already deleted): {role_name}")
+        else:
+            logger.warning(f"  Failed to delete evaluation IAM role: {e}")
+
+    if account:
+        policy_arn = f"arn:aws:iam::{account}:policy/{policy_name}"
+        try:
+            versions = iam_client.list_policy_versions(PolicyArn=policy_arn)["Versions"]
+            for version in versions:
+                if not version["IsDefaultVersion"]:
+                    iam_client.delete_policy_version(
+                        PolicyArn=policy_arn,
+                        VersionId=version["VersionId"],
+                    )
+            iam_client.delete_policy(PolicyArn=policy_arn)
+            logger.info(f"  ✓ Deleted IAM policy: {policy_name}")
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchEntity", "NoSuchEntityException"):
+                logger.info(f"  IAM policy not found (already deleted): {policy_name}")
+            else:
+                logger.warning(f"  Failed to delete IAM policy {policy_name}: {e}")
+
+
 def delete_bedrock_guardrail(cfg: Dict) -> None:
     """Delete Bedrock Guardrail created by the harness installer."""
     logger.info("Deleting Bedrock Guardrail")
@@ -1198,6 +1307,12 @@ INSTALLER_CONFIG_KEYS = [
     "harnessId",
     "HARNESS_ARN",
     "harness_runtime_arn",
+    "evaluation_execution_role_arn",
+    "online_evaluation_config_name",
+    "online_evaluation_config_id",
+    "evaluation_service_name",
+    "evaluation_log_group",
+    "evaluation_session_timeout_minutes",
     "s3_bucket",
     "s3_arn",
     "sharing_url",
@@ -1453,6 +1568,7 @@ def main():
 
         delete_bedrock_guardrail(cfg)
         delete_cloudwatch_monitoring_dashboard(cfg)
+        delete_online_evaluation(cfg)
 
         delete_ecs_iam_roles(project_name, region, logger)
         delete_alb_origin_header_secret(project_name, region, logger)

@@ -998,7 +998,7 @@ Harness 호출은 model / tool / memory 등 단계별 **traces, logs, metrics를
 | Indexing rule | Default sampling |
 | Telemetry evaluation | Observability Admin 시작 (가능 시) |
 
-커스텀 AgentCore Runtime용 **TRACES delivery source/destination** 은 구성하지 않습니다. Harness가 서비스 측에서 텔레메트리를 내보내기 때문입니다.
+커스텀 AgentCore Runtime용 **TRACES delivery source/destination** 은 구성하지 않습니다. Harness가 서비스 측에서 텔레메트리를 내보내기 때문입니다. 이어서 [AgentCore Evaluations](#agentcore-evaluations) 단계에서 online evaluation config를 생성합니다.
 
 ### 확인 방법
 
@@ -1122,17 +1122,45 @@ agent = Agent(model=model, system_prompt=system_content, tools=[...])
 
 ---
 
-## AgentCore Evaluations (미적용)
+## AgentCore Evaluations
 
-[Amazon Bedrock AgentCore Evaluations](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/evaluations.html)(Online / On-demand, LLM-as-a-Judge)는 **이 프로젝트에 포함하지 않습니다.**
+[Amazon Bedrock AgentCore Evaluations](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/evaluations.html)는 Managed Harness가 CloudWatch로 자동 전송하는 trace를 LLM-as-a-Judge로 점수화합니다. Harness GA 이후 앱에서 `strands-agents[otel]` / ADOT를 주입할 필요 없이, Harness backing Runtime trace를 data source로 online evaluation을 구성할 수 있습니다.
 
-| 이유 | 설명 |
-|------|------|
-| 관리형 Harness | 에이전트 루프가 AWS 관리 이미지 안에서 돌아 앱이 `strands-agents[otel]` / ADOT로 Evaluation용 span scope를 제어할 수 없음 |
-| Evaluation 전제 | Online Eval은 보통 `strands.telemetry.tracer` 등 **지원되는 OTEL scope**와 런타임 로그 그룹·service name 매핑이 필요 (strands-work 커스텀 Runtime 패턴) |
-| 현재 Observability 범위 | Transaction Search + Harness 자동 트레이스까지만 구성. Evaluation IAM 역할·online evaluation config·결과 로그 그룹은 생성하지 않음 |
+전제 조건은 [Observability](#observability)입니다. installer가 Observability → Evaluations 순으로 설정합니다.
 
-품질 모니터링이 필요하면 GenAI Observability **Harnesses** 탭의 trace를 직접 확인하거나, 별도 커스텀 Runtime(예: strands-work)에서 Evaluations를 사용하세요.
+```bash
+python installer.py
+```
+
+### Online Evaluation 설정
+
+Observability 다음 단계로 [`evaluation.py`](./evaluation.py)의 `setup_agentcore_evaluations()`가 실행됩니다.
+
+| 항목 | 값 |
+|------|-----|
+| IAM 역할 | `AmazonBedrockAgentCoreEvaluationRoleFor{projectName}` |
+| Config 이름 | `{projectName}_harness_online_eval` (예: `harness_work_harness_online_eval`) |
+| Evaluator | `Builtin.Helpfulness`, `Builtin.GoalSuccessRate`, `Builtin.ToolSelectionAccuracy` |
+| Sampling | 10% |
+| `sessionTimeoutMinutes` | **5분** |
+| Data source | log group `/aws/bedrock-agentcore/runtimes/<harness-runtime-id>-DEFAULT`, service `<runtimeBase>.DEFAULT` (예: `harness_harness_work.DEFAULT`) |
+| 결과 로그 | `/aws/bedrock-agentcore/evaluations/results/<config-id>` |
+
+`config.json`에 저장되는 키: `evaluation_execution_role_arn`, `online_evaluation_config_name`, `online_evaluation_config_id`, `evaluation_service_name`, `evaluation_log_group`, `evaluation_session_timeout_minutes`.
+
+콘솔: **Amazon Bedrock AgentCore → Evaluation** 또는 CloudWatch **GenAI Observability → Harnesses → Evaluations**.
+
+#### `sessionTimeoutMinutes`
+
+Online evaluation은 같은 `session.id`의 span을 모은 뒤, **마지막 활동 이후 N분 유휴**하면 세션이 끝난 것으로 보고 평가합니다. 기본(서비스) 15분 대신 **5분**으로 설정합니다. timeout이 길면 세션 span이 [한도](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/bedrock-agentcore-limits.html)(**1000 spans / 15 MB**)를 넘을 수 있습니다. 값은 `evaluation.py`의 `DEFAULT_SESSION_TIMEOUT_MINUTES`에서 바꾸며, installer 재실행 시 `update_online_evaluation_config`로 갱신합니다.
+
+### 확인 방법
+
+1. `python installer.py` 후 Harness를 1~2회 호출
+2. 10% sampling이므로 여러 세션 호출 후 **Evaluation** 탭 또는 `/aws/bedrock-agentcore/evaluations/results/<config-id>` 로그 확인
+3. GenAI Observability **Harnesses** 탭에서 trace와 evaluation score를 함께 drill-down
+
+`uninstaller.py`는 online evaluation config와 evaluation IAM role/policy를 함께 삭제합니다.
 
 ---
 
@@ -1154,7 +1182,7 @@ Agent 실행시 sidebar에서 task별로 session이 분리된 대화를 이어�
 - [Harness 모델](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-models.html)
 - [Harness 보안 / 실행 역할](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-security.html)
 - [AgentCore Observability](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability.html)
-- [AgentCore Evaluations](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/evaluations.html) (이 저장소에서는 미적용 — 위 절 참고)
+- [AgentCore Evaluations](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/evaluations.html)
 - [AgentCore 요금](https://aws.amazon.com/bedrock/agentcore/pricing/)
 - [Bedrock Prompt Caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)
 - [Strands Agents](https://strandsagents.com/)
