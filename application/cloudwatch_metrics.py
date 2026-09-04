@@ -110,6 +110,7 @@ MODEL_PRICING_PER_MILLION: dict[str, dict[str, float]] = {
     "us.anthropic.claude-opus-4-6": {"input": 5.0, "output": 25.0},
     "us.anthropic.claude-opus-4-5": {"input": 5.0, "output": 25.0},
     "us.anthropic.claude-fable-5": {"input": 3.0, "output": 15.0},
+    "us.anthropic.claude-fable-5-1": {"input": 10.0, "output": 50.0},
     "us.amazon.nova-premier-v1:0": {"input": 2.5, "output": 12.5},
     "us.amazon.nova-pro-v1:0": {"input": 0.80, "output": 3.20},
     "us.amazon.nova-lite-v1:0": {"input": 0.06, "output": 0.24},
