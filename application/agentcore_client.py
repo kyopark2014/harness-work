@@ -365,19 +365,32 @@ def get_tool_info(tool_name, tool_content):
             else:
                 json_data = tool_content
             
+            # AWS docs MCP may return {"search_results": [...]} as the root object
+            if isinstance(json_data, dict) and "search_results" in json_data:
+                json_data = json_data["search_results"]
+
             # Ensure json_data is iterable
             if not isinstance(json_data, list):
                 json_data = [json_data]
-            
+
+            normalized = []
             for item in json_data:
-                logger.info(f"item: {item}")
-                
                 if isinstance(item, str):
                     try:
                         item = json.loads(item)
                     except json.JSONDecodeError:
                         logger.info(f"Failed to parse item as JSON: {item}")
                         continue
+
+                if isinstance(item, dict) and "search_results" in item and "url" not in item:
+                    nested = item.get("search_results")
+                    if isinstance(nested, list):
+                        normalized.extend(nested)
+                    continue
+                normalized.append(item)
+
+            for item in normalized:
+                logger.info(f"item: {item}")
                 
                 if isinstance(item, dict) and 'url' in item and 'title' in item:
                     url = item['url']
@@ -994,7 +1007,7 @@ def run_harness(
                                     tool_slot_update(
                                         notification_queue,
                                         f"{tid}:input",
-                                        f"Tool: {name}, Input: {tool_input_buffers[tid]}",
+                                        f"Tool: {name}, Input: {_json_preview(tool_input_buffers[tid], 8000)}",
                                     )
                             else:
                                 logger.debug(
@@ -1030,7 +1043,7 @@ def run_harness(
                                     tool_slot_update(
                                         notification_queue,
                                         f"{tid}:result",
-                                        f"Tool Result ({tname}): {buf}",
+                                        f"Tool Result ({tname}): {_json_preview(buf, 8000)}",
                                     )
                                 content, urls, refs = get_tool_info(tname, buf)
                                 if refs:
