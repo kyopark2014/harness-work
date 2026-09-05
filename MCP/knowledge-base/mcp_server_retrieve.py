@@ -14,6 +14,7 @@ logging.basicConfig(
 logger = logging.getLogger("retrieve-server")
 
 try:
+    # mcp>=2.1: host/stateless_http belong on run(), not MCPServer()
     mcp = MCPServer(
         name="knowledge-base",
         instructions=(
@@ -22,8 +23,6 @@ try:
             "Always pass actor_id from the system prompt (account login id, "
             "e.g. ksdyb) — never a nickname or display name."
         ),
-        host="0.0.0.0",
-        stateless_http=True,
     )
     logger.info("MCP server initialized successfully")
 except Exception as e:
@@ -53,4 +52,4 @@ def retrieve(keyword: str, actor_id: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http", host="0.0.0.0", stateless_http=True)
