@@ -1293,16 +1293,9 @@ def _ensure_mcp_gateway_target(
 
     existing = _find_gateway_target(gateway_id, target_name)
     target_id = existing.get("targetId") if existing else None
-    terminal_failed = {
-        "FAILED",
-        "CREATE_UNSUCCESSFUL",
-        "UPDATE_UNSUCCESSFUL",
-        "SYNCHRONIZE_UNSUCCESSFUL",
-    }
-    if existing and existing.get("status") in terminal_failed:
+    if existing and existing.get("status") == "FAILED":
         logger.warning(
-            f"  Gateway target '{target_name}' is {existing.get('status')}; "
-            "deleting before recreate"
+            f"  Gateway target '{target_name}' is FAILED; deleting before recreate"
         )
         _delete_gateway_target(gateway_id, target_id)
         target_id = None

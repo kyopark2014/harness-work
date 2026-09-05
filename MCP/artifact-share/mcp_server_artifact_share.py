@@ -304,7 +304,6 @@ def _copy_to_sharing(filepath: str, actor_id: str) -> str:
 
 
 try:
-    # mcp>=2.1: host/stateless_http belong on run(), not MCPServer()
     mcp = MCPServer(
         name="artifact-share",
         instructions=(
@@ -317,6 +316,8 @@ try:
             "agentcore-sessions/{actor_id}/artifacts/... → "
             "artifacts/{actor_id}/... (S3 CopyObject)."
         ),
+        host="0.0.0.0",
+        stateless_http=True,
     )
     logger.info("MCP server initialized successfully")
 except Exception as e:
@@ -348,4 +349,4 @@ def share_artifact(filepath: str, actor_id: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="0.0.0.0", stateless_http=True)
+    mcp.run(transport="streamable-http")
