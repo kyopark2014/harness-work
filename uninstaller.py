@@ -525,6 +525,65 @@ def _resolve_vpc_id(cfg: dict) -> Optional[str]:
     return vpcs[0]["VpcId"] if vpcs else None
 
 
+def _delete_vpc_endpoints(vpc_id: str, timeout_sec: int = 300) -> None:
+    """Delete Interface/Gateway VPC endpoints before subnet/VPC teardown."""
+    try:
+        endpoints = ec2_client.describe_vpc_endpoints(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("VpcEndpoints", [])
+    except ClientError as e:
+        logger.warning(f"  VPC endpoint list: {e}")
+        return
+
+    pending_ids: List[str] = []
+    for ep in endpoints:
+        if ep.get("State") == "deleted":
+            continue
+        ep_id = ep["VpcEndpointId"]
+        if ep.get("State") != "deleting":
+            try:
+                ec2_client.delete_vpc_endpoints(VpcEndpointIds=[ep_id])
+                logger.info(
+                    f"  ✓ Delete VPC endpoint requested: {ep_id} "
+                    f"({ep.get('ServiceName', 'unknown')})"
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "InvalidVpcEndpointId.NotFound":
+                    logger.warning(f"  Could not delete VPC endpoint {ep_id}: {e}")
+                    continue
+        else:
+            logger.info(f"  VPC endpoint already deleting: {ep_id}")
+        pending_ids.append(ep_id)
+
+    if not pending_ids:
+        return
+
+    logger.info(f"  Waiting for {len(pending_ids)} VPC endpoint(s) to delete...")
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        remaining: List[str] = []
+        for ep_id in pending_ids:
+            try:
+                current = ec2_client.describe_vpc_endpoints(
+                    VpcEndpointIds=[ep_id]
+                ).get("VpcEndpoints", [])
+                if current and current[0].get("State") != "deleted":
+                    remaining.append(ep_id)
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "InvalidVpcEndpointId.NotFound":
+                    remaining.append(ep_id)
+                    logger.debug(f"  VPC endpoint check {ep_id}: {e}")
+        if not remaining:
+            logger.info("  ✓ All VPC endpoints deleted")
+            return
+        time.sleep(15)
+        pending_ids = remaining
+
+    logger.warning(
+        f"  {len(pending_ids)} VPC endpoint(s) still present after {timeout_sec}s"
+    )
+
+
 def delete_vpc(cfg: dict):
     logger.info("[4/8] Deleting VPC resources")
     vpc_id = _resolve_vpc_id(cfg)
@@ -533,6 +592,9 @@ def delete_vpc(cfg: dict):
         return
 
     logger.info(f"  VPC: {vpc_id}")
+
+    # VPC endpoints hold ENIs / route-table refs — must go before subnet/SG/VPC
+    _delete_vpc_endpoints(vpc_id)
 
     # Detach/delete ENIs that are available
     try:

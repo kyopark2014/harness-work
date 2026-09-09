@@ -56,12 +56,19 @@ class S3FilesVpcProvisioner:
                     f"VPC {vpc_id} has no private subnets; "
                     "create private subnets or delete the VPC and re-run installer."
                 )
-            return {
+            vpc_info = {
                 "vpc_id": vpc_id,
                 "public_subnets": public_subnets,
                 "private_subnets": private_subnets,
             }
-        return self._create_vpc()
+        else:
+            vpc_info = self._create_vpc()
+        # Keep AWS API traffic (S3/ECR/Bedrock) off NAT Gateway data-processing charges.
+        self.ensure_private_subnet_vpc_endpoints(
+            str(vpc_info["vpc_id"]),
+            list(vpc_info["private_subnets"]),
+        )
+        return vpc_info
 
     def _find_vpc_by_name(self, name: str) -> Optional[str]:
         resp = self.ec2.describe_vpcs(
@@ -263,6 +270,200 @@ class S3FilesVpcProvisioner:
             "public_subnets": public_subnets,
             "private_subnets": private_subnets,
         }
+
+    # --- VPC endpoints (avoid NAT data charges for AWS APIs) -----------------
+
+    def _ensure_vpce_security_group(self, vpc_id: str) -> str:
+        """SG that allows VPC CIDR HTTPS to interface VPC endpoints."""
+        group_name = f"vpce-sg-for-{self.project_name}"
+        cidr = self.ec2.describe_vpcs(VpcIds=[vpc_id])["Vpcs"][0]["CidrBlock"]
+        sg_id = self.create_security_group(
+            vpc_id=vpc_id,
+            group_name=group_name,
+            description=f"Allow HTTPS to VPC endpoints for {self.project_name}",
+            ingress_rules=[
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 443,
+                    "ToPort": 443,
+                    "IpRanges": [
+                        {"CidrIp": cidr, "Description": "VPC HTTPS to endpoints"}
+                    ],
+                }
+            ],
+        )
+        return sg_id
+
+    def _get_route_table_ids_for_subnets(
+        self, subnet_ids: List[str], vpc_id: str
+    ) -> List[str]:
+        route_table_ids = set()
+        for subnet_id in subnet_ids:
+            try:
+                response = self.ec2.describe_route_tables(
+                    Filters=[
+                        {"Name": "association.subnet-id", "Values": [subnet_id]}
+                    ]
+                )
+                if response["RouteTables"]:
+                    route_table_ids.add(response["RouteTables"][0]["RouteTableId"])
+            except Exception as e:
+                self.logger.debug(f"Could not get route table for {subnet_id}: {e}")
+        if not route_table_ids:
+            response = self.ec2.describe_route_tables(
+                Filters=[
+                    {"Name": "vpc-id", "Values": [vpc_id]},
+                    {"Name": "association.main", "Values": ["true"]},
+                ]
+            )
+            if response["RouteTables"]:
+                route_table_ids.add(response["RouteTables"][0]["RouteTableId"])
+        return list(route_table_ids)
+
+    def _create_interface_vpc_endpoint(
+        self,
+        vpc_id: str,
+        service_name: str,
+        subnet_ids: List[str],
+        security_group_ids: List[str],
+        endpoint_name: str,
+    ) -> Optional[str]:
+        existing = self.ec2.describe_vpc_endpoints(
+            Filters=[
+                {"Name": "vpc-id", "Values": [vpc_id]},
+                {"Name": "service-name", "Values": [service_name]},
+            ]
+        ).get("VpcEndpoints") or []
+        if existing:
+            endpoint_id = existing[0]["VpcEndpointId"]
+            current = {g["GroupId"] for g in existing[0].get("Groups") or []}
+            missing = [sg for sg in security_group_ids if sg not in current]
+            if missing:
+                self.ec2.modify_vpc_endpoint(
+                    VpcEndpointId=endpoint_id, AddSecurityGroupIds=missing
+                )
+            self.logger.debug(f"  Reusing VPC endpoint {service_name}: {endpoint_id}")
+            return endpoint_id
+        try:
+            resp = self.ec2.create_vpc_endpoint(
+                VpcId=vpc_id,
+                ServiceName=service_name,
+                VpcEndpointType="Interface",
+                SubnetIds=subnet_ids,
+                SecurityGroupIds=security_group_ids,
+                PrivateDnsEnabled=True,
+                TagSpecifications=[
+                    {
+                        "ResourceType": "vpc-endpoint",
+                        "Tags": [{"Key": "Name", "Value": endpoint_name}],
+                    }
+                ],
+            )
+            endpoint_id = resp["VpcEndpoint"]["VpcEndpointId"]
+            self.logger.info(f"  Created VPC endpoint {service_name}: {endpoint_id}")
+            return endpoint_id
+        except ClientError as e:
+            self.logger.warning(f"  Failed to create VPC endpoint {service_name}: {e}")
+            return None
+
+    def _create_s3_gateway_vpc_endpoint(
+        self, vpc_id: str, route_table_ids: List[str]
+    ) -> Optional[str]:
+        service_name = f"com.amazonaws.{self.region}.s3"
+        if not route_table_ids:
+            self.logger.warning("  Skipping S3 gateway endpoint: no route tables")
+            return None
+        existing = self.ec2.describe_vpc_endpoints(
+            Filters=[
+                {"Name": "vpc-id", "Values": [vpc_id]},
+                {"Name": "service-name", "Values": [service_name]},
+            ]
+        ).get("VpcEndpoints") or []
+        if existing:
+            endpoint_id = existing[0]["VpcEndpointId"]
+            current = set(existing[0].get("RouteTableIds") or [])
+            missing = [rt for rt in route_table_ids if rt not in current]
+            if missing:
+                self.ec2.modify_vpc_endpoint(
+                    VpcEndpointId=endpoint_id, AddRouteTableIds=missing
+                )
+            self.logger.debug(f"  Reusing S3 gateway endpoint: {endpoint_id}")
+            return endpoint_id
+        try:
+            resp = self.ec2.create_vpc_endpoint(
+                VpcId=vpc_id,
+                ServiceName=service_name,
+                VpcEndpointType="Gateway",
+                RouteTableIds=route_table_ids,
+                TagSpecifications=[
+                    {
+                        "ResourceType": "vpc-endpoint",
+                        "Tags": [
+                            {
+                                "Key": "Name",
+                                "Value": f"s3-endpoint-{self.project_name}",
+                            }
+                        ],
+                    }
+                ],
+            )
+            endpoint_id = resp["VpcEndpoint"]["VpcEndpointId"]
+            self.logger.info(f"  Created S3 gateway endpoint: {endpoint_id}")
+            return endpoint_id
+        except ClientError as e:
+            self.logger.warning(f"  Failed to create S3 gateway endpoint: {e}")
+            return None
+
+    def ensure_private_subnet_vpc_endpoints(
+        self, vpc_id: str, private_subnets: List[str]
+    ) -> Dict[str, Optional[str]]:
+        """
+        Ensure VPC endpoints so private workloads hit AWS APIs without NAT GB fees.
+
+        Interface: ECR, Logs, Secrets Manager, Bedrock Runtime/AgentCore.
+        Gateway: S3 (ECR image layers / S3 Files traffic).
+        """
+        if not private_subnets:
+            self.logger.warning("  Skipping VPC endpoints: no private subnets")
+            return {}
+        self.logger.info(
+            "  Ensuring VPC endpoints (ECR, Logs, Secrets Manager, "
+            "Bedrock, S3) to reduce NAT data charges"
+        )
+        vpce_sg_id = self._ensure_vpce_security_group(vpc_id)
+        endpoint_ids: Dict[str, Optional[str]] = {}
+        interface_services = [
+            (f"com.amazonaws.{self.region}.ecr.api", f"ecr-api-endpoint-{self.project_name}"),
+            (f"com.amazonaws.{self.region}.ecr.dkr", f"ecr-dkr-endpoint-{self.project_name}"),
+            (f"com.amazonaws.{self.region}.logs", f"logs-endpoint-{self.project_name}"),
+            (
+                f"com.amazonaws.{self.region}.secretsmanager",
+                f"secretsmanager-endpoint-{self.project_name}",
+            ),
+            (
+                f"com.amazonaws.{self.region}.bedrock-runtime",
+                f"bedrock-endpoint-{self.project_name}",
+            ),
+            (
+                f"com.amazonaws.{self.region}.bedrock-agentcore",
+                f"bedrock-agentcore-endpoint-{self.project_name}",
+            ),
+            (
+                f"com.amazonaws.{self.region}.bedrock-agentcore-control",
+                f"bedrock-agentcore-control-endpoint-{self.project_name}",
+            ),
+        ]
+        for service_name, endpoint_name in interface_services:
+            endpoint_ids[service_name] = self._create_interface_vpc_endpoint(
+                vpc_id=vpc_id,
+                service_name=service_name,
+                subnet_ids=private_subnets,
+                security_group_ids=[vpce_sg_id],
+                endpoint_name=endpoint_name,
+            )
+        route_table_ids = self._get_route_table_ids_for_subnets(private_subnets, vpc_id)
+        endpoint_ids["s3"] = self._create_s3_gateway_vpc_endpoint(vpc_id, route_table_ids)
+        return endpoint_ids
 
     # --- Security groups -----------------------------------------------------
 
