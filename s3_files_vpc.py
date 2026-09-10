@@ -420,15 +420,18 @@ class S3FilesVpcProvisioner:
         """
         Ensure VPC endpoints so private workloads hit AWS APIs without NAT GB fees.
 
-        Interface: ECR, Logs, Secrets Manager, Bedrock Runtime/AgentCore.
-        Gateway: S3 (ECR image layers / S3 Files traffic).
+        Interface: ECR, Logs, Secrets Manager, Bedrock Runtime/AgentCore
+        (data plane, control plane, and Gateway — ``*.gateway.bedrock-agentcore``
+        needs its own PrivateLink service or MCP clients fail with
+        ``[Errno -2] Name or service not known``).
+        Gateway endpoint type: S3 (ECR image layers / S3 Files traffic).
         """
         if not private_subnets:
             self.logger.warning("  Skipping VPC endpoints: no private subnets")
             return {}
         self.logger.info(
             "  Ensuring VPC endpoints (ECR, Logs, Secrets Manager, "
-            "Bedrock, S3) to reduce NAT data charges"
+            "Bedrock, AgentCore Gateway, S3) to reduce NAT data charges"
         )
         vpce_sg_id = self._ensure_vpce_security_group(vpc_id)
         endpoint_ids: Dict[str, Optional[str]] = {}
@@ -451,6 +454,10 @@ class S3FilesVpcProvisioner:
             (
                 f"com.amazonaws.{self.region}.bedrock-agentcore-control",
                 f"bedrock-agentcore-control-endpoint-{self.project_name}",
+            ),
+            (
+                f"com.amazonaws.{self.region}.bedrock-agentcore.gateway",
+                f"bedrock-agentcore-gateway-endpoint-{self.project_name}",
             ),
         ]
         for service_name, endpoint_name in interface_services:
