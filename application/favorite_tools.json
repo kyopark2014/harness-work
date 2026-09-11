@@ -2,10 +2,10 @@
   "MCP": [
     "websearch",
     "aws_documentation",
-    "knowledge base",
-    "artifact-share"
+    "knowledge base"
   ],
   "SKILL": [
+    "doc-sharing",
     "docx",
     "korea-weather",
     "pptx",

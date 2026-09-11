@@ -2,8 +2,8 @@
 """
 AWS Infrastructure Installer using boto3
 This script provisions AgentCore Harness (S3, skills, VPC, S3 Files mount,
-CloudFront, IAM roles, Memory, S3 Vectors Knowledge Base, KB + artifact-share
-MCP Runtimes behind a shared AgentCore Gateway, CreateHarness)
+CloudFront, IAM roles, Memory, S3 Vectors Knowledge Base, KB MCP Runtime
+behind a shared AgentCore Gateway, CreateHarness)
 and deploys the React+FastAPI Web UI to Amazon ECS Fargate (ALB + CloudFront),
 similar to strands-work.
 """
@@ -32,9 +32,6 @@ import s3_files_vpc
 from ecs_web import EcsWebDeployer
 
 KB_MCP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MCP", "knowledge-base")
-ARTIFACT_SHARE_MCP_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "MCP", "artifact-share"
-)
 
 # Configuration
 project_name = "harness-work"  # at least 3 characters
@@ -1470,313 +1467,6 @@ def refresh_knowledge_base_mcp_env(
         mcp_info.update(gateway_info)
 
 
-def _artifact_share_mcp_repository_name() -> str:
-    return f"artifact_share_of_{project_name}".replace("-", "_")
-
-
-def create_artifact_share_mcp_role() -> str:
-    """IAM role assumed by the Artifact Share MCP AgentCore Runtime."""
-    logger.info("[11/25] Creating Artifact Share MCP Runtime IAM role")
-    role_name = f"role-artifact-share-mcp-for-{project_name}-{region}"
-    if len(role_name) > 64:
-        role_name = f"role-artifact-share-mcp-{project_name[:20]}-{region}"[:64]
-
-    assume_role_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
-                "Action": "sts:AssumeRole",
-            },
-            {
-                "Effect": "Allow",
-                "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
-                "Action": "sts:AssumeRole",
-            },
-        ],
-    }
-    role_arn, _ = create_iam_role(
-        role_name,
-        assume_role_policy,
-        description="Execution role for Artifact Share MCP AgentCore Runtime",
-    )
-
-    bucket = _bucket_name()
-    policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Sid": "S3ListBucket",
-                "Effect": "Allow",
-                "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
-                "Resource": [f"arn:aws:s3:::{bucket}"],
-            },
-            {
-                "Sid": "S3ReadSessionObjects",
-                "Effect": "Allow",
-                "Action": ["s3:GetObject", "s3:HeadObject"],
-                "Resource": [f"arn:aws:s3:::{bucket}/*"],
-            },
-            {
-                "Sid": "S3PutSharingObjects",
-                "Effect": "Allow",
-                "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
-                "Resource": [
-                    f"arn:aws:s3:::{bucket}/artifacts/*",
-                    f"arn:aws:s3:::{bucket}/images/*",
-                    f"arn:aws:s3:::{bucket}/docs/*",
-                ],
-            },
-            {
-                "Sid": "EcrPull",
-                "Effect": "Allow",
-                "Action": [
-                    "ecr:GetAuthorizationToken",
-                    "ecr:BatchGetImage",
-                    "ecr:GetDownloadUrlForLayer",
-                    "ecr:BatchCheckLayerAvailability",
-                    "ecr:DescribeImages",
-                    "ecr:DescribeRepositories",
-                ],
-                "Resource": ["*"],
-            },
-            {
-                "Sid": "CloudWatchLogs",
-                "Effect": "Allow",
-                "Action": [
-                    "logs:CreateLogGroup",
-                    "logs:CreateLogStream",
-                    "logs:PutLogEvents",
-                    "logs:DescribeLogGroups",
-                    "logs:DescribeLogStreams",
-                ],
-                "Resource": [
-                    f"arn:aws:logs:{region}:{account_id}:log-group:/aws/bedrock-agentcore/*",
-                    f"arn:aws:logs:{region}:{account_id}:log-group:/aws/bedrock-agentcore/*:log-stream:*",
-                ],
-            },
-            {
-                "Sid": "CloudWatchMetrics",
-                "Effect": "Allow",
-                "Action": [
-                    "cloudwatch:PutMetricData",
-                    "xray:PutTraceSegments",
-                    "xray:PutTelemetryRecords",
-                ],
-                "Resource": ["*"],
-            },
-        ],
-    }
-    attach_inline_policy(
-        role_name,
-        f"artifact-share-mcp-inline-for-{project_name}"[:128],
-        policy,
-    )
-    logger.info(f"✓ Artifact Share MCP Runtime role ready: {role_arn}")
-    return role_arn
-
-
-def push_artifact_share_mcp_image() -> Tuple[str, str]:
-    """Build MCP/artifact-share image and push to ECR. Returns (repository, tag)."""
-    logger.info("[12/25] Building Artifact Share MCP Docker image and pushing to ECR")
-
-    if not shutil.which("docker"):
-        raise RuntimeError("docker is required to build the Artifact Share MCP image")
-    if not os.path.isdir(ARTIFACT_SHARE_MCP_DIR):
-        raise RuntimeError(f"MCP directory not found: {ARTIFACT_SHARE_MCP_DIR}")
-
-    try:
-        boto3.client("sts").get_caller_identity()
-    except NoCredentialsError as e:
-        raise RuntimeError("AWS credentials are not configured") from e
-
-    repository = _artifact_share_mcp_repository_name()
-    image_tag = datetime.now().strftime("%Y%m%d%H%M%S")
-    local_tag = f"{repository}:{image_tag}"
-    ecr_uri = f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repository}:{image_tag}"
-
-    _ensure_ecr_repository(repository)
-    _docker_ecr_login()
-    _run_docker(
-        [
-            "docker",
-            "build",
-            "--platform",
-            "linux/arm64",
-            "--provenance=false",
-            "--sbom=false",
-            "-t",
-            local_tag,
-            ARTIFACT_SHARE_MCP_DIR,
-        ],
-        "Building Docker image",
-    )
-    _run_docker(["docker", "tag", local_tag, ecr_uri], "Tagging for ECR")
-    _run_docker(["docker", "push", ecr_uri], "Pushing to ECR")
-    logger.info(f"✓ Pushed Artifact Share MCP image: {ecr_uri}")
-    return repository, image_tag
-
-
-def create_or_update_artifact_share_mcp_runtime(
-    role_arn: str,
-    repository: str,
-    image_tag: str,
-    s3_bucket_name: str,
-    sharing_url: str = "",
-) -> Dict[str, str]:
-    """Create or update AgentCore Runtime (MCP protocol) for S3 sharing uploads."""
-    logger.info("[13/25] Creating/updating Artifact Share MCP AgentCore Runtime")
-    runtime_name = repository
-    container_uri = (
-        f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repository}:{image_tag}"
-    )
-    env_vars = {
-        "AWS_REGION": region,
-        "AWS_DEFAULT_REGION": region,
-        "PROJECT_NAME": project_name,
-        "S3_BUCKET": s3_bucket_name,
-        "SESSION_STORAGE_DIR": s3_files_vpc.SESSION_STORAGE_MOUNT_PATH,
-    }
-    if sharing_url:
-        env_vars["SHARING_URL"] = sharing_url.rstrip("/")
-
-    existing = _find_agent_runtime_by_name(runtime_name)
-    if existing:
-        runtime_id = existing["agentRuntimeId"]
-        logger.info(f"  Updating existing runtime: {runtime_name} ({runtime_id})")
-        response = agentcore_control_client.update_agent_runtime(
-            agentRuntimeId=runtime_id,
-            description="Harness S3 sharing MCP (CloudFront download URLs)",
-            agentRuntimeArtifact={
-                "containerConfiguration": {"containerUri": container_uri}
-            },
-            roleArn=role_arn,
-            networkConfiguration={"networkMode": "PUBLIC"},
-            protocolConfiguration={"serverProtocol": "MCP"},
-            environmentVariables=env_vars,
-        )
-        agent_runtime_arn = response["agentRuntimeArn"]
-    else:
-        logger.info(f"  Creating runtime: {runtime_name}")
-        response = agentcore_control_client.create_agent_runtime(
-            agentRuntimeName=runtime_name,
-            description="Harness S3 sharing MCP (CloudFront download URLs)",
-            agentRuntimeArtifact={
-                "containerConfiguration": {"containerUri": container_uri}
-            },
-            networkConfiguration={"networkMode": "PUBLIC"},
-            roleArn=role_arn,
-            protocolConfiguration={"serverProtocol": "MCP"},
-            environmentVariables=env_vars,
-        )
-        agent_runtime_arn = response["agentRuntimeArn"]
-
-    mcp_url = knowledge_base_mcp_url(agent_runtime_arn)
-    logger.info(f"✓ Artifact Share MCP Runtime: {agent_runtime_arn}")
-    logger.info(f"  MCP URL: {mcp_url}")
-    return {
-        "agent_runtime_arn": agent_runtime_arn,
-        "artifact_share_mcp_url": mcp_url,
-        "ecr_repository": repository,
-        "latest_image_tag": image_tag,
-        "agent_runtime_role": role_arn,
-    }
-
-
-def ensure_artifact_share_gateway_target(
-    gateway_id: str,
-    agent_runtime_arn: str,
-    mcp_url: str,
-    gateway_role_arn: str,
-) -> Dict[str, str]:
-    """Attach Artifact Share MCP Runtime as a target on the project Gateway."""
-    return _ensure_mcp_gateway_target(
-        gateway_id=gateway_id,
-        target_name="artifact-share",
-        description="AgentCore Runtime MCP (S3 sharing / CloudFront URLs)",
-        agent_runtime_arn=agent_runtime_arn,
-        mcp_url=mcp_url,
-        gateway_role_arn=gateway_role_arn,
-        result_key="artifact_share_mcp_gateway_target_id",
-    )
-
-
-def deploy_artifact_share_mcp(
-    s3_bucket_name: str,
-    sharing_url: str = "",
-    gateway_info: Optional[Dict[str, str]] = None,
-) -> Dict[str, str]:
-    """Build/push image, deploy MCP Runtime, attach it to the project IAM Gateway."""
-    role_arn = create_artifact_share_mcp_role()
-    repository, image_tag = push_artifact_share_mcp_image()
-    mcp_info = create_or_update_artifact_share_mcp_runtime(
-        role_arn=role_arn,
-        repository=repository,
-        image_tag=image_tag,
-        s3_bucket_name=s3_bucket_name,
-        sharing_url=sharing_url,
-    )
-    gw = dict(gateway_info or {})
-    if not gw.get("agentcore_gateway_id"):
-        gw.update(ensure_project_agentcore_gateway())
-    target_info = ensure_artifact_share_gateway_target(
-        gateway_id=gw["agentcore_gateway_id"],
-        agent_runtime_arn=mcp_info["agent_runtime_arn"],
-        mcp_url=mcp_info["artifact_share_mcp_url"],
-        gateway_role_arn=gw["agentcore_gateway_role"],
-    )
-    # Only copy shared gateway fields — do not overwrite this runtime's ARN/role/ECR.
-    for key in (
-        "agentcore_gateway_arn",
-        "agentcore_gateway_id",
-        "agentcore_gateway_role",
-    ):
-        if gw.get(key):
-            mcp_info[key] = gw[key]
-    mcp_info.update(target_info)
-    return mcp_info
-
-
-def refresh_artifact_share_mcp_env(
-    mcp_info: Dict[str, str],
-    s3_bucket_name: str,
-    sharing_url: str,
-) -> None:
-    """Update Artifact Share MCP runtime env after CloudFront URL is finalized."""
-    arn = mcp_info.get("agent_runtime_arn") or ""
-    if not arn:
-        return
-    runtime_name = _artifact_share_mcp_repository_name()
-    existing = _find_agent_runtime_by_name(runtime_name)
-    if not existing:
-        logger.warning("  Artifact Share MCP runtime not found for env refresh")
-        return
-    role_arn = mcp_info.get("agent_runtime_role") or ""
-    repository = mcp_info.get("ecr_repository") or runtime_name
-    image_tag = mcp_info.get("latest_image_tag")
-    if not image_tag or not role_arn:
-        logger.warning("  Skipping Artifact Share MCP env refresh (missing role/image tag)")
-        return
-    updated = create_or_update_artifact_share_mcp_runtime(
-        role_arn=role_arn,
-        repository=repository,
-        image_tag=image_tag,
-        s3_bucket_name=s3_bucket_name,
-        sharing_url=sharing_url,
-    )
-    mcp_info.update(updated)
-    gateway_id = mcp_info.get("agentcore_gateway_id") or ""
-    gateway_role = mcp_info.get("agentcore_gateway_role") or ""
-    if gateway_id and gateway_role and updated.get("artifact_share_mcp_url"):
-        target_info = ensure_artifact_share_gateway_target(
-            gateway_id=gateway_id,
-            agent_runtime_arn=updated["agent_runtime_arn"],
-            mcp_url=updated["artifact_share_mcp_url"],
-            gateway_role_arn=gateway_role,
-        )
-        mcp_info.update(target_info)
-
 
 def _s3_files_provisioner() -> s3_files_vpc.S3FilesVpcProvisioner:
     return s3_files_vpc.S3FilesVpcProvisioner(
@@ -1942,17 +1632,48 @@ def _prune_removed_skills_from_s3(s3_bucket_name: str) -> int:
     return removed
 
 
+def prepare_doc_sharing_skill_config(
+    s3_bucket_name: str, sharing_url: str = ""
+) -> None:
+    """Write skills/doc-sharing/config.json for Code Interpreter fallback."""
+    skill_dir = os.path.join(SKILLS_DIR, "doc-sharing")
+    if not os.path.isdir(skill_dir):
+        logger.warning(f"doc-sharing skill dir missing: {skill_dir}")
+        return
+    url = (sharing_url or "").rstrip("/")
+    if not url:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                url = (json.load(f).get("sharing_url") or "").rstrip("/")
+        except Exception:
+            pass
+    payload = {
+        "s3_bucket": s3_bucket_name,
+        "sharing_url": url,
+        "region": region,
+    }
+    dest = os.path.join(skill_dir, "config.json")
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    logger.info(
+        f"  doc-sharing config.json ready "
+        f"(bucket={s3_bucket_name}, sharing_url={url or '(none)'})"
+    )
+
+
 def upload_skills_to_s3(s3_bucket_name: str) -> int:
     """Upload skills/ to s3://{bucket}/skills/ (AgentCore S3 skill layout).
 
-    Also deletes remote skill prefixes that are no longer present locally
-    (e.g. renamed s3-sharing → artifact-share MCP).
+    Also deletes remote skill prefixes that are no longer present locally.
     """
     logger.info(f"[2/25] Uploading skills to s3://{s3_bucket_name}/{SKILLS_S3_PREFIX}/")
 
     if not os.path.isdir(SKILLS_DIR):
         logger.warning(f"Skills directory not found: {SKILLS_DIR}; skipping upload")
         return 0
+
+    prepare_doc_sharing_skill_config(s3_bucket_name)
 
     uploaded = 0
     failed = 0
@@ -2127,7 +1848,6 @@ def create_cloudfront_distribution(s3_bucket_name: str) -> Dict[str, str]:
 
 def create_harness_execution_role(
     knowledge_base_mcp_runtime_arn: Optional[str] = None,
-    artifact_share_mcp_runtime_arn: Optional[str] = None,
     agentcore_gateway_arn: Optional[str] = None,
 ) -> str:
     """Create IAM execution role for Bedrock AgentCore harness."""
@@ -2258,7 +1978,7 @@ def create_harness_execution_role(
                 ],
                 "Resource": [f"arn:aws:s3:::{_bucket_name()}/app-data/*"],
             },
-            # Sharing prefix writes (CloudFront); artifact-share MCP also uses its own role
+            # Sharing prefix writes (CloudFront) for doc-sharing skill
             {
                 "Sid": "AgentCoreSharingS3PutObject",
                 "Effect": "Allow",
@@ -2292,13 +2012,6 @@ def create_harness_execution_role(
             [
                 knowledge_base_mcp_runtime_arn,
                 f"{knowledge_base_mcp_runtime_arn}/*",
-            ]
-        )
-    if artifact_share_mcp_runtime_arn:
-        runtime_arns.extend(
-            [
-                artifact_share_mcp_runtime_arn,
-                f"{artifact_share_mcp_runtime_arn}/*",
             ]
         )
     if runtime_arns:
@@ -2545,35 +2258,31 @@ BASE_SYSTEM_PROMPT = (
     "InvokeHarness 호출마다 systemPrompt에 actor_id와 ARTIFACTS_DIR이 명시됩니다.\n"
     "- ARTIFACTS_DIR = /mnt/workspace/{actor_id}/artifacts\n"
     "- 모든 산출물은 반드시 해당 ARTIFACTS_DIR 아래에 생성하세요.\n"
-    "MCP 도구 retrieve와 share_artifact를 호출할 때 "
+    "MCP 도구 retrieve를 호출할 때 "
     "반드시 그 actor_id를 도구 인자로 그대로 사용하세요. "
     "닉네임·표시 이름·추측 값으로 바꾸지 마세요.\n"
     "\n"
-    "## Artifact sharing (REQUIRED) — MCP tool, NOT a skill\n"
-    "- share_artifact는 AgentCore Gateway에 연결된 MCP 도구입니다. "
-    "Skill이 아닙니다. skills 도구에 skill_name=\"artifact-share\" "
-    "(또는 \"s3-sharing\")를 넣지 마세요 — 존재하지 않으며 실패합니다.\n"
+    "## Artifact sharing (REQUIRED) — doc-sharing skill\n"
     "- ARTIFACTS_DIR에 PPT/PDF/DOCX/XLSX/PNG/CSV/HTML 등 결과 파일을 생성했다면, "
-    "사용자에게 최종 답변하기 **전에** 반드시 MCP 도구 share_artifact를 "
-    "직접 호출하세요 (skills 로드 단계 없음).\n"
+    "사용자에게 최종 답변하기 **전에** 반드시 **doc-sharing** skill의 "
+    "share_artifact.py를 code 인터프리터로 실행하세요.\n"
     "- 로컬 경로(/mnt/workspace/..., ARTIFACTS_DIR)만 안내하는 것은 **금지**입니다. "
     "사용자는 그 경로에 접근할 수 없습니다.\n"
-    "- share_artifact가 반환한 CloudFront 공유 URL을 최종 답변에 **반드시** 포함하세요. "
+    "- 스크립트가 반환한 CloudFront 공유 URL을 최종 답변에 **반드시** 포함하세요. "
     "URL 없이 '생성 완료'만 말하면 실패입니다.\n"
-    "- 파일이 여러 개면 파일마다 share_artifact를 각각 호출하세요.\n"
-    "- 인자: filepath는 'artifacts/파일명' 또는 ARTIFACTS_DIR 절대경로; "
-    "actor_id는 시스템 프롬프트 값을 그대로 사용 (필수).\n"
+    "- 파일이 여러 개면 파일마다 share_artifact.py를 각각 실행하세요.\n"
+    "- 예: aws s3 sync s3://$S3_BUCKET/skills/doc-sharing/ /tmp/doc-sharing/ 후 "
+    "python3 /tmp/doc-sharing/scripts/share_artifact.py "
+    "--filepath \"$ARTIFACTS_DIR/파일명\" --actor-id \"<actor_id>\"\n"
+    "- MCP share_artifact / artifact-share는 없습니다. skill로만 공유하세요.\n"
     "\n"
     "## Agent Workflow\n"
     "1. 사용자 입력을 받는다\n"
-    "2. 문서 작성 등은 필요 시 skill(docx/pptx 등)을 skills로 로드하고, "
-    "공유·검색 등은 MCP 도구(share_artifact, retrieve 등)를 직접 호출한다. "
-    "MCP 서버/도구 이름을 skill로 취급하지 않는다.\n"
+    "2. 문서 작성 등은 필요 시 skill(docx/pptx/doc-sharing 등)을 skills로 로드하고, "
+    "검색 등은 MCP 도구(retrieve 등)를 직접 호출한다.\n"
     "3. 코드 실행·파일 생성 시 반드시 ARTIFACTS_DIR(actor별 폴더) 아래에 산출물을 저장한다\n"
-    "4. 결과 파일이 있으면 사용자 답변 전에 반드시 MCP 도구 "
-    "share_artifact를 호출하고, 반환된 공유 URL을 답변에 포함한다 "
-    "(로컬 경로만 안내 금지; filepath는 'artifacts/파일명' 또는 ARTIFACTS_DIR 절대경로; "
-    "actor_id 필수; skills로 artifact-share를 찾지 말 것)\n"
+    "4. 결과 파일이 있으면 사용자 답변 전에 반드시 doc-sharing skill로 "
+    "CloudFront URL을 만들고 답변에 포함한다 (로컬 경로만 안내 금지)\n"
     "5. 공유 URL을 포함한 최종 결과를 사용자에게 전달한다\n"
 )
 
@@ -2751,7 +2460,7 @@ def _harness_environment_variables(
     knowledge_base_id: str | None = None,
     data_source_id: str | None = None,
 ) -> Dict[str, str]:
-    """Env vars for Harness runtime (session storage + artifact-share + KB)."""
+    """Env vars for Harness runtime (session storage + doc-sharing + KB)."""
     env: Dict[str, str] = {
         "LOG_LEVEL": "info",
         "SESSION_STORAGE_DIR": s3_files_vpc.SESSION_STORAGE_MOUNT_PATH,
@@ -2775,12 +2484,12 @@ def ensure_harness_sharing_env(
     knowledge_base_id: str | None = None,
     data_source_id: str | None = None,
 ) -> None:
-    """Inject S3_BUCKET / SHARING_URL / KB ids for runtime skills."""
+    """Inject S3_BUCKET / SHARING_URL / KB ids for runtime skills (doc-sharing)."""
     if not harness_id or not s3_bucket_name:
         return
     url = (sharing_url or "").rstrip("/")
     if not url:
-        logger.warning("  SHARING_URL empty; artifact-share will fall back to console URLs")
+        logger.warning("  SHARING_URL empty; doc-sharing will fall back to console URLs")
     env_vars = _harness_environment_variables(
         s3_bucket_name=s3_bucket_name,
         sharing_url=url or None,
@@ -2788,7 +2497,7 @@ def ensure_harness_sharing_env(
         data_source_id=data_source_id,
     )
     logger.info(
-        f"  Updating harness env for artifact-share/KB: "
+        f"  Updating harness env for doc-sharing/KB: "
         f"S3_BUCKET={s3_bucket_name}, SHARING_URL={url or '(none)'}, "
         f"KNOWLEDGE_BASE_ID={knowledge_base_id or '(none)'}"
     )
@@ -3586,7 +3295,6 @@ def build_config_from_deployment_state(
     knowledge_base_role_arn: Optional[str] = None,
     s3_vectors_info: Optional[Dict[str, str]] = None,
     knowledge_base_mcp_info: Optional[Dict[str, str]] = None,
-    artifact_share_mcp_info: Optional[Dict[str, str]] = None,
     cognito_info: Optional[Dict[str, str]] = None,
 ) -> Dict:
     config_data: Dict = {
@@ -3701,50 +3409,6 @@ def build_config_from_deployment_state(
             config_data["knowledge_base_mcp_image_tag"] = knowledge_base_mcp_info[
                 "latest_image_tag"
             ]
-    if artifact_share_mcp_info:
-        if artifact_share_mcp_info.get("agent_runtime_arn"):
-            config_data["artifact_share_mcp_runtime_arn"] = artifact_share_mcp_info[
-                "agent_runtime_arn"
-            ]
-        if artifact_share_mcp_info.get("artifact_share_mcp_url"):
-            config_data["artifact_share_mcp_url"] = artifact_share_mcp_info[
-                "artifact_share_mcp_url"
-            ]
-        if artifact_share_mcp_info.get("artifact_share_mcp_gateway_target_id"):
-            config_data["artifact_share_mcp_gateway_target_id"] = artifact_share_mcp_info[
-                "artifact_share_mcp_gateway_target_id"
-            ]
-        if artifact_share_mcp_info.get("agent_runtime_role"):
-            config_data["artifact_share_mcp_role"] = artifact_share_mcp_info[
-                "agent_runtime_role"
-            ]
-        if artifact_share_mcp_info.get("ecr_repository"):
-            config_data["artifact_share_mcp_ecr_repository"] = artifact_share_mcp_info[
-                "ecr_repository"
-            ]
-        if artifact_share_mcp_info.get("latest_image_tag"):
-            config_data["artifact_share_mcp_image_tag"] = artifact_share_mcp_info[
-                "latest_image_tag"
-            ]
-        # Prefer gateway fields from either MCP deploy (shared project gateway).
-        if artifact_share_mcp_info.get("agentcore_gateway_arn") and not config_data.get(
-            "agentcore_gateway_arn"
-        ):
-            config_data["agentcore_gateway_arn"] = artifact_share_mcp_info[
-                "agentcore_gateway_arn"
-            ]
-        if artifact_share_mcp_info.get("agentcore_gateway_id") and not config_data.get(
-            "agentcore_gateway_id"
-        ):
-            config_data["agentcore_gateway_id"] = artifact_share_mcp_info[
-                "agentcore_gateway_id"
-            ]
-        if artifact_share_mcp_info.get("agentcore_gateway_role") and not config_data.get(
-            "agentcore_gateway_role"
-        ):
-            config_data["agentcore_gateway_role"] = artifact_share_mcp_info[
-                "agentcore_gateway_role"
-            ]
     if cognito_info:
         config_data["cognito_user_pool_id"] = cognito_info.get(
             "cognito_user_pool_id", ""
@@ -3814,7 +3478,6 @@ def main():
     knowledge_base_id = None
     data_source_id = None
     knowledge_base_mcp_info = None
-    artifact_share_mcp_info = None
     execution_role_arn = None
     agentcore_memory_role_arn = None
     memory_id = None
@@ -3859,23 +3522,14 @@ def main():
             knowledge_base_id=knowledge_base_id,
             sharing_url=prior_sharing_url,
         )
-        artifact_share_mcp_info = deploy_artifact_share_mcp(
-            s3_bucket_name=s3_bucket_name,
-            sharing_url=prior_sharing_url,
-            gateway_info=knowledge_base_mcp_info,
-        )
 
         execution_role_arn = create_harness_execution_role(
             knowledge_base_mcp_runtime_arn=knowledge_base_mcp_info.get(
                 "agent_runtime_arn"
             ),
-            artifact_share_mcp_runtime_arn=artifact_share_mcp_info.get(
-                "agent_runtime_arn"
-            ),
             agentcore_gateway_arn=knowledge_base_mcp_info.get(
                 "agentcore_gateway_arn"
-            )
-            or artifact_share_mcp_info.get("agentcore_gateway_arn"),
+            ),
         )
         execution_role_name = f"role-harness-for-{project_name}-{region}"
         agentcore_memory_role_arn = create_agentcore_memory_role()
@@ -3932,19 +3586,22 @@ def main():
             knowledge_base_id=knowledge_base_id,
             data_source_id=data_source_id,
         )
+        prepare_doc_sharing_skill_config(s3_bucket_name, sharing_url)
+        try:
+            s3_client.upload_file(
+                os.path.join(SKILLS_DIR, "doc-sharing", "config.json"),
+                s3_bucket_name,
+                f"{SKILLS_S3_PREFIX}/doc-sharing/config.json",
+                ExtraArgs={"ContentType": "application/json"},
+            )
+        except Exception as e:
+            logger.warning(f"  doc-sharing config.json re-upload skipped: {e}")
         if sharing_url and sharing_url != prior_sharing_url:
             if knowledge_base_mcp_info:
                 logger.info("[21/25] Refreshing Knowledge Base MCP SHARING_URL")
                 refresh_knowledge_base_mcp_env(
                     knowledge_base_mcp_info,
                     knowledge_base_id=knowledge_base_id,
-                    sharing_url=sharing_url,
-                )
-            if artifact_share_mcp_info:
-                logger.info("[22/25] Refreshing Artifact Share MCP SHARING_URL")
-                refresh_artifact_share_mcp_env(
-                    artifact_share_mcp_info,
-                    s3_bucket_name=s3_bucket_name,
                     sharing_url=sharing_url,
                 )
 
@@ -3991,7 +3648,6 @@ def main():
                 knowledge_base_role_arn=knowledge_base_role_arn,
                 s3_vectors_info=s3_vectors_info,
                 knowledge_base_mcp_info=knowledge_base_mcp_info,
-                artifact_share_mcp_info=artifact_share_mcp_info,
                 cognito_info=cognito_info,
             )
             if write_config(CONFIG_PATH, app_environment):
@@ -4049,7 +3705,7 @@ def main():
         )
         logger.info(
             f"  Artifact Share MCP Runtime: "
-            f"{(artifact_share_mcp_info or {}).get('agent_runtime_arn')}"
+            f"{(knowledge_base_mcp_info or {}).get('agent_runtime_arn')}"
         )
         logger.info(
             f"  AgentCore Gateway: "
@@ -4155,7 +3811,6 @@ def main():
             knowledge_base_role_arn=knowledge_base_role_arn,
             s3_vectors_info=s3_vectors_info,
             knowledge_base_mcp_info=knowledge_base_mcp_info,
-            artifact_share_mcp_info=artifact_share_mcp_info,
             cognito_info=cognito_info,
         )
         if app_environment is not None:

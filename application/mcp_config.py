@@ -15,13 +15,13 @@ logger = logging.getLogger("mcp-config")
 WORKING_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(WORKING_DIR, "config.json")
 
-# UI labels that map onto the shared project AgentCore Gateway
-# (KB retrieve + artifact-share Runtime targets).
-_GATEWAY_MCP_LABELS = frozenset({"knowledge base", "artifact-share"})
+# UI labels that map onto the shared project AgentCore Gateway (KB retrieve).
+_GATEWAY_MCP_LABELS = frozenset({"knowledge base"})
 
 # Always-on MCP servers for every InvokeHarness call and UI defaults.
-# share_artifact / retrieve are required by the harness system prompt.
-BASE_MCP_SERVERS: tuple[str, ...] = ("knowledge base", "artifact-share")
+# retrieve is required by the harness system prompt; artifact sharing is the
+# doc-sharing *skill* (not MCP).
+BASE_MCP_SERVERS: tuple[str, ...] = ("knowledge base",)
 
 
 def merge_base_mcp_servers(mcp_servers: list[str] | None) -> list[str]:
@@ -46,7 +46,7 @@ def _project_mcp_gateway_tool() -> dict | None:
 
     Harness ``remote_mcp`` cannot SigV4-sign AgentCore Runtime MCP URLs (403).
     Use the project Gateway (AWS_IAM) with GATEWAY_IAM_ROLE outbound to Runtimes.
-    One Gateway fronts multiple Runtime MCP targets (knowledge-base, artifact-share).
+    One Gateway fronts Knowledge Base Runtime MCP target.
     """
     cfg = _load_app_config()
     gateway_arn = (
@@ -87,12 +87,6 @@ HARNESS_MCP_CATALOG: dict[str, dict] = {
         "name": "project_gateway",
         "config": {"agentCoreGateway": {"gatewayArn": ""}},
     },
-    "artifact-share": {
-        # Same project Gateway as knowledge base (artifact-share Runtime target).
-        "type": "agentcore_gateway",
-        "name": "project_gateway",
-        "config": {"agentCoreGateway": {"gatewayArn": ""}},
-    },
     "browser-use": {
         "type": "agentcore_browser",
         "name": "browser",
@@ -111,7 +105,8 @@ MCP_OPTIONS = list(HARNESS_MCP_CATALOG.keys())
 def build_harness_tools(mcp_servers: list[str]) -> list[dict]:
     """Build InvokeHarness ``tools`` from selected MCP option labels.
 
-    ``knowledge base`` and ``artifact-share`` are always included (shared Gateway).
+    ``knowledge base`` is always included (shared Gateway). Artifact sharing
+    uses the doc-sharing skill, not an MCP tool.
     """
     tools: list[dict] = []
     seen_names: set[str] = set()

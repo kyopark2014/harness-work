@@ -101,7 +101,7 @@ def save_favorite_tools(
 def get_initial_tool_defaults() -> tuple[list[str], list[str]]:
     """Return initial skill/MCP defaults from favorite_tools.json.
 
-    Always includes base MCP servers (knowledge base, artifact-share).
+    Always includes base MCP servers (knowledge base).
     """
     favorite_tools = load_favorite_tools()
     default_skills = favorite_tools.get("SKILL") or []

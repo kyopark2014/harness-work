@@ -17,7 +17,7 @@ AgentCore의 관리형 에이전트 하네스(Managed Agent Harness)는 사전 �
 - **모델**: 사이드바 선택 → `model.bedrockModelConfig`로 호출마다 override
 - **채팅 첨부**: `+` 버튼으로 이미지(사진·화면 캡처) 첨부, 문서 RAG 업로드
 - **Knowledge Base**: S3 Vectors 기반 Bedrock KB (`docs/` 인제스션)
-- **Artifact Share MCP**: `share_artifact`로 CloudFront 공유 URL (구 s3-sharing skill 대체)
+- **doc-sharing skill**: 산출물을 S3에 올리고 CloudFront 다운로드 URL 반환 (구 artifact-share MCP / s3-sharing 대체)
 - **Knowledge Graph**: 채팅 이력(`tasks.db`)에서 엔티티·관계를 추출해 사용자별 인터랙티브 HTML로 표시 (사이드바 브랜드 클릭)
 
 AWS 오픈소스 에이전트 프레임워크 [Strands Agents](https://strandsagents.com/docs/user-guide/quickstart/python/)로 구동됩니다.
@@ -34,7 +34,7 @@ flowchart TB
   INST[installer.py] -->|CreateHarness + VPC + S3 Files| H[AgentCore Harness]
   INST --> Mem[AgentCore Memory]
   INST --> KB[Bedrock KB<br/>S3 Vectors]
-  INST --> KbMcp[KB + artifact-share MCP<br/>+ IAM Gateway]
+  INST --> KbMcp[KB MCP + IAM Gateway]
   INST --> S3[(S3 bucket<br/>skills/ · docs/ · images/ · sessions/)]
   INST --> VPC[VPC + NAT<br/>private subnets]
   INST -->|Docker → ECR| ECS[ECS Fargate Web UI]
@@ -74,7 +74,7 @@ flowchart TB
 
 | 단계 | 경로 |
 |------|------|
-| 프로비저닝 | `installer.py` → **Cognito User Pool** · S3 · skills · IAM · Memory · **S3 Vectors KB** · **KB + artifact-share MCP Runtime + IAM Gateway** · VPC · S3 Files · `CreateHarness` · **ECR/ECS/ALB/UI CloudFront** → `application/config.json` |
+| 프로비저닝 | `installer.py` → **Cognito User Pool** · S3 · skills · IAM · Memory · **S3 Vectors KB** · **KB MCP Runtime + IAM Gateway** · VPC · S3 Files · `CreateHarness` · **ECR/ECS/ALB/UI CloudFront** → `application/config.json` |
 | 호출 | React UI → Cognito 로그인 · Skill/MCP/모델 · **이미지 첨부** → SSE `/api/tasks/{id}/chat` → `run_harness` → `invoke_harness` |
 | 삭제 | `uninstaller.py` → Cognito · ECS/ALB/UI CF · Harness · MCP Gateway/Runtime · KB · S3 Vectors · S3 Files · VPC · Memory · IAM 정리 |
 
@@ -578,12 +578,6 @@ HARNESS_MCP_CATALOG = {
         "name": "project_gateway",
         "config": {"agentCoreGateway": {"gatewayArn": ""}},
     },
-    "artifact-share": {
-        # knowledge base와 동일 Gateway (artifact-share Runtime target)
-        "type": "agentcore_gateway",
-        "name": "project_gateway",
-        "config": {"agentCoreGateway": {"gatewayArn": ""}},
-    },
     "browser-use": {
         "type": "agentcore_browser",
         "name": "browser",
@@ -601,22 +595,23 @@ HARNESS_MCP_CATALOG = {
 |---------|--------|------|
 | `websearch` | `remote_mcp` | Exa 공개 MCP URL |
 | `aws_documentation` | `remote_mcp` | AWS Knowledge MCP URL |
-| `knowledge base` / `artifact-share` | `agentcore_gateway` | 라벨만 다르고 **동일** `project_gateway` (ARN은 `config.json`의 `agentcore_gateway_arn`) |
+| `knowledge base` | `agentcore_gateway` | `project_gateway` (ARN은 `config.json`의 `agentcore_gateway_arn`) |
 | `browser-use` | `agentcore_browser` | |
 | `code interpreter` | `agentcore_code_interpreter` | |
 
 `build_harness_tools(selected_labels)`가 위 카탈로그를 합쳐 `tools` 배열을 만듭니다.
-`knowledge base`와 `artifact-share`는 `_GATEWAY_MCP_LABELS`로 묶여 **하나의 프로젝트 IAM Gateway**(`_project_mcp_gateway_tool`)에만 연결됩니다.
+`knowledge base`는 `_GATEWAY_MCP_LABELS`로 **프로젝트 IAM Gateway**(`_project_mcp_gateway_tool`)에 연결됩니다.
 
-**기본 MCP**: `knowledge base` · `artifact-share`는 `BASE_MCP_SERVERS`로 UI 기본 선택·`favorite_tools.json`·매 호출의 `tools`에 **항상** 포함됩니다 (`share_artifact` / `retrieve`가 system prompt에 필수).
+**기본 MCP**: `knowledge base`는 `BASE_MCP_SERVERS`로 UI 기본 선택·`favorite_tools.json`·매 호출의 `tools`에 **항상** 포함됩니다 (`retrieve`가 system prompt에 필수).  
+산출물 공유는 MCP가 아니라 **doc-sharing skill**입니다.
 
 ### CreateHarness 기본 tools vs Invoke 시 override
 
-`installer`가 Harness를 만들 때 기본 tools(exa, aws_knowledge, browser, code, `project_gateway`)를 넣습니다. UI에서 고른 목록은 **호출마다** `InvokeHarness(tools=…)`로 override되지만, Gateway MCP(`knowledge base` / `artifact-share`)는 항상 병합됩니다.
+`installer`가 Harness를 만들 때 기본 tools(exa, aws_knowledge, browser, code, `project_gateway`)를 넣습니다. UI에서 고른 목록은 **호출마다** `InvokeHarness(tools=…)`로 override되지만, Gateway MCP(`knowledge base`)는 항상 병합됩니다.
 
-### Knowledge Base + Artifact Share MCP: Runtime + Gateway (IAM)
+### Knowledge Base MCP: Runtime + Gateway (IAM)
 
-`MCP/knowledge-base/`와 `MCP/artifact-share/`를 각각 **AgentCore Runtime(MCP protocol, IAM 인증)** 으로 배포합니다. Harness가 Runtime을 **직접 `remote_mcp`로 연결할 수 없어** 프로젝트 공용 **AgentCore Gateway**(`name={projectName}`, 예: `harness-work`)를 두고, 두 Runtime을 Gateway **target**으로 붙인 뒤 Harness에는 `agentcore_gateway` 도구로 연결합니다.
+`MCP/knowledge-base/`를 **AgentCore Runtime(MCP protocol, IAM 인증)** 으로 배포합니다. Harness가 Runtime을 **직접 `remote_mcp`로 연결할 수 없어** 프로젝트 공용 **AgentCore Gateway**(`name={projectName}`, 예: `harness-work`)를 두고, KB Runtime을 Gateway **target**으로 붙인 뒤 Harness에는 `agentcore_gateway` 도구로 연결합니다.
 
 ### AgentCore Gateway를 사용하는 이유
 
@@ -663,15 +658,27 @@ Gateway는 SigV4 **중계기**입니다.
 | 리소스 | 이름 예 | 역할 |
 |--------|---------|------|
 | KB ECR + Runtime | `knowledge_base_of_harness_work` | `MCP/knowledge-base`, `retrieve` |
-| Artifact Share ECR + Runtime | `artifact_share_of_harness_work` | `MCP/artifact-share`, `share_artifact` |
 | Gateway | `harness-work` | 프로젝트 공용 inbound `AWS_IAM` |
-| Gateway targets | `knowledge-base`, `artifact-share` | 각 Runtime MCP URL |
+| Gateway target | `knowledge-base` | KB Runtime MCP URL |
 
-`application/config.json` 주요 키: `knowledge_base_mcp_*`, `artifact_share_mcp_*`, `agentcore_gateway_arn` / `id` / `role`.
+`application/config.json` 주요 키: `knowledge_base_mcp_*`, `agentcore_gateway_arn` / `id` / `role`.
 
-산출물 공유는 예전 `skills/s3-sharing` 대신 **artifact-share MCP의 `share_artifact`** 를 사용합니다. 세션 파일은 `/mnt/workspace/{actor_id}/artifacts`에 두고, MCP가 S3 Files sync 재시도 후 CloudFront URL을 반환합니다.
+### doc-sharing skill
 
-관련 코드: `MCP/knowledge-base/`, `MCP/artifact-share/`, `installer.py` (`deploy_knowledge_base_mcp`, `deploy_artifact_share_mcp`, `ensure_project_agentcore_gateway`), `application/mcp_config.py`.
+산출물 공유는 예전 `skills/s3-sharing` · **artifact-share MCP** 대신 **`skills/doc-sharing`** 을 사용합니다.
+
+```
+ARTIFACTS_DIR 로컬 파일
+  → s3://{S3_BUCKET}/artifacts/{actor_id}/…
+  → {SHARING_URL}/artifacts/{actor_id}/…
+```
+
+- Code Interpreter에서 `share_artifact.py`로 로컬 파일을 PutObject (MCP hop 없음)
+- Harness env: `S3_BUCKET`, `SHARING_URL` (`sharing_url` CloudFront)
+- 기본 favorite skill에 `doc-sharing` 포함
+- system prompt: 산출물이 있으면 최종 답변 전 반드시 CloudFront URL을 만들도록 강제
+
+관련 코드: `skills/doc-sharing/`, `MCP/knowledge-base/`, `installer.py` (`deploy_knowledge_base_mcp`, `ensure_project_agentcore_gateway`, `prepare_doc_sharing_skill_config`), `application/mcp_config.py`, `application/agentcore_client.py`.
 
 ---
 
@@ -743,9 +750,10 @@ response = client.invoke_harness(**invoke_kwargs)
 | **한도** | `maxIterations=20`, `maxTokens=50000`, `timeoutSeconds=300` |
 | **네트워크** | `VPC` + private subnet + NAT |
 | **파일시스템** | S3 Files → `/mnt/workspace` |
-| **기본 tools** | exa, aws_knowledge, browser, code, **project_gateway** (`knowledge base` + `artifact-share` 항상 포함) |
-| **Skills** | CreateHarness 시 미설정 → Invoke 시 UI 선택으로 주입 |
-| **KB / Artifact MCP** | Runtime + 프로젝트 Gateway targets → `agentcore_gateway` |
+| **기본 tools** | exa, aws_knowledge, browser, code, **project_gateway** (`knowledge base` 항상 포함) |
+| **Skills** | CreateHarness 시 미설정 → Invoke 시 UI 선택으로 주입 (`doc-sharing` favorite 기본) |
+| **KB MCP** | Runtime + 프로젝트 Gateway target → `agentcore_gateway` |
+| **Artifact sharing** | `skills/doc-sharing` (S3 PutObject + CloudFront URL) |
 
 ---
 
@@ -822,7 +830,7 @@ flowchart LR
 | 도구 타입 | 설명 |
 |---|---|
 | `remote_mcp` | URL로 원격 MCP 연결 (SigV4 없음 → **IAM AgentCore Runtime MCP에는 사용 불가**) |
-| `agentcore_gateway` | Gateway ARN + IAM/OAuth (KB · artifact-share MCP는 이 경로) |
+| `agentcore_gateway` | Gateway ARN + IAM/OAuth (KB MCP는 이 경로) |
 | `agentcore_browser` | 관리형 브라우저 |
 | `agentcore_code_interpreter` | 샌드박스 코드 실행 |
 | `inline_function` | 클라이언트 사이드 / HITL |
@@ -902,7 +910,7 @@ flowchart LR
 | `add_user.py` | Cognito 추가 사용자 등록 |
 | `s3_files_vpc.py` | VPC / S3 Files / harness `environment` 빌더 |
 | `skills/` | 로컬 스킬 소스 (→ S3 `skills/` 또는 Git) |
-| `MCP/` | knowledge-base · artifact-share Runtime MCP 소스 |
+| `MCP/` | knowledge-base Runtime MCP 소스 |
 | `graph/` | 채팅 이력 → Knowledge Graph 파이프라인 (`run_pipeline.py`) |
 | `application/server.py` | FastAPI + React SPA (`application/web`) |
 | `application/api/` | 세션 · 설정 · 태스크 · SSE 채팅 · **graph** API |
@@ -1008,7 +1016,7 @@ Harness 호출은 model / tool / memory 등 단계별 **traces, logs, metrics를
 
 > Transaction Search가 계정에서 처음 활성화되면 ACTIVE까지 **최대 10–15분** 걸릴 수 있습니다.
 
-MCP Runtime(Knowledge Base / artifact-share) Dockerfile의 기존 OTEL은 그대로 유지되며, Harness 본체 Observability와는 별개입니다.
+MCP Runtime(Knowledge Base) Dockerfile의 기존 OTEL은 그대로 유지되며, Harness 본체 Observability와는 별개입니다.
 
 ---
 
