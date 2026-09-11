@@ -1633,7 +1633,7 @@ def _prune_removed_skills_from_s3(s3_bucket_name: str) -> int:
 
 
 def prepare_doc_sharing_skill_config(
-    s3_bucket_name: str, sharing_url: str = ""
+    s3_bucket_name: str, sharing_url: str = "", app_url: str = ""
 ) -> None:
     """Write skills/doc-sharing/config.json for Code Interpreter fallback."""
     skill_dir = os.path.join(SKILLS_DIR, "doc-sharing")
@@ -1641,15 +1641,21 @@ def prepare_doc_sharing_skill_config(
         logger.warning(f"doc-sharing skill dir missing: {skill_dir}")
         return
     url = (sharing_url or "").rstrip("/")
-    if not url:
+    ui = (app_url or "").rstrip("/")
+    if not url or not ui:
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                url = (json.load(f).get("sharing_url") or "").rstrip("/")
+                cfg = json.load(f)
+            if not url:
+                url = (cfg.get("sharing_url") or "").rstrip("/")
+            if not ui:
+                ui = (cfg.get("app_url") or "").rstrip("/")
         except Exception:
             pass
     payload = {
         "s3_bucket": s3_bucket_name,
         "sharing_url": url,
+        "app_url": ui,
         "region": region,
     }
     dest = os.path.join(skill_dir, "config.json")
@@ -1658,7 +1664,8 @@ def prepare_doc_sharing_skill_config(
         f.write("\n")
     logger.info(
         f"  doc-sharing config.json ready "
-        f"(bucket={s3_bucket_name}, sharing_url={url or '(none)'})"
+        f"(bucket={s3_bucket_name}, sharing_url={url or '(none)'}, "
+        f"app_url={ui or '(none)'})"
     )
 
 
@@ -2263,13 +2270,15 @@ BASE_SYSTEM_PROMPT = (
     "닉네임·표시 이름·추측 값으로 바꾸지 마세요.\n"
     "\n"
     "## Artifact sharing (REQUIRED) — doc-sharing skill\n"
-    "- ARTIFACTS_DIR에 PPT/PDF/DOCX/XLSX/PNG/CSV/HTML 등 결과 파일을 생성했다면, "
+    "- ARTIFACTS_DIR에 PPT/PDF/DOCX/XLSX/PNG/CSV/HTML/MD 등 결과 파일을 생성했다면, "
     "사용자에게 최종 답변하기 **전에** 반드시 **doc-sharing** skill의 "
     "share_artifact.py를 code 인터프리터로 실행하세요.\n"
     "- 로컬 경로(/mnt/workspace/..., ARTIFACTS_DIR)만 안내하는 것은 **금지**입니다. "
     "사용자는 그 경로에 접근할 수 없습니다.\n"
-    "- 스크립트가 반환한 CloudFront 공유 URL을 최종 답변에 **반드시** 포함하세요. "
+    "- 스크립트가 반환한 공유 URL을 최종 답변에 **반드시** 포함하세요. "
     "URL 없이 '생성 완료'만 말하면 실패입니다.\n"
+    "- Markdown(.md) / JSON(.json) / CSV(.csv)은 viewer_url이 있으면 viewer_url을 우선 안내하세요 "
+    "(앱 viewer). 그 외 파일은 CloudFront url을 안내하세요.\n"
     "- 파일이 여러 개면 파일마다 share_artifact.py를 각각 실행하세요.\n"
     "- 예: aws s3 sync s3://$S3_BUCKET/skills/doc-sharing/ /tmp/doc-sharing/ 후 "
     "python3 /tmp/doc-sharing/scripts/share_artifact.py "
@@ -2282,7 +2291,7 @@ BASE_SYSTEM_PROMPT = (
     "검색 등은 MCP 도구(retrieve 등)를 직접 호출한다.\n"
     "3. 코드 실행·파일 생성 시 반드시 ARTIFACTS_DIR(actor별 폴더) 아래에 산출물을 저장한다\n"
     "4. 결과 파일이 있으면 사용자 답변 전에 반드시 doc-sharing skill로 "
-    "CloudFront URL을 만들고 답변에 포함한다 (로컬 경로만 안내 금지)\n"
+    "공유 URL을 만들고 답변에 포함한다 (로컬 경로만 안내 금지; Markdown/JSON/CSV는 viewer_url 우선)\n"
     "5. 공유 URL을 포함한 최종 결과를 사용자에게 전달한다\n"
 )
 
@@ -2457,6 +2466,7 @@ def _harness_environment_variables(
     *,
     s3_bucket_name: str | None = None,
     sharing_url: str | None = None,
+    app_url: str | None = None,
     knowledge_base_id: str | None = None,
     data_source_id: str | None = None,
 ) -> Dict[str, str]:
@@ -2470,6 +2480,8 @@ def _harness_environment_variables(
         env["S3_BUCKET"] = bucket
     if sharing_url:
         env["SHARING_URL"] = sharing_url.rstrip("/")
+    if app_url:
+        env["APP_URL"] = app_url.rstrip("/")
     if knowledge_base_id:
         env["KNOWLEDGE_BASE_ID"] = knowledge_base_id
     if data_source_id:
@@ -2483,22 +2495,26 @@ def ensure_harness_sharing_env(
     sharing_url: str,
     knowledge_base_id: str | None = None,
     data_source_id: str | None = None,
+    app_url: str | None = None,
 ) -> None:
-    """Inject S3_BUCKET / SHARING_URL / KB ids for runtime skills (doc-sharing)."""
+    """Inject S3_BUCKET / SHARING_URL / APP_URL / KB ids for runtime skills."""
     if not harness_id or not s3_bucket_name:
         return
     url = (sharing_url or "").rstrip("/")
+    ui = (app_url or "").rstrip("/")
     if not url:
         logger.warning("  SHARING_URL empty; doc-sharing will fall back to console URLs")
     env_vars = _harness_environment_variables(
         s3_bucket_name=s3_bucket_name,
         sharing_url=url or None,
+        app_url=ui or None,
         knowledge_base_id=knowledge_base_id,
         data_source_id=data_source_id,
     )
     logger.info(
         f"  Updating harness env for doc-sharing/KB: "
         f"S3_BUCKET={s3_bucket_name}, SHARING_URL={url or '(none)'}, "
+        f"APP_URL={ui or '(none)'}, "
         f"KNOWLEDGE_BASE_ID={knowledge_base_id or '(none)'}"
     )
     update_harness_safe(
@@ -3629,6 +3645,25 @@ def main():
             alb_info = deployer.create_alb(vpc_info)
             ui_cloudfront_info = deployer.create_ui_cloudfront(
                 alb_info, origin_header_value
+            )
+            app_url = f"https://{ui_cloudfront_info.get('domain', '')}".rstrip("/")
+            prepare_doc_sharing_skill_config(s3_bucket_name, sharing_url, app_url)
+            try:
+                s3_client.upload_file(
+                    os.path.join(SKILLS_DIR, "doc-sharing", "config.json"),
+                    s3_bucket_name,
+                    f"{SKILLS_S3_PREFIX}/doc-sharing/config.json",
+                    ExtraArgs={"ContentType": "application/json"},
+                )
+            except Exception as e:
+                logger.warning(f"  doc-sharing config.json re-upload skipped: {e}")
+            ensure_harness_sharing_env(
+                harness_info["harness_id"],
+                s3_bucket_name,
+                sharing_url,
+                knowledge_base_id=knowledge_base_id,
+                data_source_id=data_source_id,
+                app_url=app_url,
             )
 
             app_environment = build_config_from_deployment_state(

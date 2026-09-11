@@ -60,16 +60,41 @@ function filterSupersededTextEvents(events: ToolEvent[], content: string): ToolE
   return events.filter((_, index) => !hidden.has(index));
 }
 
+/** Rewrite CloudFront/S3 artifact .md/.json links to the in-app viewer. */
+function resolveArtifactViewerHref(href: string | undefined): string | undefined {
+  if (!href) return href;
+  try {
+    const url = new URL(href, window.location.origin);
+    const match = url.pathname.match(
+      /\/artifacts\/[^/]+\/(.+\.(?:md|markdown|json|csv))$/i
+    );
+    if (!match) return href;
+    const rest = decodeURIComponent(match[1]);
+    if (!rest || rest.includes("..")) return href;
+    const encoded = rest
+      .split("/")
+      .filter(Boolean)
+      .map((part) => encodeURIComponent(part))
+      .join("/");
+    return `/api/artifacts/view/${encoded}`;
+  } catch {
+    return href;
+  }
+}
+
 function MarkdownText({ content }: { content: string }) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
-        a: ({ href, children, ...props }) => (
-          <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
-            {children}
-          </a>
-        ),
+        a: ({ href, children, ...props }) => {
+          const openHref = resolveArtifactViewerHref(href);
+          return (
+            <a href={openHref} target="_blank" rel="noopener noreferrer" {...props}>
+              {children}
+            </a>
+          );
+        },
       }}
     >
       {content}

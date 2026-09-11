@@ -124,6 +124,12 @@ def share_artifact(
         or cfg.get("sharing_url")
         or ""
     ).rstrip("/")
+    app_url = (
+        os.environ.get("APP_URL")
+        or os.environ.get("app_url")
+        or cfg.get("app_url")
+        or ""
+    ).rstrip("/")
     region = (
         region
         or os.environ.get("AWS_REGION")
@@ -148,11 +154,22 @@ def share_artifact(
     else:
         url = f"https://{bucket}.s3.{region}.amazonaws.com/{quote(dest_key, safe='/')}"
 
+    viewer_url = None
+    lower_rest = rest.lower()
+    if app_url and prefix == "artifacts" and (
+        lower_rest.endswith(".md")
+        or lower_rest.endswith(".markdown")
+        or lower_rest.endswith(".json")
+        or lower_rest.endswith(".csv")
+    ):
+        viewer_url = f"{app_url}/api/artifacts/view/{quote(rest, safe='/')}"
+
     return {
         "ok": True,
         "bucket": bucket,
         "key": dest_key,
         "url": url,
+        "viewer_url": viewer_url,
         "actor_id": actor,
         "local_path": path,
         "content_type": content_type,
