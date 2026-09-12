@@ -747,13 +747,30 @@ response = client.invoke_harness(**invoke_kwargs)
 | **systemPrompt** | 한국어 대화형 에이전트 안내 |
 | **Memory** | AgentCore Memory (`agentCoreMemoryConfiguration`) |
 | **대화 윈도우** | `sliding_window`, 최근 50 메시지 |
-| **한도** | `maxIterations=20`, `maxTokens=50000`, `timeoutSeconds=300` |
+| **한도** | `maxIterations=100`, `maxTokens=50000`, `timeoutSeconds=1800` (30분) |
 | **네트워크** | `VPC` + private subnet + NAT |
 | **파일시스템** | S3 Files → `/mnt/workspace` |
 | **기본 tools** | exa, aws_knowledge, browser, code, **project_gateway** (`knowledge base` 항상 포함) |
 | **Skills** | CreateHarness 시 미설정 → Invoke 시 UI 선택으로 주입 (`doc-sharing` favorite 기본) |
 | **KB MCP** | Runtime + 프로젝트 Gateway target → `agentcore_gateway` |
 | **Artifact sharing** | `skills/doc-sharing` (S3 PutObject + CloudFront URL) |
+
+### 실행 한도 (`maxIterations` / `timeoutSeconds`)
+
+| 파라미터 | 의미 | 기본값 |
+|----------|------|--------|
+| `maxIterations` | 에이전트 루프(max turns). tool 호출·응답 사이클 상한 | **100** |
+| `timeoutSeconds` | InvokeHarness 벽시계 타임아웃. 초과 시 `stopReason: timeout_exceeded` | **1800** (30분) |
+| `maxTokens` | 세션 출력 토큰 한도 | **50000** |
+
+`installer.py`의 `HARNESS_MAX_ITERATIONS` / `HARNESS_TIMEOUT_SECONDS` / `HARNESS_MAX_TOKENS`이 CreateHarness 기본값이며, 재설치 시 `ensure_harness_execution_limits()`로 기존 Harness에 동기화합니다.
+
+긴 스킬(예: `last30days`)이 타임아웃 전에 끝나도록, 관련 클라이언트 타임아웃도 맞춥니다.
+
+| 구성 | 값 | 이유 |
+|------|-----|------|
+| ECS `agentcore_client` boto3 `read_timeout` | **1860** | Harness 30분 스트림이 boto에 의해 끊기지 않도록 |
+| ALB `idle_timeout` | **1800** | 긴 tool 대기 중 SSE가 idle로 끊기지 않도록 |
 
 ---
 

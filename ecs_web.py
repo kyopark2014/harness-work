@@ -24,7 +24,8 @@ from botocore.exceptions import ClientError
 
 CUSTOM_HEADER_NAME = "X-Custom-Header"
 SSE_ORIGIN_READ_TIMEOUT_SECONDS = 60
-ALB_IDLE_TIMEOUT_SECONDS = 600
+# Keep ALB idle above harness timeoutSeconds (1800) so long tool waits don't drop SSE.
+ALB_IDLE_TIMEOUT_SECONDS = 1800
 # Managed CloudFront cache/origin policies
 CF_CACHE_POLICY_DISABLED = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
 CF_ORIGIN_REQUEST_ALL_VIEWER = "216adef6-5c7f-47e4-b989-5492eafa07d3"

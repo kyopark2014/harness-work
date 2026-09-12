@@ -831,8 +831,9 @@ def run_harness(
         import skill as skill_mod
         import mcp_config
 
+        # Must be >= harness timeoutSeconds (1800) so long tool loops are not cut by boto3.
         boto_config = Config(
-            read_timeout=300,
+            read_timeout=1860,
             connect_timeout=60,
             retries={"max_attempts": 0},
         )

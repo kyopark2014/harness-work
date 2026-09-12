@@ -2540,6 +2540,46 @@ def ensure_harness_system_prompt(harness_id: str) -> None:
     )
 
 
+# InvokeHarness wall-clock / agent-loop limits (CreateHarness + re-install sync).
+HARNESS_MAX_ITERATIONS = 100
+HARNESS_TIMEOUT_SECONDS = 1800  # 30 minutes
+HARNESS_MAX_TOKENS = 50000
+
+
+def ensure_harness_execution_limits(harness_id: str) -> None:
+    """Keep maxIterations / timeoutSeconds / maxTokens in sync on re-install."""
+    if not harness_id:
+        return
+    h = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
+    current_iters = h.get("maxIterations")
+    current_timeout = h.get("timeoutSeconds")
+    current_tokens = h.get("maxTokens")
+    if (
+        current_iters == HARNESS_MAX_ITERATIONS
+        and current_timeout == HARNESS_TIMEOUT_SECONDS
+        and current_tokens == HARNESS_MAX_TOKENS
+    ):
+        logger.info(
+            "  Harness execution limits already up to date "
+            f"(maxIterations={HARNESS_MAX_ITERATIONS}, "
+            f"timeoutSeconds={HARNESS_TIMEOUT_SECONDS}, "
+            f"maxTokens={HARNESS_MAX_TOKENS})"
+        )
+        return
+    logger.info(
+        f"  Updating harness execution limits (harnessId={harness_id}): "
+        f"maxIterations {current_iters!r} -> {HARNESS_MAX_ITERATIONS}, "
+        f"timeoutSeconds {current_timeout!r} -> {HARNESS_TIMEOUT_SECONDS}, "
+        f"maxTokens {current_tokens!r} -> {HARNESS_MAX_TOKENS}"
+    )
+    update_harness_safe(
+        harness_id,
+        maxIterations=HARNESS_MAX_ITERATIONS,
+        timeoutSeconds=HARNESS_TIMEOUT_SECONDS,
+        maxTokens=HARNESS_MAX_TOKENS,
+    )
+
+
 def _default_harness_tools(
     agentcore_gateway_arn: Optional[str] = None,
 ) -> List[Dict]:
@@ -2738,9 +2778,9 @@ def create_or_get_harness(
                     "strategy": "sliding_window",
                     "config": {"slidingWindow": {"messagesCount": 50}},
                 },
-                maxIterations=20,
-                maxTokens=50000,
-                timeoutSeconds=300,
+                maxIterations=HARNESS_MAX_ITERATIONS,
+                maxTokens=HARNESS_MAX_TOKENS,
+                timeoutSeconds=HARNESS_TIMEOUT_SECONDS,
                 environment=environment,
                 environmentVariables=_harness_environment_variables(),
                 tags={"Project": project_name, "Env": "dev"},
@@ -2766,6 +2806,7 @@ def create_or_get_harness(
     ensure_harness_memory_binding(harness_id, agent_memory_arn)
     ensure_harness_environment(harness_id, environment)
     ensure_harness_system_prompt(harness_id)
+    ensure_harness_execution_limits(harness_id)
     ensure_harness_tools(harness_id, agentcore_gateway_arn)
     harness_arn = wait_for_harness_ready(harness_id)
     harness_runtime_arn = get_harness_runtime_arn(harness_id)
