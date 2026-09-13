@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import re
 import logging
 import os
 from urllib.parse import quote
@@ -127,6 +128,21 @@ def _media_type_for_ext(ext: str) -> str:
     return "text/markdown; charset=utf-8"
 
 
+def _content_disposition(file_name: str, *, disposition: str = "attachment") -> str:
+    """Build latin-1-safe Content-Disposition (RFC 5987 filename*)."""
+    raw = (file_name or "download").replace('"', "").replace("\r", "").replace("\n", "")
+    ascii_name = raw.encode("ascii", "ignore").decode("ascii").strip(" .") or "download"
+    ascii_name = re.sub(r"_+", "_", ascii_name).strip("._") or "download"
+    _, ext = os.path.splitext(raw)
+    if ext and not ascii_name.lower().endswith(ext.lower()):
+        base = ascii_name if ascii_name != "download" else "download"
+        ascii_name = f"{base}{ext}"
+    return (
+        f'{disposition}; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(raw)}"
+    )
+
+
 def _topbar_actions(user_id: str, file_path: str, s3_key: str) -> str:
     rest = _normalize_artifact_rest(file_path, user_id)
     encoded_rest = quote(rest, safe="/")
@@ -181,9 +197,8 @@ def download_artifact(file_path: str, request: Request):
         )
 
     data = _read_s3_bytes(s3_key)
-    safe_name = file_name.replace('"', "")
     headers = {
-        "Content-Disposition": f'attachment; filename="{safe_name}"',
+        "Content-Disposition": _content_disposition(file_name),
         "Cache-Control": "no-store",
     }
     return Response(
