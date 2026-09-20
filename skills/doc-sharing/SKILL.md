@@ -21,13 +21,16 @@ Code Interpreter에서 만든 산출물을 **프로젝트 S3 + CloudFront**로 �
 | 변수 | 의미 |
 |------|------|
 | `S3_BUCKET` | harness-work 버킷 (예: `storage-for-harness-work-…`) |
-| `SHARING_URL` | harness-work CloudFront base (예: `https://d3z6idizzi5kk.cloudfront.net`) |
-| `APP_URL` | Web UI base (예: `https://d196….cloudfront.net`) — `.md`/`.json`/`.csv` viewer_url 생성에 사용 |
+| `SHARING_URL` | 통합 CloudFront base (UI와 동일, 예: `https://d196….cloudfront.net`) |
+| `APP_URL` | Web UI base (`SHARING_URL`과 동일) — `.md`/`.json`/`.csv` viewer_url 생성에 사용 |
 | `ARTIFACTS_DIR` | `/mnt/workspace/{actor_id}/artifacts` |
 | `ACTOR_ID` / `actor_id` | 시스템 프롬프트에 주어진 actor id |
 
 `skills/doc-sharing/config.json`이 있으면 env가 비어 있을 때 fallback으로 사용한다
 (`s3_bucket`, `sharing_url`, `app_url`, `region`).
+
+로그인 후 브라우저에 CloudFront Signed Cookies가 발급된다.
+`/artifacts/*` · `/docs/*` · `/images/*` 는 TrustedKeyGroups가 걸려 있어 **쿠키 없으면 403**이다.
 
 ## 워크플로우
 
@@ -59,7 +62,7 @@ python3 /tmp/doc-sharing/scripts/share_artifact.py \
   "ok": true,
   "bucket": "storage-for-harness-work-…",
   "key": "artifacts/<actor_id>/<file>.xlsx",
-  "url": "https://d3z6idizzi5kk.cloudfront.net/artifacts/<actor_id>/<file>.xlsx",
+  "url": "https://d196mfqdhg14u5.cloudfront.net/artifacts/<actor_id>/<file>.xlsx",
   "viewer_url": null,
   "actor_id": "<actor_id>"
 }
@@ -90,6 +93,6 @@ Markdown / JSON / CSV 예:
 ## 금지
 
 - MCP `share_artifact` / `artifact-share` 호출을 시도하지 말 것 (제거됨)
-- UI CloudFront(`app_url`)를 일반 파일 다운로드 URL로 쓰지 말 것 — 다운로드는 `SHARING_URL`
 - Markdown/JSON/CSV만 `viewer_url`(APP_URL)을 우선 사용
 - S3 콘솔 URL만 주고 CloudFront URL을 빼먹지 말 것 (`SHARING_URL`이 있으면 반드시 CF URL)
+- 로그인하지 않은 사용자에게 raw CloudFront URL만 주고 열리길 기대하지 말 것 (signed cookies 필요)

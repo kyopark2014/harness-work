@@ -1,7 +1,8 @@
 """ECS Fargate + ALB + ECR + CloudFront deployment for Harness Web UI.
 
-Modeled after strands-work installer ECS patterns, adapted for harness-work:
-- ALB-only CloudFront (separate from project S3 sharing CF)
+Modeled after agentic-work / strands-work installer ECS patterns:
+- Single CloudFront with ALB (default) + S3 (/images|/docs|/artifacts) origins
+- CloudFront signed cookies (TrustedKeyGroups) for S3 path behaviors
 - Cognito USER_PASSWORD_AUTH + HMAC-signed session cookies (via APP_CONFIG_JSON)
 - APP_CONFIG_JSON injected into the container via docker-entrypoint.sh
 """
@@ -29,6 +30,7 @@ ALB_IDLE_TIMEOUT_SECONDS = 1800
 # Managed CloudFront cache/origin policies
 CF_CACHE_POLICY_DISABLED = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
 CF_ORIGIN_REQUEST_ALL_VIEWER = "216adef6-5c7f-47e4-b989-5492eafa07d3"
+CLOUDFRONT_S3_SIGNED_PATHS = ("/images/*", "/docs/*", "/artifacts/*")
 
 ECS_SERVICE_LINKED_ROLE_NAME = "AWSServiceRoleForECS"
 DOCKER_MIN_FREE_MB = 2048
@@ -62,6 +64,8 @@ class EcsWebDeployer:
         self.s3files = boto3.client("s3files", region_name=region)
 
         self.origin_secret_name = f"{project_name}/cloudfront-alb-origin-header"
+        self.signing_secret_name = f"{project_name}/cloudfront-signing-key"
+        self._cf_signing_material: Optional[Dict[str, str]] = None
 
     # ------------------------------------------------------------------ IAM
     def _create_iam_role(
@@ -246,6 +250,10 @@ class EcsWebDeployer:
             f"arn:aws:secretsmanager:{self.region}:{self.account_id}:"
             f"secret:{self.project_name}/session-signing-key*"
         )
+        signing_secret_arn = (
+            f"arn:aws:secretsmanager:{self.region}:{self.account_id}:"
+            f"secret:{self.project_name}/cloudfront-signing-key*"
+        )
         self._attach_inline_policy(
             task_role_name,
             f"ecs-task-session-secret-for-{self.project_name}",
@@ -253,13 +261,13 @@ class EcsWebDeployer:
                 "Version": "2012-10-17",
                 "Statement": [
                     {
-                        "Sid": "ReadSessionSigningKey",
+                        "Sid": "ReadSessionAndCloudFrontSigningKeys",
                         "Effect": "Allow",
                         "Action": [
                             "secretsmanager:GetSecretValue",
                             "secretsmanager:DescribeSecret",
                         ],
-                        "Resource": [session_secret_arn],
+                        "Resource": [session_secret_arn, signing_secret_arn],
                     }
                 ],
             },
@@ -516,6 +524,21 @@ class EcsWebDeployer:
     def _ui_cloudfront_comment(self) -> str:
         return f"CloudFront-for-{self.project_name}"
 
+    def _legacy_s3_cloudfront_comment(self) -> str:
+        return f"CloudFront-S3-for-{self.project_name}"
+
+    def _s3_prefixes_for_cloudfront(self) -> List[str]:
+        prefixes: List[str] = []
+        for pattern in CLOUDFRONT_S3_SIGNED_PATHS:
+            trimmed = pattern.strip("/")
+            if trimmed.endswith("/*"):
+                trimmed = trimmed[:-2]
+            elif trimmed.endswith("*"):
+                trimmed = trimmed[:-1].rstrip("/")
+            if trimmed:
+                prefixes.append(trimmed)
+        return prefixes
+
     def _find_ui_cloudfront(self) -> Optional[Dict]:
         comment = self._ui_cloudfront_comment()
         marker = None
@@ -532,22 +555,462 @@ class EcsWebDeployer:
                 return None
             marker = listing.get("NextMarker")
 
+    def _generate_cloudfront_rsa_keypair(self) -> Tuple[str, str]:
+        try:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+
+            private_key = rsa.generate_private_key(
+                public_exponent=65537, key_size=2048
+            )
+            private_pem = private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ).decode("utf-8")
+            public_pem = (
+                private_key.public_key()
+                .public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                .decode("utf-8")
+            )
+            return private_pem, public_pem
+        except ImportError:
+            pass
+
+        openssl = shutil.which("openssl")
+        if not openssl:
+            raise RuntimeError(
+                "CloudFront signing key generation requires the 'cryptography' "
+                "package or the 'openssl' CLI. Install with: pip install cryptography"
+            )
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="cf-signing-") as tmp:
+            key_path = os.path.join(tmp, "private.pem")
+            pub_path = os.path.join(tmp, "public.pem")
+            gen = subprocess.run(
+                [openssl, "genrsa", "-out", key_path, "2048"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if gen.returncode != 0:
+                raise RuntimeError(
+                    f"openssl genrsa failed: {gen.stderr.strip()}"
+                )
+            pub = subprocess.run(
+                [openssl, "rsa", "-in", key_path, "-pubout", "-out", pub_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if pub.returncode != 0:
+                raise RuntimeError(
+                    f"openssl rsa -pubout failed: {pub.stderr.strip()}"
+                )
+            with open(key_path, "r", encoding="utf-8") as f:
+                private_pem = f.read()
+            with open(pub_path, "r", encoding="utf-8") as f:
+                public_pem = f.read()
+            return private_pem, public_pem
+
+    def _find_cloudfront_public_key_id(self, name: str) -> Optional[str]:
+        marker = None
+        while True:
+            kwargs: Dict = {"MaxItems": "100"}
+            if marker:
+                kwargs["Marker"] = marker
+            response = self.cloudfront.list_public_keys(**kwargs)
+            listing = response.get("PublicKeyList") or {}
+            for item in listing.get("Items") or []:
+                if item.get("Name") == name:
+                    return item.get("Id")
+            if not listing.get("IsTruncated"):
+                return None
+            marker = listing.get("NextMarker")
+
+    def _find_cloudfront_key_group_id(self, name: str) -> Optional[str]:
+        marker = None
+        while True:
+            kwargs: Dict = {"MaxItems": "100"}
+            if marker:
+                kwargs["Marker"] = marker
+            response = self.cloudfront.list_key_groups(**kwargs)
+            listing = response.get("KeyGroupList") or {}
+            for summary in listing.get("Items") or []:
+                kg = summary.get("KeyGroup") or summary
+                config = kg.get("KeyGroupConfig") or {}
+                if config.get("Name") == name or kg.get("Name") == name:
+                    return kg.get("Id")
+            if not listing.get("IsTruncated"):
+                return None
+            marker = listing.get("NextMarker")
+
+    def get_or_create_cloudfront_signing_material(
+        self, *, rotate: bool = False
+    ) -> Dict[str, str]:
+        if self._cf_signing_material and not rotate:
+            return self._cf_signing_material
+
+        secret_name = self.signing_secret_name
+        public_key_name = f"{self.project_name}-signing-key"
+        key_group_name = f"{self.project_name}-signing-key-group"
+
+        material: Dict[str, str] = {}
+        try:
+            existing = self.secrets.get_secret_value(SecretId=secret_name)
+            raw = (existing.get("SecretString") or "").strip()
+            if raw.startswith("{"):
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    material = {
+                        "private_key_pem": (parsed.get("private_key_pem") or "").strip(),
+                        "public_key_pem": (parsed.get("public_key_pem") or "").strip(),
+                        "public_key_id": (parsed.get("public_key_id") or "").strip(),
+                        "key_group_id": (parsed.get("key_group_id") or "").strip(),
+                    }
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                raise
+
+        if (
+            rotate
+            or not material.get("private_key_pem")
+            or not material.get("public_key_pem")
+        ):
+            private_pem, public_pem = self._generate_cloudfront_rsa_keypair()
+            material["private_key_pem"] = private_pem
+            material["public_key_pem"] = public_pem
+            material["public_key_id"] = ""
+            material["key_group_id"] = ""
+            self.logger.info("  Generated new CloudFront RSA signing key pair")
+
+        public_key_id = material.get("public_key_id") or ""
+        if not public_key_id:
+            public_key_id = self._find_cloudfront_public_key_id(public_key_name) or ""
+        if not public_key_id:
+            response = self.cloudfront.create_public_key(
+                PublicKeyConfig={
+                    "CallerReference": f"{self.project_name}-cf-pk-{int(time.time())}",
+                    "Name": public_key_name,
+                    "EncodedKey": material["public_key_pem"],
+                    "Comment": f"Signed cookies public key for {self.project_name}",
+                }
+            )
+            public_key_id = response["PublicKey"]["Id"]
+            self.logger.info(f"  ✓ Created CloudFront public key: {public_key_id}")
+        else:
+            self.logger.info(f"  ✓ Reusing CloudFront public key: {public_key_id}")
+        material["public_key_id"] = public_key_id
+
+        key_group_id = material.get("key_group_id") or ""
+        if not key_group_id:
+            key_group_id = self._find_cloudfront_key_group_id(key_group_name) or ""
+        if not key_group_id:
+            response = self.cloudfront.create_key_group(
+                KeyGroupConfig={
+                    "Name": key_group_name,
+                    "Items": [public_key_id],
+                    "Comment": f"Signed cookies key group for {self.project_name}",
+                }
+            )
+            key_group_id = response["KeyGroup"]["Id"]
+            self.logger.info(f"  ✓ Created CloudFront key group: {key_group_id}")
+        else:
+            try:
+                kg = self.cloudfront.get_key_group(Id=key_group_id)
+                etag = kg["ETag"]
+                config = kg["KeyGroup"]["KeyGroupConfig"]
+                items = list(config.get("Items") or [])
+                if public_key_id not in items:
+                    config["Items"] = [public_key_id]
+                    self.cloudfront.update_key_group(
+                        Id=key_group_id,
+                        KeyGroupConfig=config,
+                        IfMatch=etag,
+                    )
+                    self.logger.info(
+                        f"  ✓ Updated CloudFront key group items: {key_group_id}"
+                    )
+                else:
+                    self.logger.info(
+                        f"  ✓ Reusing CloudFront key group: {key_group_id}"
+                    )
+            except ClientError as e:
+                self.logger.warning(f"  Could not verify key group {key_group_id}: {e}")
+        material["key_group_id"] = key_group_id
+
+        secret_body = json.dumps(
+            {
+                "private_key_pem": material["private_key_pem"],
+                "public_key_pem": material["public_key_pem"],
+                "public_key_id": material["public_key_id"],
+                "key_group_id": material["key_group_id"],
+            }
+        )
+        try:
+            self.secrets.put_secret_value(
+                SecretId=secret_name, SecretString=secret_body
+            )
+            self.logger.info(f"  ✓ Updated CloudFront signing secret: {secret_name}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                raise
+            self.secrets.create_secret(
+                Name=secret_name,
+                Description=(
+                    f"CloudFront signed-cookie RSA key material for {self.project_name}"
+                ),
+                SecretString=secret_body,
+                Tags=[
+                    {"Key": "Name", "Value": secret_name},
+                    {"Key": "Project", "Value": self.project_name},
+                ],
+            )
+            self.logger.info(f"  ✓ Created CloudFront signing secret: {secret_name}")
+
+        self._cf_signing_material = material
+        return material
+
+    def _ensure_oai_and_bucket_policy(self, s3_bucket_name: str) -> str:
+        oai_cmt = f"OAI for {self.project_name}"
+        oai_id = None
+        oai_list = self.cloudfront.list_cloud_front_origin_access_identities()
+        for oai in oai_list.get("CloudFrontOriginAccessIdentityList", {}).get(
+            "Items", []
+        ):
+            if oai_cmt in oai.get("Comment", ""):
+                oai_id = oai["Id"]
+                self.logger.info(f"  Using existing Origin Access Identity: {oai_id}")
+                break
+        if not oai_id:
+            oai_response = self.cloudfront.create_cloud_front_origin_access_identity(
+                CloudFrontOriginAccessIdentityConfig={
+                    "CallerReference": f"{self.project_name}-s3-oai-{int(time.time())}",
+                    "Comment": oai_cmt,
+                }
+            )
+            oai_id = oai_response["CloudFrontOriginAccessIdentity"]["Id"]
+            self.logger.info(f"  Created Origin Access Identity: {oai_id}")
+
+        resources = [
+            f"arn:aws:s3:::{s3_bucket_name}/{prefix}/*"
+            for prefix in self._s3_prefixes_for_cloudfront()
+        ]
+        bucket_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "AllowCloudFrontAccess",
+                    "Effect": "Allow",
+                    "Principal": {
+                        "AWS": (
+                            f"arn:aws:iam::cloudfront:user/"
+                            f"CloudFront Origin Access Identity {oai_id}"
+                        )
+                    },
+                    "Action": "s3:GetObject",
+                    "Resource": resources,
+                }
+            ],
+        }
+        time.sleep(5)
+        s3 = boto3.client("s3", region_name=self.region)
+        s3.put_bucket_policy(Bucket=s3_bucket_name, Policy=json.dumps(bucket_policy))
+        self.logger.info(
+            "  ✓ S3 bucket policy: OAI GetObject limited to %s",
+            ", ".join(self._s3_prefixes_for_cloudfront()),
+        )
+        return oai_id
+
+    def _s3_cache_behavior(
+        self, path_pattern: str, s3_origin_id: str, key_group_id: str
+    ) -> Dict[str, object]:
+        behavior: Dict[str, object] = {
+            "PathPattern": path_pattern,
+            "TargetOriginId": s3_origin_id,
+            "ViewerProtocolPolicy": "redirect-to-https",
+            "AllowedMethods": {
+                "Quantity": 2,
+                "Items": ["GET", "HEAD"],
+                "CachedMethods": {"Quantity": 2, "Items": ["GET", "HEAD"]},
+            },
+            "CachePolicyId": CF_CACHE_POLICY_DISABLED,
+            "Compress": True,
+            # Required on UpdateDistribution when merging into an existing config.
+            "SmoothStreaming": False,
+            "FieldLevelEncryptionId": "",
+            "LambdaFunctionAssociations": {"Quantity": 0, "Items": []},
+            "TrustedSigners": {"Enabled": False, "Quantity": 0},
+        }
+        if key_group_id:
+            behavior["TrustedKeyGroups"] = {
+                "Enabled": True,
+                "Quantity": 1,
+                "Items": [key_group_id],
+            }
+        else:
+            behavior["TrustedKeyGroups"] = {"Enabled": False, "Quantity": 0}
+        return behavior
+
+    def _normalize_behavior_for_update(self, behavior: Dict) -> Dict:
+        """Ensure required CloudFront UpdateDistribution fields are present."""
+        if "SmoothStreaming" not in behavior:
+            behavior["SmoothStreaming"] = False
+        if "FieldLevelEncryptionId" not in behavior:
+            behavior["FieldLevelEncryptionId"] = ""
+        if "LambdaFunctionAssociations" not in behavior:
+            behavior["LambdaFunctionAssociations"] = {"Quantity": 0, "Items": []}
+        if "TrustedSigners" not in behavior:
+            behavior["TrustedSigners"] = {"Enabled": False, "Quantity": 0}
+        if "TrustedKeyGroups" not in behavior:
+            behavior["TrustedKeyGroups"] = {"Enabled": False, "Quantity": 0}
+        return behavior
+
+    def _behavior_has_trusted_key_group(
+        self, behavior: Dict, key_group_id: str
+    ) -> bool:
+        tkg = behavior.get("TrustedKeyGroups") or {}
+        if not tkg.get("Enabled"):
+            return False
+        return key_group_id in (tkg.get("Items") or [])
+
+    def _ensure_s3_origin_and_behaviors(
+        self,
+        dist_id: str,
+        s3_bucket_name: str,
+        oai_id: str,
+        key_group_id: str,
+    ) -> None:
+        cfg_resp = self.cloudfront.get_distribution_config(Id=dist_id)
+        etag = cfg_resp["ETag"]
+        cfg = cfg_resp["DistributionConfig"]
+        s3_origin_id = f"s3-{self.project_name}"
+        s3_domain = f"{s3_bucket_name}.s3.{self.region}.amazonaws.com"
+        changed = False
+
+        origins = list((cfg.get("Origins") or {}).get("Items") or [])
+        by_id = {o.get("Id"): o for o in origins}
+        if s3_origin_id not in by_id:
+            origins.append(
+                {
+                    "Id": s3_origin_id,
+                    "DomainName": s3_domain,
+                    "S3OriginConfig": {
+                        "OriginAccessIdentity": (
+                            f"origin-access-identity/cloudfront/{oai_id}"
+                        )
+                    },
+                    "OriginPath": "",
+                    "CustomHeaders": {"Quantity": 0, "Items": []},
+                }
+            )
+            changed = True
+            self.logger.info(f"  + CloudFront S3 origin: {s3_origin_id}")
+        else:
+            origin = by_id[s3_origin_id]
+            if origin.get("DomainName") != s3_domain:
+                origin["DomainName"] = s3_domain
+                changed = True
+            desired_oai = f"origin-access-identity/cloudfront/{oai_id}"
+            s3cfg = origin.setdefault("S3OriginConfig", {})
+            if s3cfg.get("OriginAccessIdentity") != desired_oai:
+                s3cfg["OriginAccessIdentity"] = desired_oai
+                changed = True
+
+        cfg["Origins"] = {"Quantity": len(origins), "Items": origins}
+
+        cache_behaviors = cfg.get("CacheBehaviors") or {"Quantity": 0, "Items": []}
+        items = list(cache_behaviors.get("Items") or [])
+        by_path = {item.get("PathPattern"): item for item in items}
+        for path_pattern in CLOUDFRONT_S3_SIGNED_PATHS:
+            existing = by_path.get(path_pattern)
+            if existing is None:
+                items.append(
+                    self._s3_cache_behavior(path_pattern, s3_origin_id, key_group_id)
+                )
+                changed = True
+                self.logger.info(f"  + CloudFront behavior {path_pattern} (signed)")
+                continue
+            if existing.get("TargetOriginId") != s3_origin_id:
+                existing["TargetOriginId"] = s3_origin_id
+                changed = True
+            if not self._behavior_has_trusted_key_group(existing, key_group_id):
+                existing["TrustedKeyGroups"] = {
+                    "Enabled": True,
+                    "Quantity": 1,
+                    "Items": [key_group_id],
+                }
+                existing["TrustedSigners"] = {"Enabled": False, "Quantity": 0}
+                changed = True
+                self.logger.info(
+                    f"  ✓ CloudFront behavior {path_pattern}: TrustedKeyGroups enabled"
+                )
+
+        # Normalize all behaviors + default before UpdateDistribution.
+        default_behavior = cfg.get("DefaultCacheBehavior") or {}
+        self._normalize_behavior_for_update(default_behavior)
+        cfg["DefaultCacheBehavior"] = default_behavior
+        items = [self._normalize_behavior_for_update(item) for item in items]
+
+        if changed:
+            cfg["CacheBehaviors"] = {"Quantity": len(items), "Items": items}
+            self.cloudfront.update_distribution(
+                Id=dist_id, IfMatch=etag, DistributionConfig=cfg
+            )
+            self.logger.info("  ✓ Updated CloudFront for S3 origin / signed cookies")
+            self.logger.warning(
+                "  Note: CloudFront changes may take 15–20 minutes to deploy"
+            )
+        else:
+            self.logger.info(
+                "  ✓ CloudFront S3 behaviors already require signed cookies"
+            )
+
     def create_ui_cloudfront(
         self, alb_info: Dict, origin_header_value: str
     ) -> Dict[str, str]:
-        self.logger.info("Creating CloudFront distribution for Web UI (ALB origin)")
+        """Create/reuse hybrid CloudFront (ALB default + S3 path behaviors)."""
+        self.logger.info(
+            "Creating CloudFront distribution (ALB + S3 hybrid, signed cookies)"
+        )
+        s3_bucket_name = self.bucket_name
+        signing = self.get_or_create_cloudfront_signing_material(rotate=False)
+        key_group_id = signing.get("key_group_id") or ""
+        oai_id = self._ensure_oai_and_bucket_policy(s3_bucket_name)
+
         existing = self._find_ui_cloudfront()
         if existing:
             dist_id = existing["Id"]
             domain = existing["DomainName"]
-            self.logger.info(f"  Reusing UI CloudFront: {domain} ({dist_id})")
+            self.logger.info(f"  Reusing CloudFront: {domain} ({dist_id})")
+            if not existing.get("Enabled"):
+                cfg_resp = self.cloudfront.get_distribution_config(Id=dist_id)
+                cfg = cfg_resp["DistributionConfig"]
+                cfg["Enabled"] = True
+                self.cloudfront.update_distribution(
+                    Id=dist_id,
+                    IfMatch=cfg_resp["ETag"],
+                    DistributionConfig=cfg,
+                )
+                self.logger.info(f"  ✓ Enabled CloudFront: {domain}")
             self._ensure_cf_alb_origin(dist_id, alb_info["dns"], origin_header_value)
+            self._ensure_s3_origin_and_behaviors(
+                dist_id, s3_bucket_name, oai_id, key_group_id
+            )
             return {
                 "id": dist_id,
                 "domain": domain,
                 "arn": existing.get("ARN", ""),
+                "key_pair_id": signing.get("public_key_id") or "",
+                "key_group_id": key_group_id,
             }
 
+        alb_origin_id = f"alb-{self.project_name}"
+        s3_origin_id = f"s3-{self.project_name}"
         caller = f"{self.project_name}-ui-{int(time.time())}"
         config = {
             "CallerReference": caller,
@@ -555,10 +1018,10 @@ class EcsWebDeployer:
             "Enabled": True,
             "DefaultRootObject": "",
             "Origins": {
-                "Quantity": 1,
+                "Quantity": 2,
                 "Items": [
                     {
-                        "Id": f"alb-{self.project_name}",
+                        "Id": alb_origin_id,
                         "DomainName": alb_info["dns"],
                         "OriginPath": "",
                         "CustomHeaders": {
@@ -581,11 +1044,24 @@ class EcsWebDeployer:
                             "OriginReadTimeout": SSE_ORIGIN_READ_TIMEOUT_SECONDS,
                             "OriginKeepaliveTimeout": 60,
                         },
-                    }
+                    },
+                    {
+                        "Id": s3_origin_id,
+                        "DomainName": (
+                            f"{s3_bucket_name}.s3.{self.region}.amazonaws.com"
+                        ),
+                        "S3OriginConfig": {
+                            "OriginAccessIdentity": (
+                                f"origin-access-identity/cloudfront/{oai_id}"
+                            )
+                        },
+                        "OriginPath": "",
+                        "CustomHeaders": {"Quantity": 0, "Items": []},
+                    },
                 ],
             },
             "DefaultCacheBehavior": {
-                "TargetOriginId": f"alb-{self.project_name}",
+                "TargetOriginId": alb_origin_id,
                 "ViewerProtocolPolicy": "redirect-to-https",
                 "AllowedMethods": {
                     "Quantity": 7,
@@ -604,6 +1080,13 @@ class EcsWebDeployer:
                 "CachePolicyId": CF_CACHE_POLICY_DISABLED,
                 "OriginRequestPolicyId": CF_ORIGIN_REQUEST_ALL_VIEWER,
             },
+            "CacheBehaviors": {
+                "Quantity": len(CLOUDFRONT_S3_SIGNED_PATHS),
+                "Items": [
+                    self._s3_cache_behavior(path, s3_origin_id, key_group_id)
+                    for path in CLOUDFRONT_S3_SIGNED_PATHS
+                ],
+            },
             "PriceClass": "PriceClass_All",
             "ViewerCertificate": {"CloudFrontDefaultCertificate": True},
             "HttpVersion": "http2",
@@ -611,12 +1094,50 @@ class EcsWebDeployer:
         }
         resp = self.cloudfront.create_distribution(DistributionConfig=config)
         dist = resp["Distribution"]
-        self.logger.info(f"✓ UI CloudFront created: {dist['DomainName']}")
+        self.logger.info(
+            f"✓ CloudFront created (ALB + S3): {dist['DomainName']}"
+        )
+        self.logger.info(
+            "  /images/*, /docs/*, /artifacts/* → S3 (signed cookies required)"
+        )
         return {
             "id": dist["Id"],
             "domain": dist["DomainName"],
             "arn": dist.get("ARN", ""),
+            "key_pair_id": signing.get("public_key_id") or "",
+            "key_group_id": key_group_id,
         }
+
+    def disable_legacy_s3_only_cloudfront(self) -> None:
+        """Disable old CloudFront-S3-for-* distributions after hybrid migration."""
+        comment = self._legacy_s3_cloudfront_comment()
+        self.logger.info(f"Disabling legacy S3-only CloudFront ({comment})")
+        marker = None
+        while True:
+            kwargs: Dict = {}
+            if marker:
+                kwargs["Marker"] = marker
+            resp = self.cloudfront.list_distributions(**kwargs)
+            listing = resp.get("DistributionList") or {}
+            for item in listing.get("Items") or []:
+                if comment not in (item.get("Comment") or ""):
+                    continue
+                dist_id = item["Id"]
+                if not item.get("Enabled", True):
+                    self.logger.info(f"  Already disabled: {dist_id}")
+                    continue
+                cfg_resp = self.cloudfront.get_distribution_config(Id=dist_id)
+                cfg = cfg_resp["DistributionConfig"]
+                cfg["Enabled"] = False
+                self.cloudfront.update_distribution(
+                    Id=dist_id,
+                    IfMatch=cfg_resp["ETag"],
+                    DistributionConfig=cfg,
+                )
+                self.logger.info(f"  ✓ Disabled legacy S3 CloudFront: {dist_id}")
+            if not listing.get("IsTruncated"):
+                break
+            marker = listing.get("NextMarker")
 
     def _ensure_cf_alb_origin(
         self, dist_id: str, alb_dns: str, origin_header_value: str
@@ -632,7 +1153,9 @@ class EcsWebDeployer:
                 if origin.get("Id") != origin_id and origin.get("DomainName") != alb_dns:
                     continue
                 origin["DomainName"] = alb_dns
-                headers = origin.setdefault("CustomHeaders", {"Quantity": 0, "Items": []})
+                headers = origin.setdefault(
+                    "CustomHeaders", {"Quantity": 0, "Items": []}
+                )
                 items = headers.get("Items") or []
                 found = False
                 for h in items:
@@ -660,9 +1183,9 @@ class EcsWebDeployer:
                 self.cloudfront.update_distribution(
                     Id=dist_id, IfMatch=etag, DistributionConfig=cfg
                 )
-                self.logger.info("  ✓ Updated UI CloudFront ALB origin / header")
+                self.logger.info("  ✓ Updated CloudFront ALB origin / header")
         except ClientError as e:
-            self.logger.warning(f"  Could not refresh UI CloudFront origin: {e}")
+            self.logger.warning(f"  Could not refresh CloudFront ALB origin: {e}")
 
     # ------------------------------------------------------------------- ECR
     def create_ecr_repository(self) -> str:
@@ -1236,6 +1759,12 @@ class EcsWebDeployer:
         environment = [
             {"name": "APP_CONFIG_JSON", "value": json.dumps(app_environment)},
         ]
+        signing = self.get_or_create_cloudfront_signing_material(rotate=False)
+        key_pair_id = (signing.get("public_key_id") or "").strip()
+        if key_pair_id:
+            environment.append(
+                {"name": "CLOUDFRONT_KEY_PAIR_ID", "value": key_pair_id}
+            )
         container: Dict[str, object] = {
             "name": container_name,
             "image": image_uri,
@@ -1615,12 +2144,15 @@ def delete_alb_origin_header_secret(
     project_name: str, region: str, logger
 ) -> None:
     sm = boto3.client("secretsmanager", region_name=region)
-    name = f"{project_name}/cloudfront-alb-origin-header"
-    try:
-        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
-        logger.info(f"  ✓ Deleted secret: {name}")
-    except ClientError as e:
-        logger.info(f"  Secret skip: {e}")
+    for name in (
+        f"{project_name}/cloudfront-alb-origin-header",
+        f"{project_name}/cloudfront-signing-key",
+    ):
+        try:
+            sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+            logger.info(f"  ✓ Deleted secret: {name}")
+        except ClientError as e:
+            logger.info(f"  Secret skip ({name}): {e}")
 
 
 def delete_ecs_iam_roles(project_name: str, region: str, logger) -> None:

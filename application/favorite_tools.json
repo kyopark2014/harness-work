@@ -12,6 +12,7 @@
     "skill-creator",
     "system-monitor",
     "pdf",
-    "xlsx"
+    "xlsx",
+    "use-vault"
   ]
 }

@@ -74,7 +74,7 @@ flowchart TB
 
 | 단계 | 경로 |
 |------|------|
-| 프로비저닝 | `installer.py` → **Cognito User Pool** · S3 · skills · IAM · Memory · **S3 Vectors KB** · **KB MCP Runtime + IAM Gateway** · VPC · S3 Files · `CreateHarness` · **ECR/ECS/ALB/UI CloudFront** → `application/config.json` |
+| 프로비저닝 | `installer.py` → **Cognito User Pool** · S3 · skills · IAM · Memory · **S3 Vectors KB** · **KB MCP Runtime + IAM Gateway** · VPC · S3 Files · `CreateHarness` · **ECR/ECS/ALB/하이브리드 CloudFront(ALB+S3, signed cookies)** → `application/config.json` |
 | 호출 | React UI → Cognito 로그인 · Skill/MCP/모델 · **이미지 첨부** → SSE `/api/tasks/{id}/chat` → `run_harness` → `invoke_harness` |
 | 삭제 | `uninstaller.py` → Cognito · ECS/ALB/UI CF · Harness · MCP Gateway/Runtime · KB · S3 Vectors · S3 Files · VPC · Memory · IAM 정리 |
 
@@ -674,7 +674,7 @@ ARTIFACTS_DIR 로컬 파일
 ```
 
 - Code Interpreter에서 `share_artifact.py`로 로컬 파일을 PutObject (MCP hop 없음)
-- Harness env: `S3_BUCKET`, `SHARING_URL` (`sharing_url` CloudFront)
+- Harness env: `S3_BUCKET`, `SHARING_URL` (앱과 동일 CloudFront 도메인; `/artifacts` 등은 signed cookies)
 - 기본 favorite skill에 `doc-sharing` 포함
 - system prompt: 산출물이 있으면 최종 답변 전 반드시 CloudFront URL을 만들도록 강제
 
@@ -921,7 +921,7 @@ flowchart LR
 | 경로 | 역할 |
 |---|---|
 | `installer.py` | Cognito · S3 · skills · IAM · Memory · VPC · S3 Files · CreateHarness · **ECS Web UI** |
-| `ecs_web.py` | ECR · Docker 빌드 · ECS Fargate · ALB · UI CloudFront |
+| `ecs_web.py` | ECR · Docker 빌드 · ECS Fargate · ALB · 하이브리드 CloudFront(ALB+S3) · signed cookies |
 | `Dockerfile` / `docker-entrypoint.sh` | Web UI 컨테이너 이미지 |
 | `uninstaller.py` | Cognito · ECS/UI CF · MCP Gateway/Runtime · Harness · KB · VPC · IAM 등 정리 |
 | `add_user.py` | Cognito 추가 사용자 등록 |

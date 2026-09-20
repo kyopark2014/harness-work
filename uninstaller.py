@@ -3,9 +3,10 @@
 AWS Infrastructure Uninstaller for harness-work.
 
 Deletes resources created by installer.py:
-  Cognito, session signing key, ECS Web UI, ALB, UI CloudFront, Harness,
-  online evaluation, Memory, Knowledge Base, S3 Vectors, S3 Files, VPC/NAT, project S3 /
-  S3 CloudFront, IAM roles.
+  Cognito, session signing key, CloudFront signing key, ECS Web UI, ALB,
+  hybrid CloudFront (ALB+S3), legacy S3-only CloudFront, Harness,
+  online evaluation, Memory, Knowledge Base, S3 Vectors, S3 Files, VPC/NAT, project S3,
+  IAM roles.
 """
 
 from __future__ import annotations
@@ -82,7 +83,11 @@ def _bucket_name() -> str:
 
 
 def _cloudfront_comment() -> str:
-    # S3 sharing CF (installer); UI CF is CloudFront-for-{project} in ecs_web.
+    # Unified hybrid CF (ALB+S3). Legacy installs also had CloudFront-S3-for-*.
+    return f"CloudFront-for-{project_name}"
+
+
+def _legacy_s3_cloudfront_comment() -> str:
     return f"CloudFront-S3-for-{project_name}"
 
 
@@ -147,7 +152,11 @@ def prompt_yes_no(question: str, default: bool = False) -> bool:
 # --- CloudFront --------------------------------------------------------------
 
 def _matches_cloudfront(dist: dict) -> bool:
-    return _cloudfront_comment() in dist.get("Comment", "")
+    comment = dist.get("Comment", "") or ""
+    return (
+        _cloudfront_comment() in comment
+        or _legacy_s3_cloudfront_comment() in comment
+    )
 
 
 def disable_cloudfront_distributions():
@@ -1558,7 +1567,7 @@ def main():
     parser.add_argument(
         "--keep-cloudfront",
         action="store_true",
-        help="Retain the project S3 CloudFront / OAI (default: delete)",
+        help="Retain CloudFront distributions / OAI (default: delete)",
     )
     args = parser.parse_args()
 
@@ -1571,7 +1580,7 @@ def main():
     logger.info(f"Region: {region}")
     logger.info(f"Account ID: {account_id}")
     logger.info(f"S3 Bucket: {_bucket_name()}")
-    logger.info(f"S3 CloudFront: {_cloudfront_comment()}")
+    logger.info(f"CloudFront: {_cloudfront_comment()} (+ legacy {_legacy_s3_cloudfront_comment()})")
     logger.info(f"Config: {CONFIG_PATH}")
     logger.info("=" * 60)
 
@@ -1587,7 +1596,7 @@ def main():
             default=True,
         )
         delete_cloudfront_flag = prompt_yes_no(
-            f"Delete S3 CloudFront ({_cloudfront_comment()})?",
+            f"Delete CloudFront ({_cloudfront_comment()})?",
             default=True,
         )
     else:
@@ -1649,7 +1658,7 @@ def main():
             delete_cloudfront_distributions()
             delete_cloudfront_oai()
         else:
-            logger.info(f"S3 CloudFront retained: {_cloudfront_comment()}")
+            logger.info(f"CloudFront retained: {_cloudfront_comment()}")
 
         # UI CF may still be disabling; best-effort delete if already disabled
         delete_disabled_ui_cloudfront(project_name, region, logger)

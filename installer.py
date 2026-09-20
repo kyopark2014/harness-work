@@ -4,8 +4,9 @@ AWS Infrastructure Installer using boto3
 This script provisions AgentCore Harness (S3, skills, VPC, S3 Files mount,
 CloudFront, IAM roles, Memory, S3 Vectors Knowledge Base, KB MCP Runtime
 behind a shared AgentCore Gateway, CreateHarness)
-and deploys the React+FastAPI Web UI to Amazon ECS Fargate (ALB + CloudFront),
-similar to strands-work.
+and deploys the React+FastAPI Web UI to Amazon ECS Fargate (ALB + hybrid
+CloudFront with S3 path behaviors + signed cookies), similar to agentic-work /
+strands-work.
 """
 
 import argparse
@@ -101,7 +102,11 @@ def _bucket_name() -> str:
 
 
 def _cloudfront_comment() -> str:
-    # Distinct from UI CloudFront (CloudFront-for-{project}) in ecs_web.py.
+    # Unified hybrid CF comment (ALB + S3). Legacy S3-only used CloudFront-S3-for-*.
+    return f"CloudFront-for-{project_name}"
+
+
+def _legacy_s3_cloudfront_comment() -> str:
     return f"CloudFront-S3-for-{project_name}"
 
 
@@ -1669,6 +1674,37 @@ def prepare_doc_sharing_skill_config(
     )
 
 
+DEFAULT_OB_DOCS_URL = "https://vault.my-agentic-ai.click"
+
+
+def prepare_use_vault_skill_config(ob_docs_url: str = "") -> None:
+    """Write skills/use-vault/config.json (ob-docs API base for Code Interpreter)."""
+    skill_dir = os.path.join(SKILLS_DIR, "use-vault")
+    if not os.path.isdir(skill_dir):
+        logger.warning(f"use-vault skill dir missing: {skill_dir}")
+        return
+    url = (ob_docs_url or "").rstrip("/")
+    if not url:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            url = (cfg.get("ob_docs_url") or "").rstrip("/")
+        except Exception:
+            pass
+    if not url:
+        url = DEFAULT_OB_DOCS_URL
+    payload = {
+        "ob_docs_url": url,
+        "region": region,
+        "project_name": "ob-docs",
+    }
+    dest = os.path.join(skill_dir, "config.json")
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    logger.info(f"  use-vault config.json ready (ob_docs_url={url})")
+
+
 def upload_skills_to_s3(s3_bucket_name: str) -> int:
     """Upload skills/ to s3://{bucket}/skills/ (AgentCore S3 skill layout).
 
@@ -1681,6 +1717,7 @@ def upload_skills_to_s3(s3_bucket_name: str) -> int:
         return 0
 
     prepare_doc_sharing_skill_config(s3_bucket_name)
+    prepare_use_vault_skill_config()
 
     uploaded = 0
     failed = 0
@@ -1725,132 +1762,15 @@ def upload_skills_to_s3(s3_bucket_name: str) -> int:
 
 
 def create_cloudfront_distribution(s3_bucket_name: str) -> Dict[str, str]:
-    """Create project-scoped CloudFront distribution with S3 origin (file sharing)."""
-    logger.info("[20/25] Creating CloudFront distribution (S3 sharing)")
-    comment = _cloudfront_comment()
-    oai_cmt = _oai_comment()
+    """Deprecated: S3-only CF removed. Hybrid CF is created in ecs_web.create_ui_cloudfront.
 
-    try:
-        distributions = cloudfront_client.list_distributions()
-        for dist in distributions.get("DistributionList", {}).get("Items", []):
-            if comment in dist.get("Comment", ""):
-                if dist.get("Enabled", False):
-                    logger.warning(
-                        f"CloudFront distribution already exists (reusing): "
-                        f"{dist['DomainName']}"
-                    )
-                    return {"id": dist["Id"], "domain": dist["DomainName"]}
-                logger.warning(
-                    f"CloudFront distribution exists but is disabled: {dist['DomainName']}"
-                )
-                dist_config_response = cloudfront_client.get_distribution_config(
-                    Id=dist["Id"]
-                )
-                dist_config = dist_config_response["DistributionConfig"]
-                dist_config["Enabled"] = True
-                cloudfront_client.update_distribution(
-                    Id=dist["Id"],
-                    DistributionConfig=dist_config,
-                    IfMatch=dist_config_response["ETag"],
-                )
-                return {"id": dist["Id"], "domain": dist["DomainName"]}
-    except Exception as e:
-        logger.debug(f"Error checking existing CloudFront distributions: {e}")
-
-    oai_id = None
-    try:
-        oai_list = cloudfront_client.list_cloud_front_origin_access_identities()
-        for oai in oai_list.get("CloudFrontOriginAccessIdentityList", {}).get(
-            "Items", []
-        ):
-            if oai_cmt in oai.get("Comment", ""):
-                oai_id = oai["Id"]
-                logger.info(f"  Using existing Origin Access Identity: {oai_id}")
-                break
-        if not oai_id:
-            oai_response = cloudfront_client.create_cloud_front_origin_access_identity(
-                CloudFrontOriginAccessIdentityConfig={
-                    "CallerReference": (
-                        f"{project_name}-s3-oai-{int(time.time())}"
-                    ),
-                    "Comment": oai_cmt,
-                }
-            )
-            oai_id = oai_response["CloudFrontOriginAccessIdentity"]["Id"]
-            logger.info(f"  Created Origin Access Identity: {oai_id}")
-    except ClientError as e:
-        logger.error(f"Failed to handle Origin Access Identity: {e}")
-        raise
-
-    bucket_policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Sid": "AllowCloudFrontAccess",
-                "Effect": "Allow",
-                "Principal": {
-                    "AWS": (
-                        f"arn:aws:iam::cloudfront:user/"
-                        f"CloudFront Origin Access Identity {oai_id}"
-                    )
-                },
-                "Action": "s3:GetObject",
-                "Resource": f"arn:aws:s3:::{s3_bucket_name}/*",
-            }
-        ],
-    }
-    try:
-        time.sleep(10)
-        s3_client.put_bucket_policy(
-            Bucket=s3_bucket_name, Policy=json.dumps(bucket_policy)
-        )
-        logger.info("  Updated S3 bucket policy for CloudFront access")
-    except ClientError as e:
-        logger.error(f"Failed to update S3 bucket policy: {e}")
-        raise
-
-    origin_id = f"s3-{project_name}"
-    distribution_config = {
-        "CallerReference": f"{project_name}-s3-{int(time.time())}",
-        "Comment": comment,
-        "DefaultRootObject": "index.html",
-        "DefaultCacheBehavior": {
-            "TargetOriginId": origin_id,
-            "ViewerProtocolPolicy": "redirect-to-https",
-            "AllowedMethods": {
-                "Quantity": 2,
-                "Items": ["GET", "HEAD"],
-                "CachedMethods": {"Quantity": 2, "Items": ["GET", "HEAD"]},
-            },
-            "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
-            "Compress": True,
-        },
-        "Origins": {
-            "Quantity": 1,
-            "Items": [
-                {
-                    "Id": origin_id,
-                    "DomainName": f"{s3_bucket_name}.s3.{region}.amazonaws.com",
-                    "S3OriginConfig": {
-                        "OriginAccessIdentity": (
-                            f"origin-access-identity/cloudfront/{oai_id}"
-                        )
-                    },
-                }
-            ],
-        },
-        "Enabled": True,
-        "PriceClass": "PriceClass_200",
-    }
-
-    response = cloudfront_client.create_distribution(
-        DistributionConfig=distribution_config
+    Kept as a no-op stub so older call sites / docs references fail loudly if misused.
+    """
+    del s3_bucket_name
+    raise RuntimeError(
+        "create_cloudfront_distribution (S3-only) is removed. "
+        "Use EcsWebDeployer.create_ui_cloudfront for the ALB+S3 hybrid distribution."
     )
-    distribution_id = response["Distribution"]["Id"]
-    distribution_domain = response["Distribution"]["DomainName"]
-    logger.info(f"CloudFront distribution created: {distribution_domain}")
-    logger.info(f"  S3 origin: {s3_bucket_name}")
-    return {"id": distribution_id, "domain": distribution_domain}
 
 
 def create_harness_execution_role(
@@ -1994,6 +1914,15 @@ def create_harness_execution_role(
                     f"arn:aws:s3:::{_bucket_name()}/artifacts/*",
                     f"arn:aws:s3:::{_bucket_name()}/images/*",
                     f"arn:aws:s3:::{_bucket_name()}/docs/*",
+                ],
+            },
+            {
+                "Sid": "VaultAgentTokenSecret",
+                "Effect": "Allow",
+                "Action": ["secretsmanager:GetSecretValue"],
+                "Resource": [
+                    f"arn:aws:secretsmanager:{region}:{account_id}:secret:ob-docs/vault-agent-token*",
+                    f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/vault-agent-token*",
                 ],
             },
         ],
@@ -2469,8 +2398,9 @@ def _harness_environment_variables(
     app_url: str | None = None,
     knowledge_base_id: str | None = None,
     data_source_id: str | None = None,
+    ob_docs_url: str | None = None,
 ) -> Dict[str, str]:
-    """Env vars for Harness runtime (session storage + doc-sharing + KB)."""
+    """Env vars for Harness runtime (session storage + doc-sharing + KB + vault)."""
     env: Dict[str, str] = {
         "LOG_LEVEL": "info",
         "SESSION_STORAGE_DIR": s3_files_vpc.SESSION_STORAGE_MOUNT_PATH,
@@ -2486,6 +2416,15 @@ def _harness_environment_variables(
         env["KNOWLEDGE_BASE_ID"] = knowledge_base_id
     if data_source_id:
         env["DATA_SOURCE_ID"] = data_source_id
+    vault_url = (ob_docs_url or "").rstrip("/")
+    if not vault_url:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            vault_url = (cfg.get("ob_docs_url") or "").rstrip("/")
+        except Exception:
+            pass
+    env["OB_DOCS_URL"] = vault_url or DEFAULT_OB_DOCS_URL
     return env
 
 
@@ -2496,8 +2435,9 @@ def ensure_harness_sharing_env(
     knowledge_base_id: str | None = None,
     data_source_id: str | None = None,
     app_url: str | None = None,
+    ob_docs_url: str | None = None,
 ) -> None:
-    """Inject S3_BUCKET / SHARING_URL / APP_URL / KB ids for runtime skills."""
+    """Inject S3_BUCKET / SHARING_URL / APP_URL / OB_DOCS_URL / KB ids for runtime skills."""
     if not harness_id or not s3_bucket_name:
         return
     url = (sharing_url or "").rstrip("/")
@@ -2510,11 +2450,13 @@ def ensure_harness_sharing_env(
         app_url=ui or None,
         knowledge_base_id=knowledge_base_id,
         data_source_id=data_source_id,
+        ob_docs_url=ob_docs_url,
     )
     logger.info(
-        f"  Updating harness env for doc-sharing/KB: "
+        f"  Updating harness env for doc-sharing/KB/vault: "
         f"S3_BUCKET={s3_bucket_name}, SHARING_URL={url or '(none)'}, "
         f"APP_URL={ui or '(none)'}, "
+        f"OB_DOCS_URL={env_vars.get('OB_DOCS_URL')}, "
         f"KNOWLEDGE_BASE_ID={knowledge_base_id or '(none)'}"
     )
     update_harness_safe(
@@ -3380,9 +3322,16 @@ def build_config_from_deployment_state(
     if cloudfront_info:
         config_data["sharing_url"] = f"https://{cloudfront_info.get('domain', '')}"
     if ui_cloudfront_info:
-        config_data["app_url"] = f"https://{ui_cloudfront_info.get('domain', '')}"
-        config_data["ui_cloudfront_domain"] = ui_cloudfront_info.get("domain", "")
+        # Hybrid CF: app_url and sharing_url share the same distribution domain.
+        domain = ui_cloudfront_info.get("domain", "")
+        config_data["app_url"] = f"https://{domain}"
+        config_data["sharing_url"] = f"https://{domain}"
+        config_data["ui_cloudfront_domain"] = domain
         config_data["ui_cloudfront_id"] = ui_cloudfront_info.get("id", "")
+        if ui_cloudfront_info.get("key_pair_id"):
+            config_data["cloudfront_key_pair_id"] = ui_cloudfront_info["key_pair_id"]
+        if ui_cloudfront_info.get("key_group_id"):
+            config_data["cloudfront_key_group_id"] = ui_cloudfront_info["key_group_id"]
     if vpc_info:
         config_data["vpc_id"] = vpc_info.get("vpc_id", "")
     if s3_files_info:
@@ -3634,36 +3583,26 @@ def main():
             harness_runtime_arn=(harness_info or {}).get("harness_runtime_arn"),
         )
 
-        cloudfront_info = create_cloudfront_distribution(s3_bucket_name)
-        sharing_url = f"https://{cloudfront_info.get('domain', '')}".rstrip("/")
-        ensure_harness_sharing_env(
-            harness_info["harness_id"],
-            s3_bucket_name,
-            sharing_url,
-            knowledge_base_id=knowledge_base_id,
-            data_source_id=data_source_id,
-        )
-        prepare_doc_sharing_skill_config(s3_bucket_name, sharing_url)
-        try:
-            s3_client.upload_file(
-                os.path.join(SKILLS_DIR, "doc-sharing", "config.json"),
+        # Hybrid CloudFront (ALB + S3) is created with the ECS Web UI stack below.
+        # Until then keep any prior sharing_url for MCP env; it is overwritten after CF.
+        sharing_url = prior_sharing_url
+        if sharing_url:
+            ensure_harness_sharing_env(
+                harness_info["harness_id"],
                 s3_bucket_name,
-                f"{SKILLS_S3_PREFIX}/doc-sharing/config.json",
-                ExtraArgs={"ContentType": "application/json"},
+                sharing_url,
+                knowledge_base_id=knowledge_base_id,
+                data_source_id=data_source_id,
             )
-        except Exception as e:
-            logger.warning(f"  doc-sharing config.json re-upload skipped: {e}")
-        if sharing_url and sharing_url != prior_sharing_url:
-            if knowledge_base_mcp_info:
-                logger.info("[21/25] Refreshing Knowledge Base MCP SHARING_URL")
-                refresh_knowledge_base_mcp_env(
-                    knowledge_base_mcp_info,
-                    knowledge_base_id=knowledge_base_id,
-                    sharing_url=sharing_url,
-                )
+            prepare_doc_sharing_skill_config(s3_bucket_name, sharing_url)
+            prepare_use_vault_skill_config()
 
         if args.skip_ecs:
             logger.warning("Skipping ECS Web UI deployment (--skip-ecs)")
+            logger.warning(
+                "  Hybrid CloudFront (ALB+S3) requires ECS/ALB; "
+                "sharing_url will not be updated to a unified domain"
+            )
             deployment_success = True
         else:
             deployer = EcsWebDeployer(
@@ -3673,7 +3612,7 @@ def main():
                 logger=logger,
                 bucket_name=s3_bucket_name,
             )
-            logger.info("[23/25] Creating ECS roles / ALB / UI CloudFront")
+            logger.info("[23/25] Creating ECS roles / ALB / hybrid CloudFront")
             ecs_roles = deployer.create_ecs_roles()
             vpc_info = deployer.ensure_web_security_groups(vpc_info)
             deployer.prepare_s3files_for_ecs(
@@ -3687,8 +3626,15 @@ def main():
             ui_cloudfront_info = deployer.create_ui_cloudfront(
                 alb_info, origin_header_value
             )
+            deployer.disable_legacy_s3_only_cloudfront()
+            cloudfront_info = {
+                "id": ui_cloudfront_info.get("id", ""),
+                "domain": ui_cloudfront_info.get("domain", ""),
+            }
             app_url = f"https://{ui_cloudfront_info.get('domain', '')}".rstrip("/")
+            sharing_url = app_url
             prepare_doc_sharing_skill_config(s3_bucket_name, sharing_url, app_url)
+            prepare_use_vault_skill_config()
             try:
                 s3_client.upload_file(
                     os.path.join(SKILLS_DIR, "doc-sharing", "config.json"),
@@ -3698,6 +3644,15 @@ def main():
                 )
             except Exception as e:
                 logger.warning(f"  doc-sharing config.json re-upload skipped: {e}")
+            try:
+                s3_client.upload_file(
+                    os.path.join(SKILLS_DIR, "use-vault", "config.json"),
+                    s3_bucket_name,
+                    f"{SKILLS_S3_PREFIX}/use-vault/config.json",
+                    ExtraArgs={"ContentType": "application/json"},
+                )
+            except Exception as e:
+                logger.warning(f"  use-vault config.json re-upload skipped: {e}")
             ensure_harness_sharing_env(
                 harness_info["harness_id"],
                 s3_bucket_name,
@@ -3706,6 +3661,14 @@ def main():
                 data_source_id=data_source_id,
                 app_url=app_url,
             )
+            if sharing_url and sharing_url != prior_sharing_url:
+                if knowledge_base_mcp_info:
+                    logger.info("[21/25] Refreshing Knowledge Base MCP SHARING_URL")
+                    refresh_knowledge_base_mcp_env(
+                        knowledge_base_mcp_info,
+                        knowledge_base_id=knowledge_base_id,
+                        sharing_url=sharing_url,
+                    )
 
             app_environment = build_config_from_deployment_state(
                 execution_role_arn=execution_role_arn,
@@ -3769,9 +3732,12 @@ def main():
         logger.info("Infrastructure Deployment Completed Successfully!")
         logger.info("=" * 60)
         logger.info(f"  S3 Bucket: {s3_bucket_name}")
-        logger.info(f"  Sharing CloudFront: https://{cloudfront_info['domain']}")
         if ui_cloudfront_info:
-            logger.info(f"  Web UI CloudFront: https://{ui_cloudfront_info['domain']}")
+            logger.info(
+                f"  CloudFront (UI + sharing): https://{ui_cloudfront_info['domain']}"
+            )
+        elif cloudfront_info:
+            logger.info(f"  Sharing CloudFront: https://{cloudfront_info['domain']}")
         logger.info(f"  Knowledge Base ID: {knowledge_base_id}")
         logger.info(f"  Data Source ID: {data_source_id}")
         logger.info(f"  Knowledge Base Role: {knowledge_base_role_arn}")

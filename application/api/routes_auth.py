@@ -12,9 +12,11 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 try:
+    from application import cloudfront_cookies
     from application import session_cookie
     from application import utils
 except ImportError:
+    import cloudfront_cookies  # type: ignore
     import session_cookie  # type: ignore
     import utils  # type: ignore
 
@@ -159,6 +161,13 @@ def _set_session_cookie(response: Response, request: Request, user_id: str) -> N
         secure=secure,
         max_age=max_age,
     )
+    # Same CloudFront host serves /artifacts|/docs|/images from S3 with TrustedKeyGroups.
+    if not cloudfront_cookies.set_signed_cookies(
+        response, secure=secure, max_age=max_age
+    ):
+        logger.warning(
+            "CloudFront signed cookies not attached on login (signing material missing?)"
+        )
 
 
 def _kick_graph_job(user_id: str, *, force: bool = False) -> None:
@@ -219,7 +228,7 @@ def set_session(body: LoginRequest, request: Request, response: Response) -> Ses
 
 
 @router.get("", response_model=SessionResponse | None)
-def get_session(request: Request) -> SessionResponse | None:
+def get_session(request: Request, response: Response) -> SessionResponse | None:
     user_id = get_optional_user_id(request)
     if not user_id:
         return None
@@ -228,6 +237,15 @@ def get_session(request: Request) -> SessionResponse | None:
     except Exception:
         logger.exception("Failed to ensure graph dir for %s", user_id)
     _kick_graph_job(user_id)
+    if not cloudfront_cookies.set_signed_cookies(
+        response,
+        secure=_cookie_secure(request),
+        max_age=session_cookie.session_max_age_seconds(),
+    ):
+        logger.warning(
+            "CloudFront signed cookies not attached on session refresh "
+            "(signing material missing?)"
+        )
     return _session_response(user_id)
 
 
@@ -267,6 +285,7 @@ def patch_session_settings(
 def clear_session(request: Request, response: Response) -> None:
     secure = _cookie_secure(request)
     response.delete_cookie(key=SESSION_COOKIE, samesite="lax", secure=secure)
+    cloudfront_cookies.clear_signed_cookies(response, secure=secure)
 
 
 def require_user_id(request: Request) -> str:
