@@ -217,6 +217,10 @@ def login(body: LoginRequest, request: Request, response: Response) -> SessionRe
         utils.ensure_user_graph_dir(user_id)
     except Exception:
         logger.exception("Failed to ensure graph dir for %s", user_id)
+    try:
+        utils.ensure_user_documents_dir(user_id)
+    except Exception:
+        logger.exception("Failed to ensure documents dir for %s", user_id)
     _kick_graph_job(user_id)
     return _session_response(user_id)
 
@@ -236,6 +240,10 @@ def get_session(request: Request, response: Response) -> SessionResponse | None:
         utils.ensure_user_graph_dir(user_id)
     except Exception:
         logger.exception("Failed to ensure graph dir for %s", user_id)
+    try:
+        utils.ensure_user_documents_dir(user_id)
+    except Exception:
+        logger.exception("Failed to ensure documents dir for %s", user_id)
     _kick_graph_job(user_id)
     if not cloudfront_cookies.set_signed_cookies(
         response,

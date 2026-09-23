@@ -267,3 +267,23 @@ export function KnowledgeGraphIcon({ className }: IconProps) {
     </svg>
   );
 }
+
+export function DocumentsIcon({ className }: IconProps) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.15"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M3.5 2.5h6.2L12.5 5.3v8.2H3.5z" />
+      <path d="M9.7 2.5V5.3h2.8" />
+      <path d="M5.5 8h5" />
+      <path d="M5.5 10.5h3.5" />
+    </svg>
+  );
+}

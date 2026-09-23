@@ -7,6 +7,12 @@ export interface AttachedImage {
   previewUrl: string;
 }
 
+export interface LoadedFile {
+  path: string;
+  name: string;
+  size: number;
+}
+
 const ERROR_MESSAGE_DISPLAY_DURATION_MS = 5000;
 
 function extensionFromMime(mime: string): string {
@@ -76,6 +82,7 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachedImage[]>([]);
+  const [loadedFiles, setLoadedFiles] = useState<LoadedFile[]>([]);
   const attachmentsRef = useRef<AttachedImage[]>([]);
   const uploadingRef = useRef(false);
 
@@ -170,6 +177,31 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
     });
   }, []);
 
+  const removeLoadedFile = useCallback((path: string) => {
+    setLoadedFiles((prev) => prev.filter((item) => item.path !== path));
+  }, []);
+
+  const attachExistingFile = useCallback(
+    (file: LoadedFile) => {
+      if (disabled) return;
+      const path = (file.path || "").trim();
+      const name = (file.name || "").trim();
+      if (!path || !name) return;
+      setLoadedFiles((prev) => {
+        const next = prev.filter((item) => item.path !== path);
+        return [
+          ...next,
+          {
+            path,
+            name,
+            size: Number.isFinite(file.size) && file.size > 0 ? file.size : 0,
+          },
+        ];
+      });
+    },
+    [disabled],
+  );
+
   const clearAttachments = useCallback(() => {
     setAttachments((prev) => {
       for (const item of prev) {
@@ -179,6 +211,7 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
       }
       return [];
     });
+    setLoadedFiles([]);
   }, []);
 
   const [dragOver, setDragOver] = useState(false);
@@ -230,12 +263,15 @@ export function useFileUpload({ disabled = false }: UseFileUploadOptions = {}) {
     uploading,
     uploadError,
     attachments,
+    loadedFiles,
     dragOver,
     isUploading: () => uploadingRef.current,
     clearUploadError,
     uploadImageFiles,
     uploadRagFile,
     removeAttachment,
+    removeLoadedFile,
+    attachExistingFile,
     clearAttachments,
     onDragEnter,
     onDragOver,

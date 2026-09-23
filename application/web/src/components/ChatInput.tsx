@@ -13,7 +13,11 @@ import {
   isImageFile,
   collectClipboardImages,
   useFileUpload,
+  type LoadedFile,
 } from "../hooks/useFileUpload";
+import {
+  DOCUMENTS_ATTACH_FILE_EVENT,
+} from "../pendingLoadFile";
 
 interface QueuedMessage {
   id: string;
@@ -75,18 +79,34 @@ export function ChatInput({
     uploading,
     uploadError,
     attachments,
+    loadedFiles,
     dragOver,
     isUploading,
     clearUploadError,
     uploadImageFiles,
     uploadRagFile,
     removeAttachment,
+    removeLoadedFile,
+    attachExistingFile,
     clearAttachments,
     onDragEnter,
     onDragOver,
     onDragLeave,
     onDrop,
   } = useFileUpload({ disabled });
+
+  // Documents 「복사」 → attach md chip immediately.
+  useEffect(() => {
+    function onDocumentsAttachFile(e: Event) {
+      const detail = (e as CustomEvent<LoadedFile>).detail;
+      if (!detail?.path) return;
+      attachExistingFile(detail);
+    }
+    window.addEventListener(DOCUMENTS_ATTACH_FILE_EVENT, onDocumentsAttachFile);
+    return () => {
+      window.removeEventListener(DOCUMENTS_ATTACH_FILE_EVENT, onDocumentsAttachFile);
+    };
+  }, [attachExistingFile]);
 
   function adjustInputHeight() {
     const el = textareaRef.current;
@@ -145,7 +165,10 @@ export function ChatInput({
 
   function submit(textOverride?: string) {
     const text = (textOverride ?? value).trim();
-    const files = attachments.map((item) => item.url);
+    const files = [
+      ...attachments.map((item) => item.url),
+      ...loadedFiles.map((item) => item.path),
+    ];
     if ((!text && files.length === 0) || disabled || uploading) return;
     onSend(text, files);
     setValue("");
@@ -227,7 +250,8 @@ export function ChatInput({
 
   const inputDisabled = disabled || uploading;
   const canSend =
-    !inputDisabled && (value.trim().length > 0 || attachments.length > 0);
+    !inputDisabled &&
+    (value.trim().length > 0 || attachments.length > 0 || loadedFiles.length > 0);
   const showInputSteer = queuedMessages.length > 0 && canSend;
 
   function onLeftButtonClick() {
@@ -455,6 +479,26 @@ export function ChatInput({
                   className="chat-attachment-remove"
                   aria-label={`${item.name} 제거`}
                   onClick={() => removeAttachment(item.url)}
+                  disabled={inputDisabled}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        {loadedFiles.length > 0 && (
+          <div className="chat-loaded-files" aria-label="첨부 문서">
+            {loadedFiles.map((item) => (
+              <div key={item.path} className="chat-loaded-file">
+                <span className="chat-loaded-file-name" title={item.path}>
+                  {item.name}
+                </span>
+                <button
+                  type="button"
+                  className="chat-attachment-remove"
+                  aria-label={`${item.name} 제거`}
+                  onClick={() => removeLoadedFile(item.path)}
                   disabled={inputDisabled}
                 >
                   ×
