@@ -1,14 +1,14 @@
 ---
 name: use-vault
 description: >
-  ob-docs(Obsidian형 vault)에 저장된 마크다운 노트를 조회·검색·생성·수정합니다.
+  ob-note(Obsidian형 vault)에 저장된 마크다운 노트를 조회·검색·생성·수정합니다.
   사용자가 "vault", "내 노트", "ob-docs", "위키링크", "백링크", "노트 찾아줘",
   "메모 저장", "vault에 적어줘", "지식베이스" 등을 요청할 때 사용합니다.
 ---
 
-# use-vault (ob-docs)
+# use-vault (ob-note)
 
-standalone **ob-docs** (`https://vault.my-agentic-ai.click`) vault를 API로 읽고 씁니다.  
+standalone **ob-note** (`https://vault.my-agentic-ai.click`) vault를 API로 읽고 씁니다.  
 노트는 `.md`가 Source of Truth입니다. 임의 HTTP를 새로 짜지 말고 아래 스크립트를 실행하세요.
 
 계정(`USER_ID` / email / `ACTOR_ID`)마다 vault가 `vault/{userId}/…`로 분리됩니다.  
@@ -209,15 +209,15 @@ print(r.stdout)
 
 공통 옵션: `--user-id` (기본은 `USER_ID` / `CURRENT_USER_ID` / `ACTOR_ID`)
 
-API는 ob-docs 사이트 루트의 `/api/...` 입니다.
+API는 ob-note 사이트 루트의 `/api/...` 입니다.
 
 ## Environment
 
 | 변수 | 기본 | 설명 |
 | --- | --- | --- |
-| `OB_DOCS_URL` / `VAULT_API_URL` | `https://vault.my-agentic-ai.click` | ob-docs base URL (harness `SHARING_URL` 사용 금지) |
+| `OB_DOCS_URL` / `VAULT_API_URL` | `https://vault.my-agentic-ai.click` | ob-note base URL (harness `SHARING_URL` 사용 금지) |
 | `USER_ID` / `ACTOR_ID` | (세션) | vault 소유자 — **프로덕션에서는 로그인 email** |
-| `VAULT_AGENT_TOKEN` | Secrets Manager `ob-docs/vault-agent-token` | Agent HMAC |
+| `VAULT_AGENT_TOKEN` | Secrets Manager `ob-note/vault-agent-token` (legacy `ob-docs/…`) | Agent HMAC |
 | `OB_DOCS_VAULT_AGENT_SECRET` | (없음) | 토큰 시크릿 이름 강제 지정 |
 
 `skills/use-vault/config.json`의 `ob_docs_url` / `project_name`이 env 미설정 시 fallback입니다.
@@ -234,10 +234,14 @@ API는 ob-docs 사이트 루트의 `/api/...` 입니다.
 
 ### `Vault auth unavailable`
 
-Harness 실행 역할에 `ob-docs/vault-agent-token` (또는 `harness-work/vault-agent-token`) GetSecretValue가 필요합니다.  
-두 시크릿 문자열이 동일해야 ob-docs 검증에 성공합니다.
+Harness 실행 역할에 다음 GetSecretValue가 필요합니다:
+- `ob-note/vault-agent-token` (또는 legacy `ob-docs/…`)
+- `harness-work/vault-agent-token` (installer가 ob-note와 동일 값으로 동기화)
 
-### `Failed to reach ob-docs`
+두 시크릿 문자열이 동일해야 ob-note 검증에 성공합니다.  
+AgentCore에서는 `session-signing-key`를 쓸 수 없습니다.
+
+### `Failed to reach ob-note`
 
 `OB_DOCS_URL`이 `https://vault.my-agentic-ai.click`인지 확인하세요.  
 harness CloudFront(`d196…`)로 치면 실패합니다.

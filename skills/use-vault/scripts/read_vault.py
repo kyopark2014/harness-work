@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Read-only CLI for ob-docs vault (list / read / search / graph).
+Read-only CLI for ob-note vault (list / read / search / graph).
 
 Examples:
   python read_vault.py health
@@ -94,7 +94,7 @@ def cmd_backlinks(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Read ob-docs vault via API")
+    parser = argparse.ArgumentParser(description="Read ob-note vault via API")
     parser.add_argument("--user-id", default=None, help="Override USER_ID / CURRENT_USER_ID")
     sub = parser.add_subparsers(dest="command", required=True)
 

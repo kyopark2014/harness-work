@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Write CLI for ob-docs vault (write / append / mkdir / rename / delete).
+Write CLI for ob-note vault (write / append / mkdir / rename / delete).
 
 Examples:
   python write_vault.py write notes/Hello.md --content "# Hello\\n"
@@ -115,7 +115,7 @@ def _add_content_flags(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Write ob-docs vault via API")
+    parser = argparse.ArgumentParser(description="Write ob-note vault via API")
     parser.add_argument("--user-id", default=None, help="Override USER_ID / CURRENT_USER_ID")
     sub = parser.add_subparsers(dest="command", required=True)
 

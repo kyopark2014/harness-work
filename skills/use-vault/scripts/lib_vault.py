@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""HTTP client helpers for ob-docs vault API.
+"""HTTP client helpers for ob-note vault API.
 
 Auth order (production AgentCore cannot read session-signing-key):
   1. VAULT_AGENT_TOKEN / Secrets Manager ``{project}/vault-agent-token``
      → ``Authorization: VaultAgent v1.<payload>.<sig>``
   2. SESSION_SIGNING_KEY (local / app ECS) → Bearer session cookie token
-  3. Loopback + no key → unauthenticated (ob-docs ALLOW_LOCAL_AUTH_BYPASS)
+  3. Loopback + no key → unauthenticated (ob-note ALLOW_LOCAL_AUTH_BYPASS)
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def load_app_config() -> dict[str, Any]:
             "s3_bucket": skill_cfg.get("s3_bucket"),
             "sharing_url": skill_cfg.get("sharing_url") or skill_cfg.get("ob_docs_url"),
             "region": skill_cfg.get("region"),
-            "projectName": skill_cfg.get("project_name") or "ob-docs",
+            "projectName": skill_cfg.get("project_name") or "ob-note",
         }
 
     candidates: list[Path] = []
@@ -78,10 +78,10 @@ def load_app_config() -> dict[str, Any]:
             candidates.append(Path(raw) / "application" / "config.json")
 
     here = Path(__file__).resolve()
-    # skills/use-vault/scripts → ob-docs root is parents[3]
+    # skills/use-vault/scripts → ob-note root is parents[3]
     try:
-        ob_docs_root = here.parents[3]
-        candidates.append(ob_docs_root / "config.json")
+        ob_note_root = here.parents[3]
+        candidates.append(ob_note_root / "config.json")
     except IndexError:
         pass
     candidates.extend(
@@ -106,10 +106,10 @@ def _project_name(cfg: Optional[dict[str, Any]] = None) -> str:
             or os.environ.get("SHARED_PROJECT_NAME")
             or skill.get("project_name")
             or cfg.get("projectName")
-            or "ob-docs"
+            or "ob-note"
         )
         .strip()
-        or "ob-docs"
+        or "ob-note"
     )
 
 
@@ -125,7 +125,7 @@ def _region(cfg: Optional[dict[str, Any]] = None) -> str:
 
 
 def vault_base_url() -> str:
-    """ob-docs public base URL (never harness CloudFront SHARING_URL)."""
+    """ob-note public base URL (never harness CloudFront SHARING_URL)."""
     explicit = (
         (os.environ.get("OB_DOCS_URL") or "").strip()
         or (os.environ.get("VAULT_API_URL") or "").strip()
@@ -190,13 +190,13 @@ def _get_secret_string(secret_id: str) -> tuple[Optional[str], Optional[str]]:
 
 
 def _vault_agent_token() -> tuple[Optional[bytes], list[str]]:
-    """Load HMAC key shared with ob-docs VaultAgent auth.
+    """Load HMAC key shared with ob-note VaultAgent auth.
 
     Tries (in order):
       1. VAULT_AGENT_TOKEN env
       2. OB_DOCS_VAULT_AGENT_SECRET override
-      3. ``ob-docs/vault-agent-token``
-      4. ``{project}/vault-agent-token`` (skill/app projectName)
+      3. ``{project}/vault-agent-token`` (harness-work etc.; Runtime IAM allows)
+      4. ``ob-note/vault-agent-token`` then legacy ``ob-docs/vault-agent-token``
     """
     errors: list[str] = []
     env = (os.environ.get("VAULT_AGENT_TOKEN") or "").strip()
@@ -207,10 +207,18 @@ def _vault_agent_token() -> tuple[Optional[bytes], list[str]]:
     override = (os.environ.get("OB_DOCS_VAULT_AGENT_SECRET") or "").strip()
     if override:
         secret_ids.append(override)
-    secret_ids.append("ob-docs/vault-agent-token")
-    project = _project_name()
-    if project and project != "ob-docs":
-        secret_ids.append(f"{project}/vault-agent-token")
+    # Prefer project-local copy (same value as ob-note) when present.
+    secret_ids.append(f"{_project_name()}/vault-agent-token")
+    secret_ids.append("ob-note/vault-agent-token")
+    secret_ids.append("ob-docs/vault-agent-token")  # legacy fallback
+    # Harness app project may differ from skill sidecar project_name (ob-note).
+    for extra in (
+        (os.environ.get("PROJECT_NAME") or "").strip(),
+        (os.environ.get("SHARED_PROJECT_NAME") or "").strip(),
+        "harness-work",
+    ):
+        if extra:
+            secret_ids.append(f"{extra}/vault-agent-token")
 
     seen: set[str] = set()
     for secret_id in secret_ids:
@@ -300,9 +308,11 @@ def _auth_headers(user_id: str, *, require_auth: bool = True) -> dict[str, str]:
     detail = "; ".join(errors) if errors else "no credentials resolved"
     raise RuntimeError(
         "Vault auth unavailable. Need VAULT_AGENT_TOKEN "
-        "(Secrets Manager `ob-docs/vault-agent-token` or "
-        f"`{_project_name()}/vault-agent-token`) for AgentCore, "
-        f"or SESSION_SIGNING_KEY for local/app. Details: {detail}"
+        "(Secrets Manager `ob-note/vault-agent-token` or "
+        f"`{_project_name()}/vault-agent-token` / `harness-work/vault-agent-token`) "
+        "with GetSecretValue on the harness execution role. "
+        "session-signing-key is not available in AgentCore. "
+        f"Details: {detail}"
     )
 
 
@@ -346,7 +356,7 @@ def api_request(
             parsed = detail
         raise RuntimeError(f"HTTP {exc.code} {method.upper()} {path}: {parsed}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Failed to reach ob-docs at {base}: {exc}") from exc
+        raise RuntimeError(f"Failed to reach ob-note at {base}: {exc}") from exc
 
 
 def print_json(payload: Any) -> None:

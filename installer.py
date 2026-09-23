@@ -46,6 +46,9 @@ _HARNESS_NAME_API_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,39}$")
 COGNITO_ADMIN_USERNAME = "admin"
 COGNITO_CLIENT_NAME = f"{project_name}-web-ui"
 SESSION_SIGNING_KEY_SECRET_NAME = f"{project_name}/session-signing-key"
+# HMAC for use-vault skill → ob-note VaultAgent (must match ob-note secret value).
+VAULT_AGENT_TOKEN_SECRET_NAME = f"{project_name}/vault-agent-token"
+OB_NOTE_VAULT_AGENT_TOKEN_SECRET = "ob-note/vault-agent-token"
 
 sts_client = boto3.client("sts", region_name=region)
 account_id = str(sts_client.get_caller_identity()["Account"])
@@ -938,27 +941,63 @@ def push_knowledge_base_mcp_image() -> Tuple[str, str]:
 
     repository = _kb_mcp_repository_name()
     image_tag = datetime.now().strftime("%Y%m%d%H%M%S")
-    local_tag = f"{repository}:{image_tag}"
     ecr_uri = f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repository}:{image_tag}"
 
     _ensure_ecr_repository(repository)
     _docker_ecr_login()
-    _run_docker(
-        [
-            "docker",
-            "build",
-            "--platform",
-            "linux/arm64",
-            "--provenance=false",
-            "--sbom=false",
-            "-t",
-            local_tag,
-            KB_MCP_DIR,
-        ],
-        "Building Docker image",
+
+    # Prefer buildx --push so Docker Desktop does not create a multi-platform
+    # index that fails ECR push (missing local platform manifests / digests).
+    use_buildx = (
+        subprocess.run(
+            ["docker", "buildx", "version"],
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
     )
-    _run_docker(["docker", "tag", local_tag, ecr_uri], "Tagging for ECR")
-    _run_docker(["docker", "push", ecr_uri], "Pushing to ECR")
+    env = {**os.environ, "DOCKER_BUILDKIT": "1"}
+    if use_buildx:
+        logger.info(f"  Building and pushing with buildx: {ecr_uri}")
+        subprocess.run(
+            [
+                "docker",
+                "buildx",
+                "build",
+                "--platform",
+                "linux/arm64",
+                "--provenance=false",
+                "--sbom=false",
+                "-t",
+                ecr_uri,
+                "--push",
+                KB_MCP_DIR,
+            ],
+            check=True,
+            env=env,
+        )
+    else:
+        local_tag = f"{repository}:{image_tag}"
+        _run_docker(
+            [
+                "docker",
+                "build",
+                "--platform",
+                "linux/arm64",
+                "--provenance=false",
+                "--sbom=false",
+                "-t",
+                local_tag,
+                KB_MCP_DIR,
+            ],
+            "Building Docker image",
+        )
+        _run_docker(["docker", "tag", local_tag, ecr_uri], "Tagging for ECR")
+        _run_docker(
+            ["docker", "push", "--platform", "linux/arm64", ecr_uri],
+            "Pushing to ECR",
+        )
+
     logger.info(f"✓ Pushed Knowledge Base MCP image: {ecr_uri}")
     return repository, image_tag
 
@@ -1678,7 +1717,7 @@ DEFAULT_OB_DOCS_URL = "https://vault.my-agentic-ai.click"
 
 
 def prepare_use_vault_skill_config(ob_docs_url: str = "") -> None:
-    """Write skills/use-vault/config.json (ob-docs API base for Code Interpreter)."""
+    """Write skills/use-vault/config.json (ob-note API base for Code Interpreter)."""
     skill_dir = os.path.join(SKILLS_DIR, "use-vault")
     if not os.path.isdir(skill_dir):
         logger.warning(f"use-vault skill dir missing: {skill_dir}")
@@ -1696,7 +1735,7 @@ def prepare_use_vault_skill_config(ob_docs_url: str = "") -> None:
     payload = {
         "ob_docs_url": url,
         "region": region,
-        "project_name": "ob-docs",
+        "project_name": "ob-note",
     }
     dest = os.path.join(skill_dir, "config.json")
     with open(dest, "w", encoding="utf-8") as f:
@@ -1825,6 +1864,14 @@ def create_harness_execution_role(
                 ],
             },
             {
+                # Kimi K3 Chat Completions (apiFormat=chat_completions) via
+                # bedrock-runtime …/openai/v1
+                "Sid": "BedrockRuntimeBearerToken",
+                "Effect": "Allow",
+                "Action": ["bedrock:CallWithBearerToken"],
+                "Resource": ["*"],
+            },
+            {
                 "Sid": "KnowledgeBaseRetrieve",
                 "Effect": "Allow",
                 "Action": [
@@ -1921,6 +1968,7 @@ def create_harness_execution_role(
                 "Effect": "Allow",
                 "Action": ["secretsmanager:GetSecretValue"],
                 "Resource": [
+                    f"arn:aws:secretsmanager:{region}:{account_id}:secret:ob-note/vault-agent-token*",
                     f"arn:aws:secretsmanager:{region}:{account_id}:secret:ob-docs/vault-agent-token*",
                     f"arn:aws:secretsmanager:{region}:{account_id}:secret:{project_name}/vault-agent-token*",
                 ],
@@ -2980,6 +3028,93 @@ def create_cognito_user_pool(
     return cognito_info
 
 
+def ensure_vault_agent_token(*, sync_from_ob_note: bool = True) -> Optional[str]:
+    """Ensure ``{project}/vault-agent-token`` matches ob-note for use-vault.
+
+    AgentCore harness reads this (or ``ob-note/vault-agent-token``) via GetSecretValue.
+    Values must be identical to the token ob-note uses for VaultAgent HMAC verify.
+    Returns the secret ARN when a value is stored, else None.
+    """
+    secret_name = VAULT_AGENT_TOKEN_SECRET_NAME
+    source_value = ""
+    if sync_from_ob_note:
+        for source_id in (
+            OB_NOTE_VAULT_AGENT_TOKEN_SECRET,
+            "ob-docs/vault-agent-token",
+        ):
+            try:
+                resp = secretsmanager_client.get_secret_value(SecretId=source_id)
+                source_value = (resp.get("SecretString") or "").strip()
+                if source_value:
+                    logger.info(f"  ✓ Loaded vault-agent-token source: {source_id}")
+                    break
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                if code != "ResourceNotFoundException":
+                    logger.warning(f"  Could not read {source_id}: {e}")
+                else:
+                    logger.debug(f"  Source secret missing: {source_id}")
+
+    try:
+        existing = secretsmanager_client.get_secret_value(SecretId=secret_name)
+        current = (existing.get("SecretString") or "").strip()
+        if source_value and source_value != current:
+            secretsmanager_client.put_secret_value(
+                SecretId=secret_name,
+                SecretString=source_value,
+            )
+            logger.info(f"  ✓ Synced vault-agent-token from ob-note → {secret_name}")
+        elif current:
+            logger.info(f"  ✓ Reusing vault-agent-token: {secret_name}")
+        elif source_value:
+            secretsmanager_client.put_secret_value(
+                SecretId=secret_name,
+                SecretString=source_value,
+            )
+            logger.info(f"  ✓ Wrote vault-agent-token: {secret_name}")
+        else:
+            logger.warning(
+                f"  vault-agent-token empty and no ob-note source — "
+                f"use-vault auth will fail until {OB_NOTE_VAULT_AGENT_TOKEN_SECRET} exists"
+            )
+            return None
+        return secretsmanager_client.describe_secret(SecretId=secret_name)["ARN"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+
+    value = source_value or secrets.token_urlsafe(32)
+    if not source_value:
+        logger.warning(
+            f"  Creating {secret_name} with a new random value "
+            f"(ob-note source missing — sync later for use-vault to work)"
+        )
+    try:
+        resp = secretsmanager_client.create_secret(
+            Name=secret_name,
+            Description=(
+                f"HMAC token for harness use-vault → ob-note "
+                f"(mirror of {OB_NOTE_VAULT_AGENT_TOKEN_SECRET})"
+            ),
+            SecretString=value,
+            Tags=[
+                {"Key": "Name", "Value": secret_name},
+                {"Key": "Project", "Value": project_name},
+            ],
+        )
+        logger.info(f"  ✓ Created vault-agent-token secret: {secret_name}")
+        return resp["ARN"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceExistsException":
+            if source_value:
+                secretsmanager_client.put_secret_value(
+                    SecretId=secret_name,
+                    SecretString=source_value,
+                )
+            return secretsmanager_client.describe_secret(SecretId=secret_name)["ARN"]
+        raise
+
+
 def get_or_create_session_signing_key(*, rotate: bool = False) -> str:
     """Ensure HMAC key for Web UI session cookies exists in Secrets Manager."""
     secret_name = SESSION_SIGNING_KEY_SECRET_NAME
@@ -3505,6 +3640,7 @@ def main():
 
     try:
         get_or_create_session_signing_key()
+        ensure_vault_agent_token()
         cognito_info = create_cognito_user_pool(admin_password=cognito_admin_password)
 
         s3_bucket_name = create_s3_bucket()

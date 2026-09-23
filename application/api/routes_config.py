@@ -42,6 +42,7 @@ MODELS = [
     "OpenAI GPT 5.6 Luna",
     "OpenAI OSS 120B",
     "OpenAI OSS 20B",
+    "Kimi K3",
     "Nova 2 Lite",
     "Nova Premier",
     "Nova Pro",

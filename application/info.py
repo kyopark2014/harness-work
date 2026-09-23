@@ -422,6 +422,29 @@ openai_oss_20b_models = [
     }
 ]
 
+# Kimi K3 via US Geo CRIS — Chat Completions (Harness apiFormat)
+# https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k3.html
+kimi_k3_models = [
+    {
+        "bedrock_region": "us-west-2", # Oregon
+        "model_type": "kimi",
+        "model_id": "us.moonshotai.kimi-k3",
+        "apiFormat": "chat_completions",
+    },
+    {
+        "bedrock_region": "us-east-1", # N.Virginia
+        "model_type": "kimi",
+        "model_id": "us.moonshotai.kimi-k3",
+        "apiFormat": "chat_completions",
+    },
+    {
+        "bedrock_region": "us-east-2", # Ohio
+        "model_type": "kimi",
+        "model_id": "us.moonshotai.kimi-k3",
+        "apiFormat": "chat_completions",
+    },
+]
+
 def get_model_info(model_name):
     models = []
 
@@ -477,6 +500,8 @@ def get_model_info(model_name):
         models = openai_oss_120b_models
     elif model_name == "OpenAI OSS 20B":
         models = openai_oss_20b_models
+    elif model_name == "Kimi K3":
+        models = kimi_k3_models
 
     return models
 
