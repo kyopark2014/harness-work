@@ -14,6 +14,8 @@ python-multipart
 pydantic>=2.0
 requests>=2.31.0
 langchain-aws>=0.2.0
+langchain-openai
+aws-bedrock-token-generator
 pyyaml
 markdown>=3.5
 cryptography>=42.0.0
@@ -23,3 +25,9 @@ graphifyy>=0.4.0
 python-dotenv>=1.0.0
 networkx>=3.0
 openai>=1.40.0
+
+# Documents Sync / Foundation Model Parser (documents/pdf2text.py)
+Pillow>=10.0.0
+pymupdf>=1.24.0
+pdfplumber>=0.11.0
+pypdf>=4.0.0

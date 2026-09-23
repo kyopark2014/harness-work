@@ -165,13 +165,16 @@ export function Sidebar({
     setDocumentsSyncMessage("Documents 동기화를 시작합니다…");
     try {
       const result = await api.syncDocuments(false, modelName || undefined);
-      if (result.status === "error") {
+      const status = result.status;
+      // Match agentic-work: only ``unchanged`` means nothing to do.
+      // ``ready`` here would incorrectly stop a just-queued job before polling.
+      if (status === "error") {
         setDocumentsSyncBusy(false);
         setDocumentsSyncMessage(result.error || "Documents 동기화에 실패했습니다.");
-      } else if (result.status === "unchanged" || result.status === "ready") {
+      } else if (status === "unchanged") {
         setDocumentsSyncBusy(false);
         setDocumentsSyncMessage(
-          result.message || "Documents가 이미 최신 상태입니다.",
+          result.message || "No files changed since last run. Nothing to update.",
         );
       } else {
         setDocumentsSyncBusy(true);

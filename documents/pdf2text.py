@@ -179,9 +179,7 @@ def _get_vision_chat(model_name: str | None = None):
     import boto3
     from botocore.config import Config
     from langchain_aws import ChatBedrock
-    from langchain_openai import ChatOpenAI
 
-    import bedrock_data_retention
     import info
     import utils
 
@@ -209,6 +207,8 @@ def _get_vision_chat(model_name: str | None = None):
 
     # OpenAI-on-Bedrock: Mantle Responses API (same as docgraph img2text / chat.py).
     if model_type == "openai" and mantle_api == "responses":
+        import bedrock_data_retention
+        from langchain_openai import ChatOpenAI
 
         def bearer_token_provider() -> str:
             return bedrock_data_retention.get_bedrock_bearer_token(bedrock_region)

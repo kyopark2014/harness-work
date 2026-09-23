@@ -21,6 +21,10 @@ RUN pip install --upgrade "setuptools>=83.0.0" \
 COPY . .
 COPY --from=frontend /web/dist /app/application/web/dist
 
+# Documents Foundation Model Parser (PDF → page images → Bedrock Markdown)
+# Same deps agentic-work pulls via graph/requirements.txt; appuser cannot pip-install at runtime.
+RUN pip install --no-cache-dir -r /app/documents/requirements.txt
+
 RUN chmod +x /app/docker-entrypoint.sh \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
     && chown -R appuser:appuser /app
