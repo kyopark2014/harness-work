@@ -46,7 +46,7 @@ _HARNESS_NAME_API_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,39}$")
 COGNITO_ADMIN_USERNAME = "admin"
 COGNITO_CLIENT_NAME = f"{project_name}-web-ui"
 SESSION_SIGNING_KEY_SECRET_NAME = f"{project_name}/session-signing-key"
-# HMAC for use-vault skill → ob-note VaultAgent (must match ob-note secret value).
+# HMAC for my-vaults skill → ob-note VaultAgent (must match ob-note secret value).
 VAULT_AGENT_TOKEN_SECRET_NAME = f"{project_name}/vault-agent-token"
 OB_NOTE_VAULT_AGENT_TOKEN_SECRET = "ob-note/vault-agent-token"
 
@@ -1716,11 +1716,11 @@ def prepare_doc_sharing_skill_config(
 DEFAULT_OB_DOCS_URL = "https://vault.my-agentic-ai.click"
 
 
-def prepare_use_vault_skill_config(ob_docs_url: str = "") -> None:
-    """Write skills/use-vault/config.json (ob-note API base for Code Interpreter)."""
-    skill_dir = os.path.join(SKILLS_DIR, "use-vault")
+def prepare_my_vaults_skill_config(ob_docs_url: str = "") -> None:
+    """Write skills/my-vaults/config.json (ob-note API base for Code Interpreter)."""
+    skill_dir = os.path.join(SKILLS_DIR, "my-vaults")
     if not os.path.isdir(skill_dir):
-        logger.warning(f"use-vault skill dir missing: {skill_dir}")
+        logger.warning(f"my-vaults skill dir missing: {skill_dir}")
         return
     url = (ob_docs_url or "").rstrip("/")
     if not url:
@@ -1741,7 +1741,7 @@ def prepare_use_vault_skill_config(ob_docs_url: str = "") -> None:
     with open(dest, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
         f.write("\n")
-    logger.info(f"  use-vault config.json ready (ob_docs_url={url})")
+    logger.info(f"  my-vaults config.json ready (ob_docs_url={url})")
 
 
 def upload_skills_to_s3(s3_bucket_name: str) -> int:
@@ -1756,7 +1756,7 @@ def upload_skills_to_s3(s3_bucket_name: str) -> int:
         return 0
 
     prepare_doc_sharing_skill_config(s3_bucket_name)
-    prepare_use_vault_skill_config()
+    prepare_my_vaults_skill_config()
 
     uploaded = 0
     failed = 0
@@ -3029,7 +3029,7 @@ def create_cognito_user_pool(
 
 
 def ensure_vault_agent_token(*, sync_from_ob_note: bool = True) -> Optional[str]:
-    """Ensure ``{project}/vault-agent-token`` matches ob-note for use-vault.
+    """Ensure ``{project}/vault-agent-token`` matches ob-note for my-vaults.
 
     AgentCore harness reads this (or ``ob-note/vault-agent-token``) via GetSecretValue.
     Values must be identical to the token ob-note uses for VaultAgent HMAC verify.
@@ -3075,7 +3075,7 @@ def ensure_vault_agent_token(*, sync_from_ob_note: bool = True) -> Optional[str]
         else:
             logger.warning(
                 f"  vault-agent-token empty and no ob-note source — "
-                f"use-vault auth will fail until {OB_NOTE_VAULT_AGENT_TOKEN_SECRET} exists"
+                f"my-vaults auth will fail until {OB_NOTE_VAULT_AGENT_TOKEN_SECRET} exists"
             )
             return None
         return secretsmanager_client.describe_secret(SecretId=secret_name)["ARN"]
@@ -3087,13 +3087,13 @@ def ensure_vault_agent_token(*, sync_from_ob_note: bool = True) -> Optional[str]
     if not source_value:
         logger.warning(
             f"  Creating {secret_name} with a new random value "
-            f"(ob-note source missing — sync later for use-vault to work)"
+            f"(ob-note source missing — sync later for my-vaults to work)"
         )
     try:
         resp = secretsmanager_client.create_secret(
             Name=secret_name,
             Description=(
-                f"HMAC token for harness use-vault → ob-note "
+                f"HMAC token for harness my-vaults → ob-note "
                 f"(mirror of {OB_NOTE_VAULT_AGENT_TOKEN_SECRET})"
             ),
             SecretString=value,
@@ -3731,7 +3731,7 @@ def main():
                 data_source_id=data_source_id,
             )
             prepare_doc_sharing_skill_config(s3_bucket_name, sharing_url)
-            prepare_use_vault_skill_config()
+            prepare_my_vaults_skill_config()
 
         if args.skip_ecs:
             logger.warning("Skipping ECS Web UI deployment (--skip-ecs)")
@@ -3770,7 +3770,7 @@ def main():
             app_url = f"https://{ui_cloudfront_info.get('domain', '')}".rstrip("/")
             sharing_url = app_url
             prepare_doc_sharing_skill_config(s3_bucket_name, sharing_url, app_url)
-            prepare_use_vault_skill_config()
+            prepare_my_vaults_skill_config()
             try:
                 s3_client.upload_file(
                     os.path.join(SKILLS_DIR, "doc-sharing", "config.json"),
@@ -3782,13 +3782,13 @@ def main():
                 logger.warning(f"  doc-sharing config.json re-upload skipped: {e}")
             try:
                 s3_client.upload_file(
-                    os.path.join(SKILLS_DIR, "use-vault", "config.json"),
+                    os.path.join(SKILLS_DIR, "my-vaults", "config.json"),
                     s3_bucket_name,
-                    f"{SKILLS_S3_PREFIX}/use-vault/config.json",
+                    f"{SKILLS_S3_PREFIX}/my-vaults/config.json",
                     ExtraArgs={"ContentType": "application/json"},
                 )
             except Exception as e:
-                logger.warning(f"  use-vault config.json re-upload skipped: {e}")
+                logger.warning(f"  my-vaults config.json re-upload skipped: {e}")
             ensure_harness_sharing_env(
                 harness_info["harness_id"],
                 s3_bucket_name,
