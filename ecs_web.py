@@ -428,6 +428,32 @@ class EcsWebDeployer:
         vpc_info["ecs_sg_id"] = ecs_sg_id
         return vpc_info
 
+    def _alb_is_usable(self, alb: Dict) -> bool:
+        if not alb.get("AvailabilityZones"):
+            return False
+        sg_ids = alb.get("SecurityGroups") or []
+        if not sg_ids:
+            return False
+        try:
+            found = self.ec2.describe_security_groups(GroupIds=sg_ids).get(
+                "SecurityGroups"
+            ) or []
+        except ClientError:
+            return False
+        return len(found) == len(sg_ids)
+
+    def _delete_load_balancer(self, alb_arn: str) -> None:
+        try:
+            listeners = self.elbv2.describe_listeners(LoadBalancerArn=alb_arn)
+            for listener in listeners.get("Listeners") or []:
+                self.elbv2.delete_listener(ListenerArn=listener["ListenerArn"])
+        except ClientError as e:
+            self.logger.warning(f"  Could not delete ALB listeners: {e}")
+        self.elbv2.delete_load_balancer(LoadBalancerArn=alb_arn)
+        waiter = self.elbv2.get_waiter("load_balancers_deleted")
+        waiter.wait(LoadBalancerArns=[alb_arn], WaiterConfig={"Delay": 10, "MaxAttempts": 30})
+        self.logger.info("  ✓ Deleted unusable ALB")
+
     def create_alb(self, vpc_info: Dict) -> Dict[str, str]:
         self.logger.info("Creating Application Load Balancer for Web UI")
         alb_name = f"alb-for-{self.project_name}"
@@ -439,9 +465,14 @@ class EcsWebDeployer:
             albs = self.elbv2.describe_load_balancers(Names=[alb_name])
             if albs["LoadBalancers"]:
                 alb = albs["LoadBalancers"][0]
-                self.logger.info(f"  Reusing ALB: {alb['DNSName']}")
-                self._ensure_alb_idle_timeout(alb["LoadBalancerArn"])
-                return {"arn": alb["LoadBalancerArn"], "dns": alb["DNSName"]}
+                if self._alb_is_usable(alb):
+                    self.logger.info(f"  Reusing ALB: {alb['DNSName']}")
+                    self._ensure_alb_idle_timeout(alb["LoadBalancerArn"])
+                    return {"arn": alb["LoadBalancerArn"], "dns": alb["DNSName"]}
+                self.logger.warning(
+                    "  Existing ALB has no subnets or a missing security group; deleting it"
+                )
+                self._delete_load_balancer(alb["LoadBalancerArn"])
         except ClientError as e:
             if e.response["Error"]["Code"] != "LoadBalancerNotFound":
                 raise
@@ -1177,7 +1208,9 @@ class EcsWebDeployer:
             for origin in origins:
                 if origin.get("Id") != origin_id and origin.get("DomainName") != alb_dns:
                     continue
-                origin["DomainName"] = alb_dns
+                if origin.get("DomainName") != alb_dns:
+                    origin["DomainName"] = alb_dns
+                    updated = True
                 headers = origin.setdefault(
                     "CustomHeaders", {"Quantity": 0, "Items": []}
                 )
@@ -1892,6 +1925,13 @@ class EcsWebDeployer:
                 deploymentConfiguration={
                     "minimumHealthyPercent": 0,
                     "maximumPercent": 100,
+                },
+                networkConfiguration={
+                    "awsvpcConfiguration": {
+                        "subnets": private_subnets,
+                        "securityGroups": [ecs_sg_id],
+                        "assignPublicIp": "DISABLED",
+                    }
                 },
             )
         else:
