@@ -104,6 +104,7 @@ COST_DISPLAY_DECIMALS = 3
 # Bedrock on-demand pricing per 1M tokens (USD). Used for estimated model cost.
 MODEL_PRICING_PER_MILLION: dict[str, dict[str, float]] = {
     "us.anthropic.claude-sonnet-5": {"input": 3.0, "output": 15.0},
+    "global.anthropic.claude-sonnet-5-5": {"input": 2.0, "output": 10.0},
     "us.anthropic.claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
     "us.anthropic.claude-sonnet-4-5": {"input": 3.0, "output": 15.0},
     "us.anthropic.claude-haiku-4-5": {"input": 1.0, "output": 5.0},

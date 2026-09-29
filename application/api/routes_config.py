@@ -22,6 +22,7 @@ router = APIRouter(prefix="/api/config", tags=["config"])
 
 MODELS = [
     "Claude 5.5 Opus",
+    "Claude 5.5 Sonnet",
     "Claude 5.0 Sonnet",
     "Claude 5.0 Opus",
     "Claude 4.6 Sonnet",
