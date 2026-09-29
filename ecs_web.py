@@ -796,33 +796,58 @@ class EcsWebDeployer:
             oai_id = oai_response["CloudFrontOriginAccessIdentity"]["Id"]
             self.logger.info(f"  Created Origin Access Identity: {oai_id}")
 
+        # Prefer CanonicalUser. A newly created OAI ARN fails PutBucketPolicy
+        # with "Invalid principal" until that IAM-style principal propagates.
+        oai_detail = self.cloudfront.get_cloud_front_origin_access_identity(Id=oai_id)
+        canonical = oai_detail["CloudFrontOriginAccessIdentity"]["S3CanonicalUserId"]
+
+        prefixes = [p for p in self._s3_prefixes_for_cloudfront() if p and "*" not in p]
+        if not prefixes:
+            prefixes = ["artifacts", "docs", "images"]
         resources = [
-            f"arn:aws:s3:::{s3_bucket_name}/{prefix}/*"
-            for prefix in self._s3_prefixes_for_cloudfront()
+            f"arn:aws:s3:::{s3_bucket_name}/{prefix}/*" for prefix in prefixes
         ]
+        # {user}/artifacts/... in addition to the legacy artifacts/ prefix.
+        resources.append(f"arn:aws:s3:::{s3_bucket_name}/*/artifacts/*")
         bucket_policy = {
             "Version": "2012-10-17",
             "Statement": [
                 {
                     "Sid": "AllowCloudFrontAccess",
                     "Effect": "Allow",
-                    "Principal": {
-                        "AWS": (
-                            f"arn:aws:iam::cloudfront:user/"
-                            f"CloudFront Origin Access Identity {oai_id}"
-                        )
-                    },
+                    "Principal": {"CanonicalUser": canonical},
                     "Action": "s3:GetObject",
                     "Resource": resources,
                 }
             ],
         }
-        time.sleep(5)
         s3 = boto3.client("s3", region_name=self.region)
-        s3.put_bucket_policy(Bucket=s3_bucket_name, Policy=json.dumps(bucket_policy))
+        last_err: Optional[Exception] = None
+        for attempt in range(1, 9):
+            try:
+                s3.put_bucket_policy(
+                    Bucket=s3_bucket_name, Policy=json.dumps(bucket_policy)
+                )
+                last_err = None
+                break
+            except ClientError as e:
+                last_err = e
+                code = e.response.get("Error", {}).get("Code", "")
+                if code not in {"MalformedPolicy", "AccessDenied"}:
+                    raise
+                wait = min(5 * attempt, 30)
+                self.logger.warning(
+                    "  PutBucketPolicy attempt %s failed (%s); retry in %ss",
+                    attempt,
+                    code,
+                    wait,
+                )
+                time.sleep(wait)
+        if last_err:
+            raise last_err
         self.logger.info(
             "  ✓ S3 bucket policy: OAI GetObject limited to %s",
-            ", ".join(self._s3_prefixes_for_cloudfront()),
+            ", ".join(prefixes + ["*/artifacts"]),
         )
         return oai_id
 

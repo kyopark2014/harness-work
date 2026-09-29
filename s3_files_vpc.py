@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import time
 from typing import Dict, List, Optional
@@ -60,6 +61,17 @@ class S3FilesVpcProvisioner:
                     f"VPC {vpc_id} has no private subnets; "
                     "create private subnets or delete the VPC and re-run installer."
                 )
+            if len(public_subnets) < 2:
+                self.logger.warning(
+                    f"  VPC {vpc_id} has {len(public_subnets)} public subnet(s); "
+                    "ALB needs two. Creating the missing public network."
+                )
+                public_subnets = self._ensure_public_network(
+                    vpc_id, public_subnets, private_subnets
+                )
+            self.logger.info(
+                f"  VPC subnets: public={public_subnets}, private={private_subnets}"
+            )
             vpc_info = {
                 "vpc_id": vpc_id,
                 "public_subnets": public_subnets,
@@ -130,6 +142,247 @@ class S3FilesVpcProvisioner:
                 if str(route.get("GatewayId", "")).startswith("igw-"):
                     return True
         return False
+
+    def _ensure_public_network(
+        self,
+        vpc_id: str,
+        public_subnets: List[str],
+        private_subnets: List[str],
+    ) -> List[str]:
+        """Add IGW, public subnets, and NAT when a reused VPC is private-only."""
+        igw_id = self._ensure_internet_gateway(vpc_id)
+        public_rt = self._ensure_public_route_table(vpc_id, igw_id)
+        for subnet_id in public_subnets:
+            self.ec2.modify_subnet_attribute(
+                SubnetId=subnet_id, MapPublicIpOnLaunch={"Value": True}
+            )
+            self._associate_subnet_route_table(subnet_id, public_rt)
+
+        needed = 2 - len(public_subnets)
+        if needed > 0:
+            public_subnets = list(public_subnets) + self._create_missing_public_subnets(
+                vpc_id, public_subnets, private_subnets, public_rt, needed
+            )
+        if len(public_subnets) < 2:
+            raise RuntimeError(
+                f"VPC {vpc_id} still has {len(public_subnets)} public subnet(s) "
+                "after repair; ALB requires two in different AZs."
+            )
+
+        nat_id = self._ensure_nat_gateway(vpc_id, public_subnets[0])
+        private_rt = self._ensure_private_route_table(vpc_id, nat_id)
+        for subnet_id in private_subnets:
+            self._associate_subnet_route_table(subnet_id, private_rt)
+        return public_subnets
+
+    def _ensure_internet_gateway(self, vpc_id: str) -> str:
+        igws = self.ec2.describe_internet_gateways(
+            Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}]
+        ).get("InternetGateways") or []
+        if igws:
+            return igws[0]["InternetGatewayId"]
+        igw_id = self.ec2.create_internet_gateway(
+            TagSpecifications=[
+                {
+                    "ResourceType": "internet-gateway",
+                    "Tags": [
+                        {"Key": "Name", "Value": f"igw-for-{self.project_name}"}
+                    ],
+                }
+            ]
+        )["InternetGateway"]["InternetGatewayId"]
+        self.ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+        self.logger.info(f"  Created Internet Gateway: {igw_id}")
+        return igw_id
+
+    def _ensure_public_route_table(self, vpc_id: str, igw_id: str) -> str:
+        for rt in self.ec2.describe_route_tables(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("RouteTables", []):
+            for route in rt.get("Routes") or []:
+                if (
+                    route.get("DestinationCidrBlock") == "0.0.0.0/0"
+                    and route.get("GatewayId") == igw_id
+                ):
+                    return rt["RouteTableId"]
+        public_rt = self.ec2.create_route_table(
+            VpcId=vpc_id,
+            TagSpecifications=[
+                {
+                    "ResourceType": "route-table",
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": f"public-rt-for-{self.project_name}",
+                        }
+                    ],
+                }
+            ],
+        )["RouteTable"]["RouteTableId"]
+        self.ec2.create_route(
+            RouteTableId=public_rt,
+            DestinationCidrBlock="0.0.0.0/0",
+            GatewayId=igw_id,
+        )
+        self.logger.info(f"  Created public route table: {public_rt}")
+        return public_rt
+
+    def _create_missing_public_subnets(
+        self,
+        vpc_id: str,
+        public_subnets: List[str],
+        private_subnets: List[str],
+        public_rt: str,
+        needed: int,
+    ) -> List[str]:
+        used_azs = set()
+        if public_subnets:
+            for subnet in self.ec2.describe_subnets(SubnetIds=public_subnets)["Subnets"]:
+                used_azs.add(subnet["AvailabilityZone"])
+        azs: List[str] = []
+        if private_subnets:
+            for subnet in self.ec2.describe_subnets(SubnetIds=private_subnets)["Subnets"]:
+                az = subnet["AvailabilityZone"]
+                if az not in used_azs and az not in azs:
+                    azs.append(az)
+        for zone in self.ec2.describe_availability_zones(
+            Filters=[{"Name": "state", "Values": ["available"]}]
+        )["AvailabilityZones"]:
+            name = zone["ZoneName"]
+            if name not in used_azs and name not in azs:
+                azs.append(name)
+
+        vpc_cidr = self.ec2.describe_vpcs(VpcIds=[vpc_id])["Vpcs"][0]["CidrBlock"]
+        network = ipaddress.ip_network(vpc_cidr)
+        used = [
+            ipaddress.ip_network(subnet["CidrBlock"])
+            for subnet in self.ec2.describe_subnets(
+                Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+            ).get("Subnets", [])
+        ]
+        free = [
+            candidate
+            for candidate in network.subnets(new_prefix=24)
+            if not any(candidate.overlaps(existing) for existing in used)
+        ]
+        created: List[str] = []
+        for az in azs:
+            if len(created) >= needed:
+                break
+            if not free:
+                break
+            cidr = str(free.pop(0))
+            index = len(public_subnets) + len(created)
+            subnet_id = self.ec2.create_subnet(
+                VpcId=vpc_id,
+                CidrBlock=cidr,
+                AvailabilityZone=az,
+                TagSpecifications=[
+                    {
+                        "ResourceType": "subnet",
+                        "Tags": [
+                            {
+                                "Key": "Name",
+                                "Value": f"public-{index}-for-{self.project_name}",
+                            }
+                        ],
+                    }
+                ],
+            )["Subnet"]["SubnetId"]
+            self.ec2.modify_subnet_attribute(
+                SubnetId=subnet_id, MapPublicIpOnLaunch={"Value": True}
+            )
+            self._associate_subnet_route_table(subnet_id, public_rt)
+            created.append(subnet_id)
+            self.logger.info(f"  Created public subnet: {subnet_id} in {az} ({cidr})")
+        return created
+
+    def _ensure_nat_gateway(self, vpc_id: str, public_subnet_id: str) -> str:
+        nats = self.ec2.describe_nat_gateways(
+            Filters=[
+                {"Name": "vpc-id", "Values": [vpc_id]},
+                {"Name": "state", "Values": ["available", "pending"]},
+            ]
+        ).get("NatGateways") or []
+        if nats:
+            nat_id = nats[0]["NatGatewayId"]
+            if nats[0].get("State") != "available":
+                self.logger.info(f"  Waiting for NAT Gateway: {nat_id}")
+                self.ec2.get_waiter("nat_gateway_available").wait(NatGatewayIds=[nat_id])
+            return nat_id
+        eip = self.ec2.allocate_address(Domain="vpc")["AllocationId"]
+        nat_id = self.ec2.create_nat_gateway(
+            SubnetId=public_subnet_id,
+            AllocationId=eip,
+            TagSpecifications=[
+                {
+                    "ResourceType": "natgateway",
+                    "Tags": [
+                        {"Key": "Name", "Value": f"nat-for-{self.project_name}"}
+                    ],
+                }
+            ],
+        )["NatGateway"]["NatGatewayId"]
+        self.logger.info(f"  Waiting for NAT Gateway: {nat_id}")
+        self.ec2.get_waiter("nat_gateway_available").wait(NatGatewayIds=[nat_id])
+        return nat_id
+
+    def _ensure_private_route_table(self, vpc_id: str, nat_id: str) -> str:
+        for rt in self.ec2.describe_route_tables(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        ).get("RouteTables", []):
+            for route in rt.get("Routes") or []:
+                if (
+                    route.get("DestinationCidrBlock") == "0.0.0.0/0"
+                    and route.get("NatGatewayId") == nat_id
+                ):
+                    return rt["RouteTableId"]
+        private_rt = self.ec2.create_route_table(
+            VpcId=vpc_id,
+            TagSpecifications=[
+                {
+                    "ResourceType": "route-table",
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": f"private-rt-for-{self.project_name}",
+                        }
+                    ],
+                }
+            ],
+        )["RouteTable"]["RouteTableId"]
+        self.ec2.create_route(
+            RouteTableId=private_rt,
+            DestinationCidrBlock="0.0.0.0/0",
+            NatGatewayId=nat_id,
+        )
+        self.logger.info(f"  Created private route table: {private_rt}")
+        return private_rt
+
+    def _associate_subnet_route_table(self, subnet_id: str, route_table_id: str) -> None:
+        tables = self.ec2.describe_route_tables(
+            Filters=[{"Name": "association.subnet-id", "Values": [subnet_id]}]
+        ).get("RouteTables", [])
+        for rt in tables:
+            if rt["RouteTableId"] == route_table_id:
+                return
+            for assoc in rt.get("Associations") or []:
+                if assoc.get("SubnetId") != subnet_id:
+                    continue
+                association_id = assoc.get("RouteTableAssociationId")
+                if association_id:
+                    self.ec2.replace_route_table_association(
+                        AssociationId=association_id,
+                        RouteTableId=route_table_id,
+                    )
+                    return
+        try:
+            self.ec2.associate_route_table(
+                SubnetId=subnet_id, RouteTableId=route_table_id
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "Resource.AlreadyAssociated":
+                raise
 
     def _create_vpc(self) -> Dict[str, object]:
         azs = [
