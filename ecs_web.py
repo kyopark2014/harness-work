@@ -30,7 +30,7 @@ ALB_IDLE_TIMEOUT_SECONDS = 1800
 # Managed CloudFront cache/origin policies
 CF_CACHE_POLICY_DISABLED = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
 CF_ORIGIN_REQUEST_ALL_VIEWER = "216adef6-5c7f-47e4-b989-5492eafa07d3"
-CLOUDFRONT_S3_SIGNED_PATHS = ("/images/*", "/docs/*", "/artifacts/*")
+CLOUDFRONT_S3_SIGNED_PATHS = ("/images/*", "/docs/*", "/artifacts/*", "/*/artifacts/*")
 
 ECS_SERVICE_LINKED_ROLE_NAME = "AWSServiceRoleForECS"
 DOCKER_MIN_FREE_MB = 2048

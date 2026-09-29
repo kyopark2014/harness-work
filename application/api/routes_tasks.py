@@ -2,8 +2,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from application.api.routes_auth import require_user_id
-from application import task_store
-from application import utils
+from application import mcp_config, skill, task_store, utils
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -35,12 +34,21 @@ def _resolve_tool_defaults(
     skills: list[str] | None,
     mcp_servers: list[str] | None,
 ) -> tuple[list[str], list[str]]:
-    """Fill missing skill/MCP from settings.json (else favorite_tools)."""
+    """Fill missing skill/MCP from settings.json (else favorite_tools).
+
+    Drop stale names that are no longer discoverable (e.g. renamed skills
+    like ``use-vault`` → ``my-vaults``) so InvokeHarness never gets empty
+    S3 skill URIs.
+    """
     default_skills, default_mcp = utils.get_user_tool_defaults(user_id)
     resolved_skills = list(skills) if skills is not None else list(default_skills)
     resolved_mcp = (
         list(mcp_servers) if mcp_servers is not None else list(default_mcp)
     )
+    available = {s["name"] for s in skill.available_skill_info("base", user_id=user_id)}
+    resolved_skills = [s for s in resolved_skills if s in available]
+    mcp_options = set(mcp_config.MCP_OPTIONS)
+    resolved_mcp = [m for m in resolved_mcp if m in mcp_options]
     return resolved_skills, resolved_mcp
 
 @router.get("")
@@ -88,6 +96,16 @@ def patch_task(task_id: str, body: TaskPatch, request: Request):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     patch = body.model_dump(exclude_unset=True)
+    if "skills" in patch or "mcp_servers" in patch:
+        skills, mcp_servers = _resolve_tool_defaults(
+            user_id,
+            patch.get("skills", task.get("skills")),
+            patch.get("mcp_servers", task.get("mcp_servers")),
+        )
+        if "skills" in patch:
+            patch["skills"] = skills
+        if "mcp_servers" in patch:
+            patch["mcp_servers"] = mcp_servers
     updated = task_store.update_task(task_id, user_id, **patch)
     if updated and ("skills" in patch or "mcp_servers" in patch):
         utils.save_user_tool_defaults(

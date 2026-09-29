@@ -28,7 +28,7 @@ def _default_session_storage_dir() -> str:
 
     - ECS: ``/mnt/app-data`` (S3 Files prefix ``app-data/``) for tasks.db,
       graph, and settings. Skills are loaded via S3 API, not this mount.
-    - Harness runtime: ``/mnt/workspace`` (prefix ``agentcore-sessions/``).
+    - Harness runtime: ``/mnt/workspace`` is the storage bucket root.
     """
     for candidate in ("/mnt/app-data", "/mnt/workspace"):
         if os.path.isdir(candidate):
@@ -38,8 +38,21 @@ def _default_session_storage_dir() -> str:
 
 SESSION_STORAGE_DIR = os.environ.get("SESSION_STORAGE_DIR") or _default_session_storage_dir()
 
-# S3 Files FS prefix for Runtime workspace → s3://{bucket}/agentcore-sessions/
-S3_FILES_SESSION_PREFIX = "agentcore-sessions"
+# Empty when the S3 Files mount is the storage bucket root.
+S3_FILES_SESSION_PREFIX = ""
+
+
+def session_object_key(*parts: str) -> str:
+    """Join an object key on the session mount, omitting an empty prefix."""
+    bits: list[str] = []
+    prefix = (S3_FILES_SESSION_PREFIX or "").strip("/")
+    if prefix:
+        bits.append(prefix)
+    for part in parts:
+        piece = str(part or "").strip("/")
+        if piece:
+            bits.append(piece)
+    return "/".join(bits)
 
 
 def load_config():
@@ -1273,7 +1286,7 @@ def documents_md_runtime_workspace_s3_key(
     safe_name = os.path.basename(file_name or "").strip() or "document.md"
     if not safe_name.lower().endswith(".md"):
         safe_name = f"{os.path.splitext(safe_name)[0]}.md"
-    return f"{S3_FILES_SESSION_PREFIX}/{segment}/artifacts/md/{safe_name}"
+    return session_object_key(segment, "artifacts", "md", safe_name)
 
 
 def documents_md_artifacts_public_url(

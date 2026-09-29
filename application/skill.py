@@ -16,9 +16,6 @@ APPLICATION_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(APPLICATION_DIR)
 SKILLS_DIR = os.path.join(PROJECT_ROOT, "skills")
 
-# S3 Files FS prefix for /mnt/workspace → s3://{bucket}/agentcore-sessions/
-S3_FILES_SESSION_PREFIX = "agentcore-sessions"
-
 
 @dataclass
 class Skill:
@@ -119,8 +116,8 @@ def _is_user_skill(user_id: str | None, name: str) -> bool:
         if not user_segment or not bucket:
             return False
 
-        key = (
-            f"{S3_FILES_SESSION_PREFIX}/{user_segment}/skills/{name}/SKILL.md"
+        key = utils.session_object_key(
+            user_segment, "skills", name, "SKILL.md"
         )
         s3 = boto3.client("s3", region_name=utils.bedrock_region)
         s3.head_object(Bucket=bucket, Key=key)
@@ -168,7 +165,7 @@ def _list_user_skills_from_s3(user_id: str | None) -> list[dict]:
         if not bucket:
             return []
 
-        prefix = f"{S3_FILES_SESSION_PREFIX}/{user_segment}/skills/"
+        prefix = utils.session_object_key(user_segment, "skills") + "/"
         s3 = boto3.client("s3", region_name=utils.bedrock_region)
         paginator = s3.get_paginator("list_objects_v2")
         names: list[str] = []
@@ -308,7 +305,7 @@ def materialize_user_skill_for_harness(
             return None
 
         src_prefix = (
-            f"{S3_FILES_SESSION_PREFIX}/{user_segment}/skills/{name}/"
+            utils.session_object_key(user_segment, "skills", name) + "/"
         )
         dst_prefix = f"{_HARNESS_USER_SKILL_PREFIX}/{user_segment}/{name}/"
         s3 = boto3.client("s3", region_name=utils.bedrock_region)
@@ -389,6 +386,9 @@ def build_harness_skills(
     ``s3://{bucket}/skills/users/{user_id}/{name}/`` (markers + ``evals/``
     stripped) before attach — raw ``agentcore-sessions/...`` URIs break Harness
     extract when S3 Files directory placeholders are present.
+
+    Unknown names (neither builtin nor a materialized user skill) are skipped
+    so InvokeHarness does not fail with ``No files found at S3 URI``.
     """
     if not skill_list:
         return []
@@ -404,30 +404,34 @@ def build_harness_skills(
 
     harness_skills = []
     for name in skill_list:
-        use_user_skill = bool(user_segment) and (
-            _is_user_skill(user_segment, name) or not _is_builtin_skill(name)
-        )
-        if s3_bucket and use_user_skill:
+        if not name or not isinstance(name, str):
+            continue
+        is_builtin = _is_builtin_skill(name)
+        is_user = bool(user_segment) and _is_user_skill(user_segment, name)
+
+        if is_user:
             uri = materialize_user_skill_for_harness(user_segment, name)
-            if not uri:
-                # Last resort: raw session URI (may fail if markers remain)
-                uri = (
-                    f"s3://{s3_bucket}/{S3_FILES_SESSION_PREFIX}/"
-                    f"{user_segment}/skills/{name}/"
-                )
+            if uri:
+                harness_skills.append({"s3": {"uri": uri}})
+            else:
+                # Do not fall back to an empty agentcore-sessions URI —
+                # InvokeHarness rejects prefixes with no objects.
                 logger.warning(
-                    "Using raw session skill URI for %s (materialize failed)",
+                    "Skipping user skill %s: materialize failed (no attachable files)",
                     name,
                 )
-            harness_skills.append({"s3": {"uri": uri}})
-        elif s3_bucket:
-            harness_skills.append(
-                {"s3": {"uri": f"s3://{s3_bucket}/skills/{name}/"}}
-            )
-        elif use_user_skill and user_segment:
-            # Fallback: path inside the runtime session mount
-            harness_skills.append({"path": f"{user_segment}/skills/{name}"})
+        elif is_builtin:
+            if s3_bucket:
+                harness_skills.append(
+                    {"s3": {"uri": f"s3://{s3_bucket}/skills/{name}/"}}
+                )
+            else:
+                harness_skills.append({"path": f"skills/{name}"})
         else:
-            # Fallback: path inside the runtime working directory
-            harness_skills.append({"path": f"skills/{name}"})
+            logger.warning(
+                "Skipping unknown skill %s (not in skills/ and not under "
+                "agentcore-sessions/%s/skills/)",
+                name,
+                user_segment or "?",
+            )
     return harness_skills

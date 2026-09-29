@@ -1121,8 +1121,13 @@ def _agentcore_gateway_role_name() -> str:
     return role_name
 
 
-def create_agentcore_gateway_role() -> str:
-    """IAM service role for the project AgentCore Gateway (all MCP targets)."""
+def create_agentcore_gateway_role() -> tuple[str, bool]:
+    """IAM service role for the project AgentCore Gateway (all MCP targets).
+
+    Returns (role_arn, created). created is True only when the role did not
+    already exist. A recreated role has a new unique ID, so an existing
+    gateway must be updated before it can assume the role again.
+    """
     logger.info("[9/25] Creating project AgentCore Gateway IAM role")
     gateway_name = _agentcore_gateway_name()
     role_name = _agentcore_gateway_role_name()
@@ -1147,7 +1152,7 @@ def create_agentcore_gateway_role() -> str:
             }
         ],
     }
-    role_arn, _ = create_iam_role(
+    role_arn, role_created = create_iam_role(
         role_name,
         assume_role_policy,
         description=f"Service role for AgentCore Gateway ({project_name})",
@@ -1190,7 +1195,25 @@ def create_agentcore_gateway_role() -> str:
         policy,
     )
     logger.info(f"✓ AgentCore Gateway role ready: {role_arn}")
-    return role_arn
+    return role_arn, role_created
+
+
+def _existing_iam_role_arns(role_arns: List[str]) -> List[str]:
+    """Drop role ARNs that do not exist yet. PutResourcePolicy rejects them."""
+    existing: List[str] = []
+    for role_arn in role_arns:
+        role_name = role_arn.rsplit("/", 1)[-1]
+        try:
+            iam_client.get_role(RoleName=role_name)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchEntity":
+                logger.info(
+                    f"  Skipping resource-policy principal; role does not exist yet: {role_name}"
+                )
+                continue
+            raise
+        existing.append(role_arn)
+    return existing
 
 
 def put_mcp_runtime_resource_policy(
@@ -1199,9 +1222,13 @@ def put_mcp_runtime_resource_policy(
     harness_role_arn: Optional[str] = None,
 ) -> None:
     """Allow Gateway (and Harness) to InvokeAgentRuntime on an MCP Runtime."""
-    principals = [gateway_role_arn]
+    candidates = [gateway_role_arn]
     if harness_role_arn:
-        principals.append(harness_role_arn)
+        candidates.append(harness_role_arn)
+    principals = _existing_iam_role_arns(candidates)
+    if not principals:
+        logger.warning("  No existing IAM principals; skipping MCP Runtime resource policy")
+        return
     # PutResourcePolicy requires Resource to be exactly the target runtime ARN
     # (not "*"); multiple principals are allowed in one statement.
     policy = {
@@ -1395,7 +1422,7 @@ def ensure_project_agentcore_gateway() -> Dict[str, str]:
     """Create or reuse the shared project AgentCore Gateway (IAM inbound)."""
     logger.info("[10/25] Ensuring project AgentCore Gateway")
     gateway_name = _agentcore_gateway_name()
-    gateway_role_arn = create_agentcore_gateway_role()
+    gateway_role_arn, role_created = create_agentcore_gateway_role()
 
     gateway_id = None
     next_token = None
@@ -1417,6 +1444,7 @@ def ensure_project_agentcore_gateway() -> Dict[str, str]:
 
     if not gateway_id:
         logger.info(f"  Creating gateway: {gateway_name}")
+        # New roles are not assumable until IAM propagates.
         time.sleep(12)
         created = agentcore_control_client.create_gateway(
             name=gateway_name,
@@ -1428,6 +1456,23 @@ def ensure_project_agentcore_gateway() -> Dict[str, str]:
         )
         gateway_id = created["gatewayId"]
         logger.info(f"  ✓ Gateway created: {gateway_id}")
+    else:
+        # Rebind even when the role ARN is unchanged. Deleting and recreating
+        # the role keeps the ARN but changes the role ID, and the gateway
+        # keeps assuming the old ID until UpdateGateway.
+        if role_created:
+            logger.info("  Waiting for recreated gateway role to propagate")
+            time.sleep(12)
+        logger.info(f"  Rebinding gateway {gateway_id} to {gateway_role_arn}")
+        agentcore_control_client.update_gateway(
+            gatewayIdentifier=gateway_id,
+            name=gateway_name,
+            description=f"Shared IAM Gateway for {project_name} MCP runtimes",
+            roleArn=gateway_role_arn,
+            protocolType="MCP",
+            authorizerType="AWS_IAM",
+        )
+        logger.info(f"  ✓ Gateway rebound to execution role: {gateway_id}")
 
     gateway = _wait_gateway_ready(gateway_id)
     gateway_arn = gateway.get("gatewayArn") or (
@@ -1933,9 +1978,12 @@ def create_harness_execution_role(
                 "Sid": "AgentCoreSkillS3GetObject",
                 "Effect": "Allow",
                 "Action": ["s3:GetObject"],
-                # Intentionally exclude app-data/* (ECS tasks.db / graph / settings).
+                # Workspace objects live at the bucket root ({user}/skills, artifacts).
+                # Legacy prefixes stay readable until installer copies them to root.
                 "Resource": [
                     f"arn:aws:s3:::{_bucket_name()}/skills/*",
+                    f"arn:aws:s3:::{_bucket_name()}/*/skills/*",
+                    f"arn:aws:s3:::{_bucket_name()}/*/artifacts/*",
                     f"arn:aws:s3:::{_bucket_name()}/agentcore-sessions/*",
                     f"arn:aws:s3:::{_bucket_name()}/artifacts/*",
                     f"arn:aws:s3:::{_bucket_name()}/images/*",
@@ -3673,6 +3721,14 @@ def main():
                 "agentcore_gateway_arn"
             ),
         )
+        mcp_runtime_arn = knowledge_base_mcp_info.get("agent_runtime_arn")
+        gateway_role_arn = knowledge_base_mcp_info.get("agentcore_gateway_role")
+        if mcp_runtime_arn and gateway_role_arn:
+            put_mcp_runtime_resource_policy(
+                agent_runtime_arn=mcp_runtime_arn,
+                gateway_role_arn=gateway_role_arn,
+                harness_role_arn=execution_role_arn,
+            )
         execution_role_name = f"role-harness-for-{project_name}-{region}"
         agentcore_memory_role_arn = create_agentcore_memory_role()
         memory_id = create_agentcore_memory(agentcore_memory_role_arn)
@@ -3897,7 +3953,7 @@ def main():
         )
         logger.info(
             f"  S3 Files (Harness) Mount: {s3_files_info.get('mount_path')} "
-            f"(prefix=agentcore-sessions/, networkMode=VPC)"
+            f"(prefix=/, networkMode=VPC)"
         )
         if s3_files_app_data_info:
             logger.info(
@@ -3907,7 +3963,7 @@ def main():
             logger.info(
                 f"  S3 Files (ECS app-data) Mount: "
                 f"{s3_files_app_data_info.get('mount_path')} "
-                f"(prefix=app-data/)"
+                f"(prefix=/)"
             )
         logger.info(f"  Execution Role: {execution_role_arn}")
         logger.info(f"  AgentCore Memory Role: {agentcore_memory_role_arn}")
