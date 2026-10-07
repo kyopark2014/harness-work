@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import html
 import logging
+import unicodedata
 from pathlib import Path
 from urllib.parse import quote, unquote
 
@@ -106,7 +107,7 @@ def _load_drawings_list_payload(user_id: str, *, enrich: bool = False) -> dict:
 
 
 def _safe_doc_name(name: str) -> str:
-    cleaned = Path(unquote(name or "")).name.strip()
+    cleaned = utils.nfc_filename(unquote(name or ""))
     if not cleaned or cleaned in {".", ".."}:
         raise HTTPException(status_code=400, detail="Invalid document name")
     return cleaned
@@ -485,7 +486,7 @@ def documents_projects_complete(body: DocumentsCompleteRequest, request: Request
 
     expected_key = utils.documents_projects_s3_key(safe_name, user_id=user_id)
     key = (body.s3_key or "").strip()
-    if key != expected_key:
+    if unicodedata.normalize("NFC", key) != unicodedata.normalize("NFC", expected_key):
         raise HTTPException(status_code=400, detail="Invalid upload target")
 
     head = utils.head_session_upload_object(key)
@@ -531,7 +532,7 @@ def documents_projects_complete(body: DocumentsCompleteRequest, request: Request
 async def _upload_documents_project_multipart(request: Request, file: UploadFile) -> dict:
     """Legacy multipart upload for project docs (small files only)."""
     user_id = require_user_id(request)
-    name = (file.filename or "").strip() or "upload.bin"
+    name = utils.nfc_filename(file.filename, default="upload.bin")
     try:
         data = await file.read()
     finally:
@@ -634,7 +635,7 @@ def documents_drawings_complete(body: DocumentsCompleteRequest, request: Request
 
     expected_key = utils.documents_drawings_s3_key(safe_name, user_id=user_id)
     key = (body.s3_key or "").strip()
-    if key != expected_key:
+    if unicodedata.normalize("NFC", key) != unicodedata.normalize("NFC", expected_key):
         raise HTTPException(status_code=400, detail="Invalid upload target")
 
     head = utils.head_session_upload_object(key)
@@ -680,7 +681,7 @@ def documents_drawings_complete(body: DocumentsCompleteRequest, request: Request
 async def _upload_documents_drawing_multipart(request: Request, file: UploadFile) -> dict:
     """Legacy multipart upload for drawing docs (small files only)."""
     user_id = require_user_id(request)
-    name = (file.filename or "").strip() or "upload.bin"
+    name = utils.nfc_filename(file.filename, default="upload.bin")
     try:
         data = await file.read()
     finally:

@@ -1,6 +1,16 @@
 import type { AppConfig, Message, StreamEvent, Task } from "./types";
 import { uiError, uiLog } from "./debug";
 
+/** macOS file pickers yield NFD Hangul. Uploads store and address NFC. */
+function fileWithNfcName(file: File): File {
+  const name = file.name.normalize("NFC");
+  if (!name || name === file.name) return file;
+  return new File([file], name, {
+    type: file.type,
+    lastModified: file.lastModified,
+  });
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const method = init?.method ?? "GET";
   uiLog(`api:${method} ${path}`);
@@ -242,6 +252,7 @@ export const api = {
   uploadDocumentsProjectFile: async (
     file: File,
   ): Promise<DocumentsUploadResult> => {
+    file = fileWithNfcName(file);
     uiLog("documents:project-upload start", { name: file.name, size: file.size });
     const presign = await request<DocumentsPresignResult>(
       "/api/documents/projects/presign",
@@ -306,6 +317,7 @@ export const api = {
   uploadDocumentsDrawingFile: async (
     file: File,
   ): Promise<DocumentsUploadResult> => {
+    file = fileWithNfcName(file);
     uiLog("documents:drawing-upload start", { name: file.name, size: file.size });
     const presign = await request<DocumentsPresignResult>(
       "/api/documents/drawings/presign",
@@ -393,6 +405,7 @@ export const api = {
   getMessages: (id: string) =>
     request<{ messages: Message[] }>(`/api/tasks/${id}/messages`),
   uploadToRag: async (file: File): Promise<RagUploadResult> => {
+    file = fileWithNfcName(file);
     uiLog("rag:upload start", { name: file.name, size: file.size });
     const form = new FormData();
     form.append("file", file);
@@ -420,6 +433,7 @@ export const api = {
     return data;
   },
   uploadFile: async (file: File): Promise<FileUploadResult> => {
+    file = fileWithNfcName(file);
     uiLog("file:upload start", { name: file.name, size: file.size, type: file.type });
     const form = new FormData();
     form.append("file", file);

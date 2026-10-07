@@ -15,7 +15,7 @@ IMAGE_ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 
 def _validate_image_filename(filename: str) -> str:
-    name = os.path.basename(filename or "").strip()
+    name = utils.nfc_filename(filename)
     if not name:
         raise HTTPException(status_code=400, detail="File name is required")
     ext = os.path.splitext(name)[1].lower()

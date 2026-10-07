@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -120,15 +121,23 @@ def _extracted_at_from_paths(
     return None
 
 
+def _nfc_name(value: str) -> str:
+    """Compose Hangul so an NFD upload and an NFC lookup share one key."""
+    return unicodedata.normalize("NFC", value or "")
+
+
 def sanitize_documents_filename(filename: str, *, default: str = "upload.bin") -> str:
     """Return a shell/path-safe basename (spaces → ``_``, strip unsafe chars).
+
+    The basename is NFC first. macOS sends decomposed Hangul (NFD); composing
+    it keeps the sanitized name stable across platforms.
 
     Preserves a single final extension (lowercased). Examples::
 
         ``s9540_3_2025 1.pdf`` → ``s9540_3_2025_1.pdf``
         ``Report (final).PDF`` → ``Report_final.pdf``
     """
-    name = os.path.basename((filename or "").strip()) or default
+    name = _nfc_name(os.path.basename((filename or "").strip())) or default
     name = name.replace("\x00", "")
     if name in {".", ".."}:
         return default
@@ -274,21 +283,22 @@ def save_doc_list(
 
 def _norm_key(filename: str | None = None, source_path: str | None = None) -> str:
     if filename and str(filename).strip():
-        return os.path.basename(str(filename).strip())
+        return _nfc_name(os.path.basename(str(filename).strip()))
     if source_path:
-        return os.path.basename(str(source_path).strip())
+        return _nfc_name(os.path.basename(str(source_path).strip()))
     return ""
 
 
 def _find_index(documents: list[Any], key: str) -> int:
-    if not key:
+    want = _nfc_name(key)
+    if not want:
         return -1
     for i, item in enumerate(documents):
         if not isinstance(item, dict):
             continue
-        name = str(item.get("filename") or "")
-        src = str(item.get("source_path") or "")
-        if name == key or os.path.basename(src) == key:
+        name = _nfc_name(str(item.get("filename") or ""))
+        src = _nfc_name(os.path.basename(str(item.get("source_path") or "")))
+        if name == want or src == want:
             return i
     return -1
 

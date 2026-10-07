@@ -3,6 +3,7 @@ import os
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 
+from application import utils
 from application.api.routes_auth import require_user_id
 from application.services.rag_service import RagServiceError, ingest_rag_upload
 
@@ -30,7 +31,7 @@ RAG_ALLOWED_EXTENSIONS = {
 
 
 def _validate_filename(filename: str) -> str:
-    name = os.path.basename(filename or "").strip()
+    name = utils.nfc_filename(filename)
     if not name:
         raise HTTPException(status_code=400, detail="File name is required")
     ext = os.path.splitext(name)[1].lower()
