@@ -483,16 +483,16 @@ materialize 실패 시에만 raw `agentcore-sessions/.../skills/{name}/` URI로 
 AgentCore Harness microVM에서 에이전트가 실제로 쓸 수 있는 런타임은 로컬 Mac/Linux와 다릅니다.  
 `SKILL.md`·스크립트·시스템 프롬프트(`agentcore_client._HARNESS_SYSTEM_PROMPT_BASE`)는 아래 제약을 전제로 작성하세요.
 
-### Node.js / npm 미지원 → Python 사용
+### Node.js / npm 자동 설치
 
-| 금지 | 대안 |
-|------|------|
-| `node`, `npm`, `npx` | `python3` |
-| `docx` (npm) / docx-js | `python-docx` |
-| `pptxgenjs` / react-icons | `python-pptx` |
+harness 기본 이미지에는 `node`, `npm`, `npx`가 없어서, `run_harness`가 세션마다 한 번
+`InvokeAgentRuntimeCommand`로 설치합니다 (`ensure_node_installed`).
 
-- Node 바이너리가 없어 `command not found` / exit 127로 끝납니다.
-- 문서·슬라이드·스프레드시트는 **처음부터 Python**으로 생성하세요. Node 경로를 “있는지 확인”하는 probe도 하지 마세요.
+- 이미 설치돼 있으면 건너뜁니다.
+- `apt-get install -y --no-install-recommends nodejs npm`을 먼저 시도하고, 실패할 때만 `apt-get update` 후 재시도합니다.
+- 설치 실패는 경고 로그만 남기고 대화는 계속 진행합니다.
+- 문서·슬라이드 생성은 계속 Python(python-docx, python-pptx)을 사용합니다. docx-js, pptxgenjs는 사용하지 않습니다.
+- 설치 직후 `npm install -g <pkg>`는 세션 안에서만 유지됩니다. 새 세션에서는 node/npm만 다시 설치되고 전역 패키지는 다시 설치해야 합니다.
 
 ### `pip` 없음 → `pip3` 명시
 

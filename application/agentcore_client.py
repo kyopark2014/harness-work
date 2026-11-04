@@ -680,8 +680,10 @@ _HARNESS_SYSTEM_PROMPT_BASE = (
     "한국어로 답변하세요.\n"
     "\n"
     "## Runtime environment\n"
-    "- 이 환경에는 Node.js/npm이 없습니다. `node`, `npm`, `npx`를 시도하지 마세요 "
-    "(command not found / exit 127).\n"
+    "- 세션 시작 시 Node.js/npm(`node`, `npm`, `npx`)이 자동 설치됩니다. "
+    "만약 command not found (exit 127)가 나오면 "
+    "`apt-get install -y nodejs npm`으로 설치한 뒤 사용하세요 "
+    "(실패 시에만 `apt-get update` 후 재시도).\n"
     "- 문서·슬라이드·스프레드시트 생성은 처음부터 Python을 사용하세요 "
     "(예: python-docx, python-pptx, openpyxl). "
     "docx-js / pptxgenjs 등 Node 패키지 경로는 사용하지 마세요.\n"
@@ -751,6 +753,59 @@ def build_harness_system_prompt(actor_id: str | None = None) -> list[dict]:
             "닉네임·표시 이름·추측 값으로 바꾸지 마세요.\n"
         )
     return [{"text": text}]
+
+
+_NODE_INSTALL_COMMAND = (
+    "command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 "
+    "|| apt-get install -y -qq --no-install-recommends nodejs npm "
+    "|| (apt-get update -qq && apt-get install -y -qq --no-install-recommends nodejs npm)"
+)
+_node_ready_sessions: set[str] = set()
+
+
+def _resolve_runtime_arn_for_command(harness_arn: str) -> str:
+    """InvokeAgentRuntimeCommand needs the backing Runtime ARN, not the Harness ARN."""
+    cfg_arn = (config.get("harness_runtime_arn") or "").strip()
+    if cfg_arn:
+        return cfg_arn
+    if ":runtime/" in harness_arn:
+        return harness_arn
+    control = boto3.client("bedrock-agentcore-control", region_name=bedrock_region)
+    harness_id = harness_arn.rsplit("/", 1)[-1]
+    harness = control.get_harness(harnessId=harness_id)["harness"]
+    env = (harness.get("environment") or {}).get("agentCoreRuntimeEnvironment") or {}
+    return env.get("agentRuntimeArn") or harness_arn
+
+
+def ensure_node_installed(client, harness_arn: str, session_id: str) -> None:
+    """Install nodejs/npm in the harness session once (best effort, never raises)."""
+    if session_id in _node_ready_sessions:
+        return
+    try:
+        response = client.invoke_agent_runtime_command(
+            agentRuntimeArn=_resolve_runtime_arn_for_command(harness_arn),
+            runtimeSessionId=session_id,
+            body={"command": _NODE_INSTALL_COMMAND, "timeout": 300},
+        )
+        exit_code = None
+        stderr = []
+        for event in response.get("stream") or []:
+            chunk = event.get("chunk") or {}
+            stop = chunk.get("contentStop")
+            if stop:
+                exit_code = stop.get("exitCode")
+            err = (chunk.get("contentDelta") or {}).get("stderr")
+            if err:
+                stderr.append(err)
+        if exit_code == 0:
+            _node_ready_sessions.add(session_id)
+            logger.info(f"node/npm ready in session {session_id}")
+        else:
+            logger.warning(
+                f"node/npm install exit={exit_code}: {''.join(stderr)[-500:]}"
+            )
+    except Exception as exc:
+        logger.warning(f"node/npm install failed (continuing): {exc}")
 
 
 def run_harness(
@@ -879,6 +934,8 @@ def run_harness(
             invoke_kwargs["skills"] = skills
         if tools:
             invoke_kwargs["tools"] = tools
+
+        ensure_node_installed(client, harness_arn, session_id)
 
         response = client.invoke_harness(**invoke_kwargs)
 
