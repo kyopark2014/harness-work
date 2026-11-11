@@ -76,6 +76,11 @@ def get_config(request: Request):
     default_skills = [s for s in default_skills if s in skill_options]
     default_mcp = [m for m in default_mcp if m in mcp_options]
     config = utils.load_config()
+    # Per-user Settings (model / Guardrail / Memory) shared by all tasks.
+    flags = utils.get_user_task_feature_flags(user_id)
+    default_model = utils.get_user_preferred_model(user_id) or DEFAULT_MODEL
+    if default_model not in MODELS:
+        default_model = DEFAULT_MODEL
     return {
         "projectName": config.get("projectName", "agentcore"),
         "is_admin": False,
@@ -83,10 +88,12 @@ def get_config(request: Request):
         "mcp_servers": mcp_options,
         "models": MODELS,
         "gateway_models": [],
-        "default_model": DEFAULT_MODEL,
+        "default_model": default_model,
         "default_gateway_model": DEFAULT_MODEL,
         "default_skills": default_skills,
         "default_mcp_servers": default_mcp,
+        "default_guardrail_enabled": flags["guardrail_enabled"],
+        "default_memory_enabled": flags["memory_enabled"],
         "llm_gateway_configured": False,
     }
 
