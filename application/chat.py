@@ -22,7 +22,7 @@ bedrock_region = config['region']
 accountId = config['accountId']
 projectName = config['projectName']
 
-model_name = "Claude 4.6 Sonnet"
+model_name = "Claude 5.0 Sonnet"
 model_type = "claude"
 models = info.get_model_info(model_name)
 model_id = models[0]["model_id"]

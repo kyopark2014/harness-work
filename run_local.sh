@@ -35,6 +35,31 @@ else
   echo "    lsof not found; skipping port check"
 fi
 
+# Task store = DynamoDB. Locally use DynamoDB Local (tables are auto-created on startup).
+# Set DYNAMODB_ENDPOINT_URL yourself to use another endpoint (or unset + TASK_STORE_AUTO_CREATE=1
+# with real AWS credentials to use the AWS tables).
+if [[ -z "${DYNAMODB_ENDPOINT_URL:-}" ]]; then
+  DDB_PORT="${DDB_LOCAL_PORT:-8000}"
+  DDB_NAME="harness-work-dynamodb-local"
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "docker is required to run DynamoDB Local (or set DYNAMODB_ENDPOINT_URL)" >&2
+    exit 1
+  fi
+  if [[ "$(docker inspect -f '{{.State.Running}}' "${DDB_NAME}" 2>/dev/null || true)" != "true" ]]; then
+    echo "==> Starting DynamoDB Local on :${DDB_PORT} (data: application/data/dynamodb)"
+    mkdir -p "${ROOT}/application/data/dynamodb"
+    docker rm -f "${DDB_NAME}" >/dev/null 2>&1 || true
+    docker run -d --name "${DDB_NAME}" -u root -p "${DDB_PORT}:8000" \
+      -v "${ROOT}/application/data/dynamodb:/home/dynamodblocal/data" \
+      amazon/dynamodb-local:latest -jar DynamoDBLocal.jar -sharedDb -dbPath /home/dynamodblocal/data >/dev/null
+    sleep 2
+  else
+    echo "==> DynamoDB Local already running (${DDB_NAME})"
+  fi
+  export DYNAMODB_ENDPOINT_URL="http://localhost:${DDB_PORT}"
+fi
+echo "    DynamoDB endpoint: ${DYNAMODB_ENDPOINT_URL}"
+
 echo "==> Starting uvicorn on 0.0.0.0:${PORT}"
 echo "    Open http://localhost:${PORT}"
 # Local-only: Swagger UI at /docs (disabled by default in production/ECS).

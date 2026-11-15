@@ -1,433 +1,358 @@
-"""Task/message store with per-user SQLite DBs and a global legacy DB."""
+"""Task/message store backed by DynamoDB.
+
+Tables (names derive from the project name; override with env vars):
+
+* ``{project}-tasks``                PK ``user_id``, SK ``task_id``
+* ``{project}-messages``             PK ``task_id``, SK ``message_id``,
+                                      LSI ``task_id-created_at-index`` (chronological order)
+
+Every write is a single-item, field-level operation, so concurrent ECS tasks (or the
+same user on several machines) can no longer overwrite each other with a stale
+whole-file copy the way the former per-user SQLite files could.
+
+Local development: set ``DYNAMODB_ENDPOINT_URL`` (``run_local.sh`` starts DynamoDB
+Local) and the tables are created automatically on startup.
+"""
 
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
 import sqlite3
+import threading
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Iterator
+from typing import Any
 
-from application.task_store_persistence import (
-    durable_user_db_path,
-    flush_persist,
-    restore_user_db,
-    schedule_persist,
-    working_db_path,
-    working_user_db_path,
-)
-from application.utils import sanitize_user_path_segment
+import boto3
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-_APPLICATION_DIR = os.path.dirname(os.path.abspath(__file__))
-_DATA_DIR = os.path.join(_APPLICATION_DIR, "data")
-_GLOBAL_DB_PATH = working_db_path()
+DEFAULT_MODEL = "Claude 5.0 Sonnet"
 
-DEFAULT_MODEL = "Claude 4.6 Sonnet"
+_MESSAGES_BY_CREATED_INDEX = "task_id-created_at-index"
 
-_USER_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS tasks (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  title TEXT,
-  runtime_session_id TEXT NOT NULL UNIQUE,
-  model_name TEXT,
-  skills_json TEXT,
-  mcp_servers_json TEXT,
-  guardrail_enabled INTEGER DEFAULT 0,
-  llm_gateway_enabled INTEGER DEFAULT 0,
-  memory_enabled INTEGER DEFAULT 1,
-  pinned INTEGER DEFAULT 0,
-  created_at TEXT,
-  updated_at TEXT
-);
+# DynamoDB items are capped at 400 KB, but the messages table has an LSI that projects
+# ALL attributes and the limit applies to the item plus its index copy (~200 KB each).
+_MAX_ITEM_PAYLOAD_BYTES = 180_000
 
-CREATE TABLE IF NOT EXISTS messages (
-  id TEXT PRIMARY KEY,
-  task_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  content TEXT,
-  images_json TEXT,
-  tool_events_json TEXT,
-  created_at TEXT,
-  FOREIGN KEY (task_id) REFERENCES tasks(id)
-);
+_local = threading.local()
+_tables_ready = False
+_tables_lock = threading.Lock()
 
-CREATE INDEX IF NOT EXISTS idx_tasks_user_updated
-  ON tasks(user_id, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_task_created
-  ON messages(task_id, created_at ASC);
-"""
 
-_GLOBAL_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS tasks (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  title TEXT,
-  runtime_session_id TEXT NOT NULL UNIQUE,
-  model_name TEXT,
-  skills_json TEXT,
-  mcp_servers_json TEXT,
-  guardrail_enabled INTEGER DEFAULT 0,
-  llm_gateway_enabled INTEGER DEFAULT 0,
-  memory_enabled INTEGER DEFAULT 1,
-  created_at TEXT,
-  updated_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-  id TEXT PRIMARY KEY,
-  task_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  content TEXT,
-  images_json TEXT,
-  tool_events_json TEXT,
-  created_at TEXT,
-  FOREIGN KEY (task_id) REFERENCES tasks(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_tasks_user_updated
-  ON tasks(user_id, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_task_created
-  ON messages(task_id, created_at ASC);
-
-CREATE TABLE IF NOT EXISTS login_events (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  method TEXT NOT NULL,
-  name TEXT,
-  picture TEXT,
-  logged_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_login_events_logged
-  ON login_events(logged_at DESC);
-CREATE INDEX IF NOT EXISTS idx_login_events_user
-  ON login_events(user_id, logged_at DESC);
-"""
-
+# ---------------------------------------------------------------------------
+# Configuration / clients
+# ---------------------------------------------------------------------------
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _configure_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
+def _app_config() -> dict[str, Any]:
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.Error:
-        pass
-    return conn
+        from application import utils
+
+        cfg = utils.load_config()
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
 
 
-def _connect_path(db_path: str) -> sqlite3.Connection:
-    parent = os.path.dirname(db_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
-    return _configure_connection(conn)
+def _project_name() -> str:
+    env_name = (os.environ.get("TASK_DB_PROJECT") or "").strip()
+    if env_name:
+        return env_name
+    name = _app_config().get("projectName")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return "harness-work"
 
 
-def _connect_global() -> sqlite3.Connection:
-    global _GLOBAL_DB_PATH
-    _GLOBAL_DB_PATH = working_db_path()
-    return _connect_path(_GLOBAL_DB_PATH)
-
-
-def _apply_task_column_migrations(conn: sqlite3.Connection) -> None:
-    for stmt in (
-        "ALTER TABLE tasks ADD COLUMN pinned INTEGER DEFAULT 0",
-        "ALTER TABLE tasks ADD COLUMN memory_enabled INTEGER DEFAULT 1",
-        "ALTER TABLE tasks ADD COLUMN llm_gateway_enabled INTEGER DEFAULT 0",
-    ):
-        try:
-            conn.execute(stmt)
-        except sqlite3.OperationalError:
-            pass
-
-
-def _init_user_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(_USER_SCHEMA_SQL)
-    _apply_task_column_migrations(conn)
-
-
-def _init_global_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(_GLOBAL_SCHEMA_SQL)
-    _apply_task_column_migrations(conn)
-
-
-def init_db() -> None:
-    """Initialize the global DB (login_events + legacy tables)."""
-    global _GLOBAL_DB_PATH
-    _GLOBAL_DB_PATH = working_db_path()
-    with _connect_global() as conn:
-        _init_global_schema(conn)
-
-
-@contextmanager
-def _user_db_lock(user_id: str) -> Iterator[None]:
-    lock_path = working_user_db_path(user_id) + ".lock"
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    with open(lock_path, "a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def _db_ready(path: str) -> bool:
-    return os.path.isfile(path) and os.path.getsize(path) > 0
-
-
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    if "." in table:
-        schema, name = table.split(".", 1)
-        rows = conn.execute(f"PRAGMA {schema}.table_info({name})").fetchall()
-    else:
-        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    return {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in rows}
-
-
-def _migrate_user_from_legacy(user_db_path: str, user_id: str) -> None:
-    """Create user DB and copy this user's tasks/messages from legacy global DB."""
-    legacy = working_db_path()
-    parent = os.path.dirname(user_db_path)
-    os.makedirs(parent, exist_ok=True)
-    tmp_path = user_db_path + f".migrating-{os.getpid()}"
-    for suffix in ("", "-wal", "-shm"):
-        side = tmp_path + suffix
-        if os.path.isfile(side):
-            os.remove(side)
-
-    task_rows: list[sqlite3.Row] = []
-    message_rows: list[sqlite3.Row] = []
-    task_cols: list[str] = []
-    msg_cols: list[str] = []
-
-    if _db_ready(legacy):
-        with _connect_path(legacy) as legacy_conn:
-            legacy_task_cols = _table_columns(legacy_conn, "tasks")
-            legacy_msg_cols = _table_columns(legacy_conn, "messages")
-            task_cols = [
-                c
-                for c in (
-                    "id",
-                    "user_id",
-                    "title",
-                    "runtime_session_id",
-                    "model_name",
-                    "skills_json",
-                    "mcp_servers_json",
-                    "guardrail_enabled",
-                    "llm_gateway_enabled",
-                    "memory_enabled",
-                    "pinned",
-                    "created_at",
-                    "updated_at",
-                )
-                if c in legacy_task_cols
-            ]
-            msg_cols = [
-                c
-                for c in (
-                    "id",
-                    "task_id",
-                    "role",
-                    "content",
-                    "images_json",
-                    "tool_events_json",
-                    "created_at",
-                )
-                if c in legacy_msg_cols
-            ]
-            if task_cols:
-                col_csv = ", ".join(task_cols)
-                task_rows = legacy_conn.execute(
-                    f"SELECT {col_csv} FROM tasks WHERE user_id = ?",
-                    (user_id,),
-                ).fetchall()
-            if msg_cols and task_rows:
-                col_csv = ", ".join(msg_cols)
-                message_rows = legacy_conn.execute(
-                    f"""
-                    SELECT {col_csv}
-                    FROM messages
-                    WHERE task_id IN (
-                      SELECT id FROM tasks WHERE user_id = ?
-                    )
-                    """,
-                    (user_id,),
-                ).fetchall()
-
-    conn = _connect_path(tmp_path)
-    try:
-        _init_user_schema(conn)
-        dest_task_cols = _table_columns(conn, "tasks")
-        dest_msg_cols = _table_columns(conn, "messages")
-        task_cols = [c for c in task_cols if c in dest_task_cols]
-        msg_cols = [c for c in msg_cols if c in dest_msg_cols]
-        if task_cols and task_rows:
-            col_csv = ", ".join(task_cols)
-            placeholders = ", ".join("?" for _ in task_cols)
-            conn.executemany(
-                f"INSERT OR IGNORE INTO tasks ({col_csv}) VALUES ({placeholders})",
-                [tuple(row[c] for c in task_cols) for row in task_rows],
-            )
-        if msg_cols and message_rows:
-            col_csv = ", ".join(msg_cols)
-            placeholders = ", ".join("?" for _ in msg_cols)
-            conn.executemany(
-                f"INSERT OR IGNORE INTO messages ({col_csv}) VALUES ({placeholders})",
-                [tuple(row[c] for c in msg_cols) for row in message_rows],
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-    os.replace(tmp_path, user_db_path)
-    for suffix in ("-wal", "-shm"):
-        src = tmp_path + suffix
-        dst = user_db_path + suffix
-        if os.path.isfile(src):
-            os.replace(src, dst)
-        elif os.path.isfile(dst):
-            os.remove(dst)
-    logger.info(
-        "Migrated user tasks DB for %s -> %s (tasks=%s messages=%s)",
-        user_id,
-        user_db_path,
-        len(task_rows),
-        len(message_rows),
+def _region() -> str:
+    return (
+        os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or str(_app_config().get("region") or "").strip()
+        or "us-west-2"
     )
 
 
-def ensure_user_db(user_id: str) -> str:
-    """Return working path for the user's tasks/messages DB, creating/migrating if needed."""
-    if not sanitize_user_path_segment(user_id):
-        raise ValueError(f"Invalid user_id: {user_id!r}")
+def _endpoint_url() -> str | None:
+    return (os.environ.get("DYNAMODB_ENDPOINT_URL") or "").strip() or None
 
-    working = working_user_db_path(user_id)
-    with _user_db_lock(user_id):
-        if _db_ready(working):
-            with _connect_path(working) as conn:
-                _init_user_schema(conn)
-            return working
 
-        restored = False
+def tasks_table_name() -> str:
+    return (os.environ.get("TASKS_TABLE") or "").strip() or f"{_project_name()}-tasks"
+
+
+def messages_table_name() -> str:
+    return (os.environ.get("MESSAGES_TABLE") or "").strip() or f"{_project_name()}-messages"
+
+
+def _resource():
+    # boto3 resources are not thread-safe; keep one per thread.
+    res = getattr(_local, "resource", None)
+    if res is None:
+        kwargs: dict[str, Any] = {"region_name": _region()}
+        endpoint = _endpoint_url()
+        if endpoint:
+            kwargs["endpoint_url"] = endpoint
+            # DynamoDB Local accepts any credentials; make sure some exist.
+            if not os.environ.get("AWS_ACCESS_KEY_ID"):
+                kwargs["aws_access_key_id"] = "local"
+                kwargs["aws_secret_access_key"] = "local"
+        res = boto3.resource("dynamodb", **kwargs)
+        _local.resource = res
+    return res
+
+
+def _tasks():
+    return _resource().Table(tasks_table_name())
+
+
+def _messages():
+    return _resource().Table(messages_table_name())
+
+
+def table_specs() -> list[dict[str, Any]]:
+    """CreateTable arguments for all store tables (also used for local auto-create)."""
+    return [
+        {
+            "TableName": tasks_table_name(),
+            "AttributeDefinitions": [
+                {"AttributeName": "user_id", "AttributeType": "S"},
+                {"AttributeName": "task_id", "AttributeType": "S"},
+            ],
+            "KeySchema": [
+                {"AttributeName": "user_id", "KeyType": "HASH"},
+                {"AttributeName": "task_id", "KeyType": "RANGE"},
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+        },
+        {
+            "TableName": messages_table_name(),
+            "AttributeDefinitions": [
+                {"AttributeName": "task_id", "AttributeType": "S"},
+                {"AttributeName": "message_id", "AttributeType": "S"},
+                {"AttributeName": "created_at", "AttributeType": "S"},
+            ],
+            "KeySchema": [
+                {"AttributeName": "task_id", "KeyType": "HASH"},
+                {"AttributeName": "message_id", "KeyType": "RANGE"},
+            ],
+            "LocalSecondaryIndexes": [
+                {
+                    "IndexName": _MESSAGES_BY_CREATED_INDEX,
+                    "KeySchema": [
+                        {"AttributeName": "task_id", "KeyType": "HASH"},
+                        {"AttributeName": "created_at", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+        },
+    ]
+
+
+def ensure_tables() -> None:
+    """Create any missing tables (DynamoDB Local / first run). No-op for existing tables."""
+    client = _resource().meta.client
+    for spec in table_specs():
+        name = spec["TableName"]
         try:
-            restored = restore_user_db(user_id)
-        except Exception:
-            logger.exception("Failed to restore user DB for %s", user_id)
-
-        if restored and _db_ready(working):
-            with _connect_path(working) as conn:
-                _init_user_schema(conn)
-            return working
-
-        durable = durable_user_db_path(user_id)
-        if _db_ready(durable) and not _db_ready(working):
-            try:
-                restore_user_db(user_id)
-            except Exception:
-                logger.exception("Failed durable→working restore for %s", user_id)
-            if _db_ready(working):
-                with _connect_path(working) as conn:
-                    _init_user_schema(conn)
-                return working
-
-        _migrate_user_from_legacy(working, user_id)
-        with _connect_path(working) as conn:
-            _init_user_schema(conn)
-        flush_persist(user_id)
-        return working
+            client.describe_table(TableName=name)
+            continue
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+                raise
+        try:
+            client.create_table(**spec)
+            client.get_waiter("table_exists").wait(TableName=name)
+            logger.info("Created DynamoDB table %s", name)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ResourceInUseException":
+                raise
 
 
-def _connect_user(user_id: str) -> sqlite3.Connection:
-    path = ensure_user_db(user_id)
-    return _connect_path(path)
+def init_db() -> None:
+    """Prepare the store. Auto-creates tables for DynamoDB Local or TASK_STORE_AUTO_CREATE=1."""
+    global _tables_ready
+    with _tables_lock:
+        auto_create = bool(_endpoint_url()) or (
+            os.environ.get("TASK_STORE_AUTO_CREATE", "").strip().lower() in {"1", "true", "yes", "on"}
+        )
+        if auto_create:
+            ensure_tables()
+        _tables_ready = True
+    logger.info(
+        "Task store using DynamoDB (tasks=%s, messages=%s, endpoint=%s)",
+        tasks_table_name(),
+        messages_table_name(),
+        _endpoint_url() or "aws",
+    )
 
 
-def _after_write(user_id: str | None = None) -> None:
-    schedule_persist(user_id)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def _row_to_task(row: sqlite3.Row) -> dict[str, Any]:
-    keys = row.keys()
+def _query_all(table: Any, **kwargs: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    while True:
+        resp = table.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        last = resp.get("LastEvaluatedKey")
+        if not last:
+            return items
+        kwargs["ExclusiveStartKey"] = last
+
+
+def _is_conditional_failure(exc: ClientError) -> bool:
+    return exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
+
+
+
+
+def _item_to_task(item: dict[str, Any]) -> dict[str, Any]:
     return {
-        "id": row["id"],
-        "user_id": row["user_id"],
-        "title": row["title"] or "New task",
+        "id": item["task_id"],
+        "user_id": item["user_id"],
+        "title": item.get("title") or "New task",
         # Checkpoints must be isolated per task; use task id as the stable fallback.
-        "runtime_session_id": row["runtime_session_id"] or row["id"],
-        "model_name": row["model_name"] or DEFAULT_MODEL,
-        "skills": json.loads(row["skills_json"] or "[]"),
-        "mcp_servers": json.loads(row["mcp_servers_json"] or "[]"),
-        "guardrail_enabled": bool(row["guardrail_enabled"]),
-        "llm_gateway_enabled": (
-            bool(row["llm_gateway_enabled"]) if "llm_gateway_enabled" in keys else False
-        ),
-        "memory_enabled": bool(row["memory_enabled"]) if "memory_enabled" in keys else True,
-        "pinned": bool(row["pinned"]) if "pinned" in keys else False,
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
+        "runtime_session_id": item.get("runtime_session_id") or item["task_id"],
+        "model_name": item.get("model_name") or DEFAULT_MODEL,
+        "skills": list(item.get("skills") or []),
+        "mcp_servers": list(item.get("mcp_servers") or []),
+        "guardrail_enabled": bool(item.get("guardrail_enabled", False)),
+        "llm_gateway_enabled": bool(item.get("llm_gateway_enabled", False)),
+        "memory_enabled": bool(item.get("memory_enabled", True)),
+        "pinned": bool(item.get("pinned", False)),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
     }
 
 
-def _row_to_message(row: sqlite3.Row) -> dict[str, Any]:
+def _loads_list(raw: Any) -> list[Any]:
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        return []
+    return value if isinstance(value, list) else []
+
+
+def _item_to_message(item: dict[str, Any]) -> dict[str, Any]:
     return {
-        "id": row["id"],
-        "task_id": row["task_id"],
-        "role": row["role"],
-        "content": row["content"] or "",
-        "images": json.loads(row["images_json"] or "[]"),
-        "tool_events": json.loads(row["tool_events_json"] or "[]"),
-        "created_at": row["created_at"],
+        "id": item["message_id"],
+        "task_id": item["task_id"],
+        "role": item["role"],
+        "content": item.get("content") or "",
+        "images": _loads_list(item.get("images_json")),
+        "tool_events": _loads_list(item.get("tool_events_json")),
+        "created_at": item.get("created_at"),
     }
+
+
+def _fit_payload(
+    content: str, images: list[str], tool_events: list[dict[str, Any]]
+) -> tuple[str, str, str]:
+    """Serialize message fields, shrinking them if the item would exceed the budget."""
+    content = content or ""
+    images_json = json.dumps(images, ensure_ascii=False)
+    events_json = json.dumps(tool_events, ensure_ascii=False)
+
+    def size() -> int:
+        return len(content.encode("utf-8")) + len(images_json.encode("utf-8")) + len(
+            events_json.encode("utf-8")
+        )
+
+    if size() <= _MAX_ITEM_PAYLOAD_BYTES:
+        return content, images_json, events_json
+
+    try:
+        from application.tool_events_slim import slim_tool_events
+
+        events_json = json.dumps(slim_tool_events(tool_events), ensure_ascii=False)
+    except Exception:
+        events_json = "[]"
+    if size() > _MAX_ITEM_PAYLOAD_BYTES:
+        events_json = "[]"
+    if size() > _MAX_ITEM_PAYLOAD_BYTES:
+        budget = max(_MAX_ITEM_PAYLOAD_BYTES - len(images_json.encode("utf-8")) - 64, 1_000)
+        content = content.encode("utf-8")[:budget].decode("utf-8", errors="ignore") + "…"
+    logger.warning("Message payload exceeded DynamoDB item budget; truncated before write")
+    return content, images_json, events_json
+
+
+def _touch_task(user_id: str, task_id: str, *, updated_at: str) -> bool:
+    """Bump ``updated_at`` and ``message_count``. Returns False if the task does not exist."""
+    try:
+        _tasks().update_item(
+            Key={"user_id": user_id, "task_id": task_id},
+            UpdateExpression="SET updated_at = :u ADD message_count :one",
+            ExpressionAttributeValues={":u": updated_at, ":one": 1},
+            ConditionExpression="attribute_exists(task_id)",
+        )
+        return True
+    except ClientError as exc:
+        if _is_conditional_failure(exc):
+            logger.warning("Task %s/%s not found while updating timestamp", user_id, task_id)
+            return False
+        raise
+
+
+def _set_title_if_default(user_id: str, task_id: str, title: str) -> None:
+    try:
+        _tasks().update_item(
+            Key={"user_id": user_id, "task_id": task_id},
+            UpdateExpression="SET title = :t",
+            ConditionExpression=(
+                "attribute_exists(task_id) AND "
+                "(attribute_not_exists(title) OR title = :empty OR title = :default)"
+            ),
+            ExpressionAttributeValues={":t": title, ":empty": "", ":default": "New task"},
+        )
+    except ClientError as exc:
+        if not _is_conditional_failure(exc):
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
 
 
 def list_tasks(user_id: str, limit: int = 100) -> list[dict[str, Any]]:
-    with _connect_user(user_id) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM tasks
-            WHERE user_id = ?
-            ORDER BY pinned DESC, updated_at DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        ).fetchall()
-    return [_row_to_task(r) for r in rows]
+    items = _query_all(
+        _tasks(),
+        KeyConditionExpression=Key("user_id").eq(user_id),
+        ConsistentRead=True,
+    )
+    tasks = [_item_to_task(i) for i in items]
+    tasks.sort(key=lambda t: (t["pinned"], t["updated_at"] or ""), reverse=True)
+    return tasks[:limit]
 
 
 def get_task(task_id: str, user_id: str | None = None) -> dict[str, Any] | None:
     if not user_id:
-        raise ValueError("user_id is required to resolve the per-user task DB")
-    with _connect_user(user_id) as conn:
-        row = conn.execute(
-            "SELECT * FROM tasks WHERE id = ? AND user_id = ?",
-            (task_id, user_id),
-        ).fetchone()
-    return _row_to_task(row) if row else None
+        raise ValueError("user_id is required to resolve the task")
+    resp = _tasks().get_item(
+        Key={"user_id": user_id, "task_id": task_id}, ConsistentRead=True
+    )
+    item = resp.get("Item")
+    return _item_to_task(item) if item else None
 
 
 def get_task_refreshing(task_id: str, user_id: str | None = None) -> dict[str, Any] | None:
-    """Return a task, reloading this user's durable DB once if missing locally."""
+    """Kept for call-site compatibility: reads are strongly consistent, no refresh needed."""
     if not user_id:
-        return None
-    task = get_task(task_id, user_id)
-    if task:
-        return task
-    try:
-        restore_user_db(user_id)
-    except Exception:
-        return None
-    if not _db_ready(working_user_db_path(user_id)):
         return None
     return get_task(task_id, user_id)
 
@@ -444,37 +369,54 @@ def create_task(
     title: str = "New task",
 ) -> dict[str, Any]:
     task_id = str(uuid.uuid4())
-    # Keep the checkpoint namespace aligned with the task identity.
-    runtime_session_id = task_id
     now = _now_iso()
-    with _connect_user(user_id) as conn:
-        conn.execute(
-            """
-            INSERT INTO tasks (
-              id, user_id, title, runtime_session_id, model_name,
-              skills_json, mcp_servers_json, guardrail_enabled, llm_gateway_enabled,
-              memory_enabled, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                user_id,
-                title,
-                runtime_session_id,
-                model_name or DEFAULT_MODEL,
-                json.dumps(skills or [], ensure_ascii=False),
-                json.dumps(mcp_servers or [], ensure_ascii=False),
-                1 if guardrail_enabled else 0,
-                1 if llm_gateway_enabled else 0,
-                1 if memory_enabled else 0,
-                now,
-                now,
-            ),
+    item = {
+        "user_id": user_id,
+        "task_id": task_id,
+        "title": title,
+        # Keep the checkpoint namespace aligned with the task identity.
+        "runtime_session_id": task_id,
+        "model_name": model_name or DEFAULT_MODEL,
+        "skills": list(skills or []),
+        "mcp_servers": list(mcp_servers or []),
+        "guardrail_enabled": bool(guardrail_enabled),
+        "llm_gateway_enabled": bool(llm_gateway_enabled),
+        "memory_enabled": bool(memory_enabled),
+        "pinned": False,
+        "message_count": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+    _tasks().put_item(Item=item, ConditionExpression="attribute_not_exists(task_id)")
+    return _item_to_task(item)
+
+
+def _update_task_fields(
+    user_id: str, task_id: str, fields: dict[str, Any], *, now: str | None = None
+) -> bool:
+    names: dict[str, str] = {}
+    values: dict[str, Any] = {":updated_at": now or _now_iso()}
+    sets = ["updated_at = :updated_at"]
+    for idx, (attr, value) in enumerate(fields.items()):
+        names[f"#f{idx}"] = attr
+        values[f":v{idx}"] = value
+        sets.append(f"#f{idx} = :v{idx}")
+    kwargs: dict[str, Any] = {}
+    if names:
+        kwargs["ExpressionAttributeNames"] = names
+    try:
+        _tasks().update_item(
+            Key={"user_id": user_id, "task_id": task_id},
+            UpdateExpression="SET " + ", ".join(sets),
+            ExpressionAttributeValues=values,
+            ConditionExpression="attribute_exists(task_id)",
+            **kwargs,
         )
-    # Flush immediately so sibling ECS tasks / replacements can see the row
-    # (debounced persist alone loses creates during rolling deploys).
-    flush_persist(user_id)
-    return get_task(task_id, user_id)  # type: ignore[return-value]
+        return True
+    except ClientError as exc:
+        if _is_conditional_failure(exc):
+            return False
+        raise
 
 
 def update_all_tasks(
@@ -485,31 +427,28 @@ def update_all_tasks(
     memory_enabled: bool | None = None,
 ) -> int:
     """Apply shared settings to every task for ``user_id``. Returns rows updated."""
-    sets: list[str] = []
-    values: list[Any] = []
+    fields: dict[str, Any] = {}
     if model_name is not None:
-        sets.append("model_name = ?")
-        values.append(str(model_name).strip() or DEFAULT_MODEL)
+        fields["model_name"] = str(model_name).strip() or DEFAULT_MODEL
     if guardrail_enabled is not None:
-        sets.append("guardrail_enabled = ?")
-        values.append(1 if guardrail_enabled else 0)
+        fields["guardrail_enabled"] = bool(guardrail_enabled)
     if memory_enabled is not None:
-        sets.append("memory_enabled = ?")
-        values.append(1 if memory_enabled else 0)
-    if not sets:
+        fields["memory_enabled"] = bool(memory_enabled)
+    if not fields:
         return 0
-    sets.append("updated_at = ?")
-    values.append(_now_iso())
-    values.append(user_id)
-    with _connect_user(user_id) as conn:
-        cur = conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} WHERE user_id = ?",
-            values,
-        )
-        rowcount = cur.rowcount
-    # Flush immediately so new-task creates / other instances see Settings.
-    flush_persist(user_id)
-    return int(rowcount or 0)
+
+    now = _now_iso()
+    updated = 0
+    items = _query_all(
+        _tasks(),
+        KeyConditionExpression=Key("user_id").eq(user_id),
+        ProjectionExpression="task_id",
+        ConsistentRead=True,
+    )
+    for item in items:
+        if _update_task_fields(user_id, item["task_id"], fields, now=now):
+            updated += 1
+    return updated
 
 
 def update_all_task_flags(
@@ -527,77 +466,68 @@ def update_all_task_flags(
 
 
 def update_task(task_id: str, user_id: str, **fields: Any) -> dict[str, Any] | None:
-    allowed = {
-        "title": "title",
-        "model_name": "model_name",
-        "guardrail_enabled": "guardrail_enabled",
-        "llm_gateway_enabled": "llm_gateway_enabled",
-        "memory_enabled": "memory_enabled",
-        "pinned": "pinned",
-    }
-    sets: list[str] = []
-    values: list[Any] = []
+    patch: dict[str, Any] = {}
+    for key in ("title", "model_name"):
+        if fields.get(key) is not None:
+            patch[key] = fields[key]
+    for key in ("guardrail_enabled", "llm_gateway_enabled", "memory_enabled", "pinned"):
+        if fields.get(key) is not None:
+            patch[key] = bool(fields[key])
+    for key in ("skills", "mcp_servers"):
+        if fields.get(key) is not None:
+            patch[key] = list(fields[key])
 
-    for key, column in allowed.items():
-        if key in fields and fields[key] is not None:
-            value = fields[key]
-            if key in (
-                "guardrail_enabled",
-                "llm_gateway_enabled",
-                "memory_enabled",
-                "pinned",
-            ):
-                value = 1 if value else 0
-            sets.append(f"{column} = ?")
-            values.append(value)
-
-    if "skills" in fields and fields["skills"] is not None:
-        sets.append("skills_json = ?")
-        values.append(json.dumps(fields["skills"], ensure_ascii=False))
-
-    if "mcp_servers" in fields and fields["mcp_servers"] is not None:
-        sets.append("mcp_servers_json = ?")
-        values.append(json.dumps(fields["mcp_servers"], ensure_ascii=False))
-
-    if not sets:
-        return get_task(task_id, user_id)
-
-    sets.append("updated_at = ?")
-    values.append(_now_iso())
-    values.extend([task_id, user_id])
-
-    with _connect_user(user_id) as conn:
-        conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ? AND user_id = ?",
-            values,
-        )
-    _after_write(user_id)
+    if patch:
+        _update_task_fields(user_id, task_id, patch)
     return get_task(task_id, user_id)
 
 
 def delete_task(task_id: str, user_id: str) -> bool:
-    with _connect_user(user_id) as conn:
-        conn.execute("DELETE FROM messages WHERE task_id = ?", (task_id,))
-        cur = conn.execute(
-            "DELETE FROM tasks WHERE id = ? AND user_id = ?",
-            (task_id, user_id),
+    try:
+        resp = _tasks().delete_item(
+            Key={"user_id": user_id, "task_id": task_id},
+            ConditionExpression="attribute_exists(task_id)",
+            ReturnValues="ALL_OLD",
         )
-    if cur.rowcount > 0:
-        _after_write(user_id)
-    return cur.rowcount > 0
+    except ClientError as exc:
+        if _is_conditional_failure(exc):
+            return False
+        raise
+    if not resp.get("Attributes"):
+        return False
+
+    # Task row is gone first, so the task disappears from the UI immediately;
+    # then remove its messages.
+    keys = _query_all(
+        _messages(),
+        KeyConditionExpression=Key("task_id").eq(task_id),
+        ProjectionExpression="task_id, message_id",
+        ConsistentRead=True,
+    )
+    with _messages().batch_writer() as batch:
+        for key in keys:
+            batch.delete_item(Key={"task_id": key["task_id"], "message_id": key["message_id"]})
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Messages
+# ---------------------------------------------------------------------------
+
+
+def _message_items(task_id: str, user_id: str) -> list[dict[str, Any]]:
+    items = _query_all(
+        _messages(),
+        IndexName=_MESSAGES_BY_CREATED_INDEX,
+        KeyConditionExpression=Key("task_id").eq(task_id),
+        ScanIndexForward=True,
+        ConsistentRead=True,
+    )
+    return [i for i in items if i.get("user_id") in (None, user_id)]
 
 
 def list_messages(task_id: str, user_id: str) -> list[dict[str, Any]]:
-    with _connect_user(user_id) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM messages
-            WHERE task_id = ?
-            ORDER BY created_at ASC
-            """,
-            (task_id,),
-        ).fetchall()
-    return [_row_to_message(r) for r in rows]
+    return [_item_to_message(i) for i in _message_items(task_id, user_id)]
 
 
 def add_message(
@@ -609,42 +539,120 @@ def add_message(
     images: list[str] | None = None,
     tool_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    message_id = str(uuid.uuid4())
     now = _now_iso()
-    with _connect_user(user_id) as conn:
-        conn.execute(
-            """
-            INSERT INTO messages (
-              id, task_id, role, content, images_json, tool_events_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                message_id,
-                task_id,
-                role,
-                content,
-                json.dumps(images or [], ensure_ascii=False),
-                json.dumps(tool_events or [], ensure_ascii=False),
-                now,
-            ),
-        )
-        title_update = None
-        if role == "user":
-            row = conn.execute(
-                "SELECT title FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone()
-            if row and (row["title"] or "New task") in ("New task", ""):
-                title_update = content.strip()[:50] or "New task"
+    content, images_json, events_json = _fit_payload(
+        content, images or [], tool_events or []
+    )
+    item = {
+        "task_id": task_id,
+        "message_id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "role": role,
+        "content": content,
+        "images_json": images_json,
+        "tool_events_json": events_json,
+        "created_at": now,
+    }
+    _messages().put_item(Item=item, ConditionExpression="attribute_not_exists(message_id)")
+    _touch_task(user_id, task_id, updated_at=now)
+    if role == "user":
+        title = content.strip()[:50]
+        if title:
+            _set_title_if_default(user_id, task_id, title)
+    return _item_to_message(item)
 
-        conn.execute(
-            "UPDATE tasks SET updated_at = ?"
-            + (", title = ?" if title_update else "")
-            + " WHERE id = ?",
-            ([now, title_update, task_id] if title_update else [now, task_id]),
+
+# ---------------------------------------------------------------------------
+# Graph pipeline support
+# ---------------------------------------------------------------------------
+
+
+def get_message_fingerprint(user_id: str) -> dict[str, Any]:
+    """Return ``{message_count, max_created_at}`` across the user's messages."""
+    tasks = _query_all(
+        _tasks(),
+        KeyConditionExpression=Key("user_id").eq(user_id),
+        ProjectionExpression="task_id, message_count",
+        ConsistentRead=True,
+    )
+    message_count = 0
+    max_created_at: str | None = None
+    for task in tasks:
+        message_count += int(task.get("message_count") or 0)
+        resp = _messages().query(
+            IndexName=_MESSAGES_BY_CREATED_INDEX,
+            KeyConditionExpression=Key("task_id").eq(task["task_id"]),
+            ScanIndexForward=False,
+            Limit=1,
+            ProjectionExpression="created_at",
+            ConsistentRead=True,
         )
-    _after_write(user_id)
-    with _connect_user(user_id) as conn:
-        row = conn.execute(
-            "SELECT * FROM messages WHERE id = ?", (message_id,)
-        ).fetchone()
-    return _row_to_message(row) if row else {}
+        for item in resp.get("Items", []):
+            created = item.get("created_at")
+            if created and (max_created_at is None or created > max_created_at):
+                max_created_at = created
+    return {"message_count": message_count, "max_created_at": max_created_at}
+
+
+def export_user_sqlite(user_id: str, path: str) -> str:
+    """Write the user's tasks/messages to a scratch SQLite file for ``graph/`` to read.
+
+    The graph pipeline is a separate process that reads SQLite; this file is a
+    throw-away export, never a source of truth.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if os.path.exists(path):
+        os.remove(path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE tasks (
+              id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT,
+              runtime_session_id TEXT, model_name TEXT, skills_json TEXT,
+              mcp_servers_json TEXT, guardrail_enabled INTEGER,
+              llm_gateway_enabled INTEGER, memory_enabled INTEGER, pinned INTEGER,
+              created_at TEXT, updated_at TEXT
+            );
+            CREATE TABLE messages (
+              id TEXT PRIMARY KEY, task_id TEXT NOT NULL, role TEXT NOT NULL,
+              content TEXT, images_json TEXT, tool_events_json TEXT, created_at TEXT
+            );
+            """
+        )
+        for task in list_tasks(user_id, limit=10_000):
+            conn.execute(
+                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    task["id"],
+                    user_id,
+                    task["title"],
+                    task["runtime_session_id"],
+                    task["model_name"],
+                    json.dumps(task["skills"], ensure_ascii=False),
+                    json.dumps(task["mcp_servers"], ensure_ascii=False),
+                    int(task["guardrail_enabled"]),
+                    int(task["llm_gateway_enabled"]),
+                    int(task["memory_enabled"]),
+                    int(task["pinned"]),
+                    task["created_at"],
+                    task["updated_at"],
+                ),
+            )
+            for item in _message_items(task["id"], user_id):
+                conn.execute(
+                    "INSERT INTO messages VALUES (?,?,?,?,?,?,?)",
+                    (
+                        item["message_id"],
+                        item["task_id"],
+                        item["role"],
+                        item.get("content") or "",
+                        item.get("images_json") or "[]",
+                        item.get("tool_events_json") or "[]",
+                        item.get("created_at"),
+                    ),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+    return path

@@ -18,7 +18,7 @@ AgentCore의 관리형 에이전트 하네스(Managed Agent Harness)는 사전 �
 - **채팅 첨부**: `+` 버튼으로 이미지(사진·화면 캡처) 첨부, 문서 RAG 업로드
 - **Knowledge Base**: S3 Vectors 기반 Bedrock KB (`docs/` 인제스션)
 - **doc-sharing skill**: 산출물을 S3에 올리고 CloudFront 다운로드 URL 반환 (구 artifact-share MCP / s3-sharing 대체)
-- **Knowledge Graph**: 채팅 이력(`tasks.db`)에서 엔티티·관계를 추출해 사용자별 인터랙티브 HTML로 표시 (사이드바 브랜드 클릭)
+- **Knowledge Graph**: 채팅 이력(DynamoDB 태스크 스토어)에서 엔티티·관계를 추출해 사용자별 인터랙티브 HTML로 표시 (사이드바 브랜드 클릭)
 
 AWS 오픈소스 에이전트 프레임워크 [Strands Agents](https://strandsagents.com/docs/user-guide/quickstart/python/)로 구동됩니다.
 
@@ -115,7 +115,7 @@ python uninstaller.py
 | Dockerfile | multi-stage: Node로 React 빌드 → Python/uvicorn :8501 |
 | `ecs_web.py` | ECR · ECS Fargate · ALB · UI 전용 CloudFront |
 | `APP_CONFIG_JSON` | ECS 태스크 환경변수 → entrypoint가 `application/config.json`에 기록 |
-| S3 Files | ECS는 **별도** `app-data/` FS를 `/mnt/app-data`에 마운트 (`tasks.db`·graph·settings). Harness는 `agentcore-sessions/` → `/mnt/workspace`. Skills는 S3 API |
+| S3 Files | ECS는 **별도** `app-data/` FS를 `/mnt/app-data`에 마운트 (graph·settings; 태스크·메시지는 DynamoDB). Harness는 `agentcore-sessions/` → `/mnt/workspace`. Skills는 S3 API |
 | Cognito | User Pool + App Client (`USER_PASSWORD_AUTH`) · HMAC 세션 쿠키 |
 
 ### Cognito / 세션
@@ -212,6 +212,21 @@ python uninstaller.py
 
 ---
 
+## Task store (DynamoDB)
+
+Web UI의 태스크·메시지는 사용자별 SQLite 파일(S3 Files 동기화) 대신 **DynamoDB**에 저장합니다. 파일 단위 동기화는 오래된 ECS task가 최신 데이터를 덮어써 여러 기기에서 로그인하면 태스크 정보가 과거로 되돌아가는 문제가 있었고, DynamoDB는 항목 단위(필드 단위) 쓰기라 이를 피합니다.
+
+| 테이블 | 키 | 비고 |
+|--------|----|------|
+| `{projectName}-tasks` | PK `user_id`, SK `task_id` | 설정 필드·`message_count` 카운터 |
+| `{projectName}-messages` | PK `task_id`, SK `message_id` | LSI `task_id-created_at-index`로 시간순 조회 (ConsistentRead) |
+
+- `projectName`은 `application/config.json`에서 읽고 `TASK_DB_PROJECT` 환경변수로 덮어쓸 수 있습니다. 테이블 이름은 `TASKS_TABLE` / `MESSAGES_TABLE`로도 지정할 수 있습니다.
+- `installer.py`가 테이블을 만들고 ECS task role에 권한을 붙입니다 (`create_task_store_tables`, `attach_ecs_task_store_policy`). 이것만 실행하려면 `python installer.py --task-store-only`. `uninstaller.py`는 두 테이블도 삭제합니다.
+- 로컬: `run_local.sh`가 DynamoDB Local(Docker, :8000)을 띄우고 `DYNAMODB_ENDPOINT_URL`을 설정하며, endpoint가 있거나 `TASK_STORE_AUTO_CREATE=1`이면 시작 시 테이블을 자동 생성합니다.
+- Knowledge Graph 파이프라인은 실행마다 DynamoDB에서 임시 SQLite를 export해 읽습니다. 메시지 payload는 항목당 약 180KB로 제한됩니다.
+- 테스트: `DYNAMODB_ENDPOINT_URL=http://localhost:8000 python -m unittest application.test_task_store` (미설정 시 skip).
+
 ## S3 Files + VPC 설정
 
 S3 Files 마운트는 **VPC 네트워크 모드**가 필요합니다. `s3_files_vpc.py`가 VPC(public/private + NAT)·**두 개의** S3 Files 파일시스템·Access Point·보안 그룹을 만듭니다.
@@ -219,7 +234,7 @@ S3 Files 마운트는 **VPC 네트워크 모드**가 필요합니다. `s3_files_
 | FS prefix | 마운트 | 소비자 | 내용 |
 |-----------|--------|--------|------|
 | `agentcore-sessions/` | `/mnt/workspace` | Harness runtime | artifacts, skill-creator skills |
-| `app-data/` | `/mnt/app-data` | ECS Web UI only | `tasks.db`, graph, settings |
+| `app-data/` | `/mnt/app-data` | ECS Web UI only | graph, settings (태스크·메시지는 DynamoDB) |
 
 Harness IAM은 `app-data/*`에 Deny가 걸려 있어 에이전트가 채팅 DB를 읽을 수 없습니다. UI의 user skills 목록은 `agentcore-sessions/{user}/skills/`를 **S3 API**로 조회합니다.
 
@@ -489,7 +504,8 @@ harness 기본 이미지에는 `node`, `npm`, `npx`가 없어서, `run_harness`�
 `InvokeAgentRuntimeCommand`로 설치합니다 (`ensure_node_installed`).
 
 - 이미 설치돼 있으면 건너뜁니다.
-- `apt-get install -y --no-install-recommends nodejs npm`을 먼저 시도하고, 실패할 때만 `apt-get update` 후 재시도합니다.
+- harness 이미지는 **Amazon Linux 2023**이라 `apt-get`이 없습니다(exit 127). 그래서 `dnf install -y nodejs npm`을 먼저 시도합니다. 이 `dnf`는 microdnf 링크라 `-q` 옵션을 받지 않으므로 옵션 없이 씁니다(Node 18.x). `apt-get`(실패 시 `apt-get update` 후 재시도)은 다른 이미지를 위한 폴백입니다.
+- 명령은 **harness ARN**으로 호출합니다. harness 내부 runtime ARN으로 보내면 `managed by a harness and cannot be invoked directly`로 거부됩니다.
 - 설치 실패는 경고 로그만 남기고 대화는 계속 진행합니다.
 - 문서·슬라이드 생성은 계속 Python(python-docx, python-pptx)을 사용합니다. docx-js, pptxgenjs는 사용하지 않습니다.
 - 설치 직후 `npm install -g <pkg>`는 세션 안에서만 유지됩니다. 새 세션에서는 node/npm만 다시 설치되고 전역 패키지는 다시 설치해야 합니다.
@@ -906,12 +922,12 @@ flowchart LR
 |------|------|
 | 트리거 | 로그인 / 세션 복원 / 채팅 완료 / Settings에서 KG ON |
 | UI | 사이드바 브랜드 클릭 → `GET /api/graph` iframe |
-| 파이프라인 | `tasks.db` → corpus → LLM 추출 → `graph.html` |
+| 파이프라인 | DynamoDB → 임시 SQLite export → corpus → LLM 추출 → `graph.html` |
 | CLI | `cd graph && python run_pipeline.py --user <id>` |
 |------|
 | 트리거 | 로그인 / 세션 복원 / 채팅 완료 / Settings에서 KG ON |
 | UI | 사이드바 브랜드 클릭 → `GET /api/graph` iframe |
-| 파이프라인 | `tasks.db` → corpus → LLM 추출 → `graph.html` |
+| 파이프라인 | DynamoDB → 임시 SQLite export → corpus → LLM 추출 → `graph.html` |
 | CLI | `cd graph && python run_pipeline.py --user <id>` |
 
 ---

@@ -59,6 +59,7 @@ s3vectors_client = boto3.client("s3vectors", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name=region)
 cognito_idp_client = boto3.client("cognito-idp", region_name=region)
 secretsmanager_client = boto3.client("secretsmanager", region_name=region)
+dynamodb_client = boto3.client("dynamodb", region_name=region)
 bedrock_agent_client = boto3.client("bedrock-agent", region_name=region)
 agentcore_control_client = boto3.client(
     "bedrock-agentcore-control",
@@ -1454,6 +1455,24 @@ def _find_cognito_user_pool_id(pool_name: str):
             return None
 
 
+TASK_STORE_TABLE_NAMES = [
+    f"{project_name}-tasks",
+    f"{project_name}-messages",
+]
+
+
+def delete_task_store_tables() -> None:
+    """Delete the Web UI task-store DynamoDB tables (best effort)."""
+    for table_name in TASK_STORE_TABLE_NAMES:
+        try:
+            dynamodb_client.delete_table(TableName=table_name)
+            logger.info(f"  ✓ Deleted DynamoDB table: {table_name}")
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code not in ("ResourceNotFoundException", "ResourceNotFound"):
+                logger.warning(f"  Could not delete DynamoDB table {table_name}: {e}")
+
+
 def delete_session_signing_key_secret() -> None:
     """Delete HMAC session cookie signing key from Secrets Manager."""
     logger.info("Deleting session signing key secret")
@@ -1647,6 +1666,7 @@ def main():
 
         delete_cognito_user_pool()
         delete_session_signing_key_secret()
+        delete_task_store_tables()
 
         if delete_s3_bucket_flag:
             delete_s3_bucket()

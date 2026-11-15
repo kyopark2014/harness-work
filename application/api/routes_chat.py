@@ -15,7 +15,6 @@ from pydantic import BaseModel, Field, model_validator
 
 from application.api.routes_auth import _kick_graph_job, require_user_id
 from application import task_store
-from application.task_store_persistence import flush_persist
 from application.notification_queue import QueueNotificationSink
 
 logger = logging.getLogger("routes_chat")
@@ -364,7 +363,6 @@ def _spawn_late_persist(
                 images=images,
                 tool_events=events,
             )
-            flush_persist(user_id)
             _kick_graph_job(user_id)
         except Exception:
             logger.exception("Late persist failed")
@@ -580,7 +578,6 @@ def chat_stream(task_id: str, body: ChatRequest, request: Request):
             raise
         finally:
             if not sse_closed_early:
-                flush_persist(user_id)
                 if pending_graph_kick:
                     _kick_graph_job(user_id)
 

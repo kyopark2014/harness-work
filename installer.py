@@ -50,6 +50,11 @@ SESSION_SIGNING_KEY_SECRET_NAME = f"{project_name}/session-signing-key"
 VAULT_AGENT_TOKEN_SECRET_NAME = f"{project_name}/vault-agent-token"
 OB_NOTE_VAULT_AGENT_TOKEN_SECRET = "ob-note/vault-agent-token"
 
+# Web UI task store (DynamoDB) — replaces per-user SQLite tasks.db
+TASKS_TABLE_NAME = f"{project_name}-tasks"
+MESSAGES_TABLE_NAME = f"{project_name}-messages"
+TASK_STORE_TABLE_NAMES = [TASKS_TABLE_NAME, MESSAGES_TABLE_NAME]
+
 sts_client = boto3.client("sts", region_name=region)
 account_id = str(sts_client.get_caller_identity()["Account"])
 
@@ -73,6 +78,7 @@ s3vectors_client = boto3.client("s3vectors", region_name=region)
 cloudfront_client = boto3.client("cloudfront", region_name=region)
 cognito_idp_client = boto3.client("cognito-idp", region_name=region)
 secretsmanager_client = boto3.client("secretsmanager", region_name=region)
+dynamodb_client = boto3.client("dynamodb", region_name=region)
 agentcore_control_client = boto3.client(
     "bedrock-agentcore-control",
     region_name=region,
@@ -1054,6 +1060,7 @@ def create_or_update_knowledge_base_mcp_runtime(
             networkConfiguration={"networkMode": "PUBLIC"},
             protocolConfiguration={"serverProtocol": "MCP"},
             environmentVariables=env_vars,
+            platformVersion="V2",
         )
         agent_runtime_arn = response["agentRuntimeArn"]
     else:
@@ -1068,6 +1075,7 @@ def create_or_update_knowledge_base_mcp_runtime(
             roleArn=role_arn,
             protocolConfiguration={"serverProtocol": "MCP"},
             environmentVariables=env_vars,
+            platformVersion="V2",
         )
         agent_runtime_arn = response["agentRuntimeArn"]
 
@@ -3614,6 +3622,108 @@ def build_config_from_deployment_state(
     return config_data
 
 
+def create_task_store_tables() -> dict:
+    """DynamoDB tables for Web UI tasks / messages (replaces per-user SQLite)."""
+    specs = [
+        {
+            "TableName": TASKS_TABLE_NAME,
+            "AttributeDefinitions": [
+                {"AttributeName": "user_id", "AttributeType": "S"},
+                {"AttributeName": "task_id", "AttributeType": "S"},
+            ],
+            "KeySchema": [
+                {"AttributeName": "user_id", "KeyType": "HASH"},
+                {"AttributeName": "task_id", "KeyType": "RANGE"},
+            ],
+        },
+        {
+            "TableName": MESSAGES_TABLE_NAME,
+            "AttributeDefinitions": [
+                {"AttributeName": "task_id", "AttributeType": "S"},
+                {"AttributeName": "message_id", "AttributeType": "S"},
+                {"AttributeName": "created_at", "AttributeType": "S"},
+            ],
+            "KeySchema": [
+                {"AttributeName": "task_id", "KeyType": "HASH"},
+                {"AttributeName": "message_id", "KeyType": "RANGE"},
+            ],
+            "LocalSecondaryIndexes": [
+                {
+                    "IndexName": "task_id-created_at-index",
+                    "KeySchema": [
+                        {"AttributeName": "task_id", "KeyType": "HASH"},
+                        {"AttributeName": "created_at", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+        },
+    ]
+    for spec in specs:
+        name = spec["TableName"]
+        logger.info(f"[task-store] Creating DynamoDB table: {name}")
+        try:
+            dynamodb_client.create_table(
+                **spec,
+                BillingMode="PAY_PER_REQUEST",
+                Tags=[
+                    {"Key": "Name", "Value": name},
+                    {"Key": "Project", "Value": project_name},
+                ],
+            )
+            dynamodb_client.get_waiter("table_exists").wait(TableName=name)
+            logger.info(f"  ✓ Created DynamoDB table: {name}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceInUseException":
+                raise
+            logger.warning(f"  DynamoDB table already exists: {name}")
+    return {
+        "tasks_table": TASKS_TABLE_NAME,
+        "messages_table": MESSAGES_TABLE_NAME,
+    }
+
+
+def attach_ecs_task_store_policy(task_role_name: str) -> None:
+    """Allow the ECS Web task to read/write the task-store tables."""
+    resources = []
+    for name in TASK_STORE_TABLE_NAMES:
+        resources.append(f"arn:aws:dynamodb:{region}:{account_id}:table/{name}")
+        resources.append(f"arn:aws:dynamodb:{region}:{account_id}:table/{name}/index/*")
+    attach_inline_policy(
+        task_role_name,
+        f"ecs-task-task-store-policy-for-{project_name}",
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "TaskStoreTables",
+                    "Effect": "Allow",
+                    "Action": [
+                        "dynamodb:GetItem",
+                        "dynamodb:PutItem",
+                        "dynamodb:UpdateItem",
+                        "dynamodb:DeleteItem",
+                        "dynamodb:Query",
+                        "dynamodb:Scan",
+                        "dynamodb:BatchWriteItem",
+                        "dynamodb:BatchGetItem",
+                    ],
+                    "Resource": resources,
+                }
+            ],
+        },
+    )
+    logger.info(f"  ✓ Attached task-store policy to {task_role_name}")
+
+
+def deploy_task_store(ecs_task_role_name: str) -> dict:
+    """Provision DynamoDB tables + ECS task role permissions for the task store."""
+    info = create_task_store_tables()
+    if ecs_task_role_name:
+        attach_ecs_task_store_policy(ecs_task_role_name)
+    return info
+
+
 def main():
     global project_name, region, account_id
 
@@ -3630,7 +3740,19 @@ def main():
         action="store_true",
         help="Provision Harness/VPC only; do not deploy ECS Web UI.",
     )
+    parser.add_argument(
+        "--task-store-only",
+        action="store_true",
+        help="Create only the DynamoDB task-store tables + ECS task role policy.",
+    )
     args = parser.parse_args()
+
+    if args.task_store_only:
+        load_config(CONFIG_PATH)
+        info = deploy_task_store(f"role-ecs-task-for-{project_name}-{region}"[:64])
+        for key, value in info.items():
+            logger.info(f"  {key}: {value}")
+        return
 
     logger.info("=" * 60)
     logger.info("Starting AgentCore Harness Infrastructure Deployment")
@@ -3806,6 +3928,7 @@ def main():
             )
             logger.info("[23/25] Creating ECS roles / ALB / hybrid CloudFront")
             ecs_roles = deployer.create_ecs_roles()
+            deploy_task_store(ecs_roles["task_role_name"])
             vpc_info = deployer.ensure_web_security_groups(vpc_info)
             deployer.prepare_s3files_for_ecs(
                 vpc_info,

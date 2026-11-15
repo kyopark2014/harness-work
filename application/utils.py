@@ -40,8 +40,8 @@ favorite_tools_path = os.path.join(script_dir, "favorite_tools.json")
 def _default_session_storage_dir() -> str:
     """Resolve session/app storage mount.
 
-    - ECS: ``/mnt/app-data`` (S3 Files prefix ``app-data/``) for tasks.db,
-      graph, and settings. Skills are loaded via S3 API, not this mount.
+    - ECS: ``/mnt/app-data`` (S3 Files prefix ``app-data/``) for graph and
+      settings (tasks/messages live in DynamoDB). Skills are loaded via S3 API, not this mount.
     - Harness runtime: ``/mnt/workspace`` is the storage bucket root.
     """
     for candidate in ("/mnt/app-data", "/mnt/workspace"):
@@ -329,12 +329,6 @@ def normalize_graph_pattern(value: object | None) -> str:
     }
     return aliases.get(raw, DEFAULT_GRAPH_PATTERN)
 
-
-
-def get_user_db_path(user_id: str | None) -> str:
-    """Durable per-user tasks/messages DB: {SESSION_STORAGE_DIR}/{user_id}/{user_id}.db."""
-    segment = sanitize_user_path_segment(user_id) or "default"
-    return os.path.join(SESSION_STORAGE_DIR, segment, f"{segment}.db")
 
 
 def get_user_settings_path(user_id: str | None) -> str:

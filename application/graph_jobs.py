@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -98,38 +98,24 @@ def _fingerprint_path(user_id: str) -> Path:
     return Path(utils.get_user_graph_dir(user_id)) / "out" / _FINGERPRINT_NAME
 
 
-def _compute_source_fingerprint(user_id: str) -> dict[str, Any]:
-    """Return {message_count, max_created_at} for the user's tasks.db messages."""
-    from application import task_store
-    from application.task_store_persistence import working_user_db_path
+def _export_segment(user_id: str) -> str:
+    from application.utils import sanitize_user_path_segment
 
-    db_path = working_user_db_path(user_id)
+    return sanitize_user_path_segment(user_id) or "default"
+
+
+def _compute_source_fingerprint(user_id: str) -> dict[str, Any]:
+    """Return {message_count, max_created_at} for the user's stored messages."""
+    from application import task_store
+
     message_count = 0
     max_created_at: str | None = None
     try:
-        # Ensure per-user DB exists (lazy migrate) before fingerprinting.
-        task_store.ensure_user_db(user_id)
-        db_path = working_user_db_path(user_id)
+        fp = task_store.get_message_fingerprint(user_id)
+        message_count = int(fp.get("message_count") or 0)
+        max_created_at = fp.get("max_created_at")
     except Exception:
-        logger.exception("Failed to ensure user DB for fingerprint %s", user_id)
-
-    if os.path.isfile(db_path):
-        try:
-            with sqlite3.connect(db_path) as conn:
-                row = conn.execute(
-                    """
-                    SELECT COUNT(m.id), MAX(m.created_at)
-                    FROM messages m
-                    JOIN tasks t ON t.id = m.task_id
-                    WHERE t.user_id = ?
-                    """,
-                    (user_id,),
-                ).fetchone()
-            if row:
-                message_count = int(row[0] or 0)
-                max_created_at = row[1]
-        except sqlite3.Error:
-            logger.exception("Failed to compute graph source fingerprint for %s", user_id)
+        logger.exception("Failed to compute graph source fingerprint for %s", user_id)
     return {
         "user_id": user_id,
         "message_count": message_count,
@@ -187,7 +173,7 @@ def _queue_has_work(user_id: str) -> bool:
 
 
 def _source_unchanged(user_id: str) -> bool:
-    """True when graph.html exists and tasks.db fingerprint matches last extract."""
+    """True when graph.html exists and task-store fingerprint matches last extract."""
     from application import utils
 
     html = Path(utils.user_graph_html_path(user_id))
@@ -298,15 +284,15 @@ def _run_pipeline(user_id: str, force: bool = False) -> None:
             env = os.environ.copy()
             try:
                 from application import task_store
-                from application.task_store_persistence import working_user_db_path
 
-                task_store.ensure_user_db(user_id)
-                env["TASKS_DB_PATH"] = working_user_db_path(user_id)
-            except Exception:
-                logger.exception(
-                    "Could not resolve per-user tasks DB for graph pipeline %s",
-                    user_id,
+                export_path = os.path.join(
+                    tempfile.gettempdir(), f"graph_tasks_{_export_segment(user_id)}.db"
                 )
+                task_store.export_user_sqlite(user_id, export_path)
+                env["TASKS_DB_PATH"] = export_path
+            except Exception:
+                logger.exception("Could not export tasks for graph pipeline %s", user_id)
+                raise
             if "SESSION_STORAGE_DIR" not in env:
                 try:
                     from application import utils as app_utils

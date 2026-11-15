@@ -755,26 +755,15 @@ def build_harness_system_prompt(actor_id: str | None = None) -> list[dict]:
     return [{"text": text}]
 
 
+# harness 기본 이미지는 Amazon Linux 2023 이라 apt-get 이 없다(command not found, exit 127).
+# `dnf` 는 microdnf 로 연결되어 -q 옵션을 받지 않으므로 옵션 없이 쓴다. apt-get 은 다른 이미지용 폴백.
 _NODE_INSTALL_COMMAND = (
     "command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 "
+    "|| dnf install -y nodejs npm "
     "|| apt-get install -y -qq --no-install-recommends nodejs npm "
     "|| (apt-get update -qq && apt-get install -y -qq --no-install-recommends nodejs npm)"
 )
 _node_ready_sessions: set[str] = set()
-
-
-def _resolve_runtime_arn_for_command(harness_arn: str) -> str:
-    """InvokeAgentRuntimeCommand needs the backing Runtime ARN, not the Harness ARN."""
-    cfg_arn = (config.get("harness_runtime_arn") or "").strip()
-    if cfg_arn:
-        return cfg_arn
-    if ":runtime/" in harness_arn:
-        return harness_arn
-    control = boto3.client("bedrock-agentcore-control", region_name=bedrock_region)
-    harness_id = harness_arn.rsplit("/", 1)[-1]
-    harness = control.get_harness(harnessId=harness_id)["harness"]
-    env = (harness.get("environment") or {}).get("agentCoreRuntimeEnvironment") or {}
-    return env.get("agentRuntimeArn") or harness_arn
 
 
 def ensure_node_installed(client, harness_arn: str, session_id: str) -> None:
@@ -783,7 +772,9 @@ def ensure_node_installed(client, harness_arn: str, session_id: str) -> None:
         return
     try:
         response = client.invoke_agent_runtime_command(
-            agentRuntimeArn=_resolve_runtime_arn_for_command(harness_arn),
+            # harness 가 관리하는 backing runtime ARN 으로 보내면 "managed by a harness and cannot be
+            # invoked directly" 로 거부된다. InvokeAgentRuntimeCommand 에는 harness ARN 을 그대로 넘긴다.
+            agentRuntimeArn=harness_arn,
             runtimeSessionId=session_id,
             body={"command": _NODE_INSTALL_COMMAND, "timeout": 300},
         )

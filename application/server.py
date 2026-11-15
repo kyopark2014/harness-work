@@ -17,12 +17,6 @@ from application.api.routes_rag import router as rag_router
 from application.api.routes_graph import router as graph_router
 from application.api.routes_documents import router as documents_router
 from application.task_store import init_db
-from application.task_store_persistence import (
-    flush_persist,
-    persistence_enabled,
-    persistent_db_path,
-    restore_tasks_db,
-)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,15 +40,8 @@ _ENABLE_API_DOCS = os.environ.get("ENABLE_API_DOCS", "").strip().lower() in {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    restore_tasks_db()
     init_db()
-    if persistence_enabled():
-        logger.info("Task store persistence enabled: %s", persistent_db_path())
-    else:
-        logger.info("Task store using local SQLite only")
     yield
-    flush_persist()
-    logger.info("Task store shutdown persist complete")
 
 
 app = FastAPI(
