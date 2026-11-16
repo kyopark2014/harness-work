@@ -19,6 +19,8 @@ import {
   DOCUMENTS_ATTACH_FILE_EVENT,
 } from "../pendingLoadFile";
 
+import type { ToolEvent } from "../types";
+import { AgentActivityStrip } from "./AgentActivityStrip";
 interface QueuedMessage {
   id: string;
   text: string;
@@ -29,6 +31,11 @@ interface Props {
   disabled?: boolean;
   /** True while waiting for an assistant response (shows stop icon + progress animation). */
   waiting?: boolean;
+  /** Live tool timeline used for the composer activity strip. */
+  streamEvents?: ToolEvent[];
+  /** In-progress assistant text (shows “응답 작성 중” when tools are idle). */
+  streamText?: string;
+
   queuedMessages?: QueuedMessage[];
   queuePaused?: boolean;
   onRemoveQueued?: (id: string) => void;
@@ -49,6 +56,8 @@ const MENU_VERTICAL_OFFSET = 8; // gap between the input box and the popup menu 
 export function ChatInput({
   disabled,
   waiting = false,
+  streamEvents = [],
+  streamText = "",
   queuedMessages = [],
   queuePaused = false,
   onRemoveQueued,
@@ -346,7 +355,12 @@ export function ChatInput({
       : null;
 
   return (
-    <div className="chat-input-area">
+    <div className={`chat-input-area${waiting ? " is-waiting" : ""}`}>
+      <AgentActivityStrip
+        waiting={waiting}
+        streamEvents={streamEvents}
+        streamText={streamText}
+      />
       {uploadError && (
         <div className="chat-upload-error" role="alert">
           {uploadError}
