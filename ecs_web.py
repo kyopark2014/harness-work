@@ -159,7 +159,8 @@ class EcsWebDeployer:
                             f"arn:aws:bedrock:{self.region}:{self.account_id}:inference-profile/*",
                             f"arn:aws:bedrock:*:{self.account_id}:inference-profile/*",
                             f"arn:aws:bedrock:{self.region}:{self.account_id}:guardrail/*",
-                            f"arn:aws:bedrock:{self.region}:{self.account_id}:guardrail-profile/*",
+                            # STANDARD tier routes ApplyGuardrail via CRIS profiles.
+                            f"arn:aws:bedrock:*:{self.account_id}:guardrail-profile/*",
                         ],
                     },
                     {

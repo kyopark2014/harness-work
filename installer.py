@@ -3263,8 +3263,34 @@ def guardrail_name_for_project(name: str) -> str:
     return f"guardrail-for-{safe_name}"
 
 
+
+def _guardrail_profile_for_region(region: str) -> str:
+    """Return the Bedrock Guardrail cross-Region profile id for a source region."""
+    if region.startswith("us-gov-"):
+        return "us-gov.guardrail.v1:0"
+    if region.startswith("us-"):
+        return "us.guardrail.v1:0"
+    if region == "eu-west-2":
+        return "uk.guardrail.v1:0"
+    if region.startswith("eu-") or region == "il-central-1":
+        return "eu.guardrail.v1:0"
+    if region.startswith("ca-"):
+        return "ca.guardrail.v1:0"
+    if region == "ap-southeast-2":
+        # AU profile is also valid; APAC profile covers ap-southeast-2 as well.
+        return "apac.guardrail.v1:0"
+    if (
+        region.startswith("ap-")
+        or region.startswith("me-")
+        or region.startswith("af-")
+    ):
+        return "apac.guardrail.v1:0"
+    # Fallback: US profile is the most widely available.
+    return "us.guardrail.v1:0"
+
+
 def _bedrock_guardrail_content_policy() -> dict:
-    """Content filters: block sexual content and prompt attacks."""
+    """Content filters (STANDARD tier): sexual content + prompt attacks."""
     return {
         "filtersConfig": [
             {
@@ -3284,7 +3310,8 @@ def _bedrock_guardrail_content_policy() -> dict:
                 "outputAction": "NONE",
                 "inputModalities": ["TEXT"],
             },
-        ]
+        ],
+        "tierConfig": {"tierName": "STANDARD"},
     }
 
 
@@ -3319,6 +3346,8 @@ def create_bedrock_guardrail() -> Dict[str, str]:
     )
     blocked_output_message = "응답이 안전 정책에 의해 차단되었습니다."
     content_policy = _bedrock_guardrail_content_policy()
+    profile_id = _guardrail_profile_for_region(region)
+    cross_region_config = {"guardrailProfileIdentifier": profile_id}
 
     bedrock_client = boto3.client("bedrock", region_name=region)
     existing = _find_guardrail_by_name(bedrock_client, name)
@@ -3331,6 +3360,7 @@ def create_bedrock_guardrail() -> Dict[str, str]:
             name=name,
             description=description,
             contentPolicyConfig=content_policy,
+            crossRegionConfig=cross_region_config,
             blockedInputMessaging=blocked_input_message,
             blockedOutputsMessaging=blocked_output_message,
         )
@@ -3343,6 +3373,7 @@ def create_bedrock_guardrail() -> Dict[str, str]:
             name=name,
             description=description,
             contentPolicyConfig=content_policy,
+            crossRegionConfig=cross_region_config,
             blockedInputMessaging=blocked_input_message,
             blockedOutputsMessaging=blocked_output_message,
         )
@@ -3356,11 +3387,15 @@ def create_bedrock_guardrail() -> Dict[str, str]:
         "guardrail_version": guardrail_version,
         "guardrail_arn": guardrail_arn,
         "guardrail_name": name,
+        "guardrail_tier": "STANDARD",
+        "guardrail_profile": profile_id,
     }
     write_config(CONFIG_PATH, info)
     logger.info(f"  - guardrail_id: {guardrail_id}")
     logger.info(f"  - guardrail_version: {guardrail_version}")
     logger.info(f"  - guardrail_name: {name}")
+    logger.info("  - guardrail_tier: STANDARD")
+    logger.info(f"  - guardrail_profile: {profile_id}")
     logger.info("  - filters: SEXUAL (HIGH), PROMPT_ATTACK (HIGH)")
     return info
 
