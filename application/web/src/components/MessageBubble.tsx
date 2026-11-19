@@ -65,6 +65,13 @@ function resolveArtifactViewerHref(href: string | undefined): string | undefined
   if (!href) return href;
   try {
     const url = new URL(href, window.location.origin);
+    // Keep short-lived S3 presigned GET links as direct downloads.
+    if (
+      url.searchParams.has("X-Amz-Algorithm") ||
+      url.searchParams.has("X-Amz-Signature")
+    ) {
+      return href;
+    }
     let match = url.pathname.match(
       /\/[^/]+\/artifacts\/(.+\.(?:md|markdown|json|csv))$/i
     );
