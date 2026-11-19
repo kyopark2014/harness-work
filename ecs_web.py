@@ -31,6 +31,8 @@ ALB_IDLE_TIMEOUT_SECONDS = 1800
 CF_CACHE_POLICY_DISABLED = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
 CF_ORIGIN_REQUEST_ALL_VIEWER = "216adef6-5c7f-47e4-b989-5492eafa07d3"
 CLOUDFRONT_S3_SIGNED_PATHS = ("/images/*", "/docs/*", "/artifacts/*", "/*/artifacts/*")
+# Must precede the S3 patterns: "/*/artifacts/*" would otherwise capture /api/artifacts/view/*.
+CLOUDFRONT_ALB_API_PATH = "/api/*"
 
 ECS_SERVICE_LINKED_ROLE_NAME = "AWSServiceRoleForECS"
 DOCKER_MIN_FREE_MB = 2048
@@ -913,6 +915,40 @@ class EcsWebDeployer:
             behavior["TrustedKeyGroups"] = {"Enabled": False, "Quantity": 0}
         return behavior
 
+    def _alb_api_cache_behavior(self, alb_origin_id: str) -> Dict[str, object]:
+        """``/api/*`` → ALB (same policies as DefaultCacheBehavior).
+
+        ``/*/artifacts/*`` (S3, signed cookies) also matches ``/api/artifacts/view/...``
+        because ``*`` spans a path segment. This behavior must be listed *before*
+        the S3 ones so the artifact viewer reaches the app instead of CloudFront 403.
+        """
+        return {
+            "PathPattern": CLOUDFRONT_ALB_API_PATH,
+            "TargetOriginId": alb_origin_id,
+            "ViewerProtocolPolicy": "redirect-to-https",
+            "AllowedMethods": {
+                "Quantity": 7,
+                "Items": [
+                    "GET",
+                    "HEAD",
+                    "OPTIONS",
+                    "PUT",
+                    "POST",
+                    "PATCH",
+                    "DELETE",
+                ],
+                "CachedMethods": {"Quantity": 2, "Items": ["GET", "HEAD"]},
+            },
+            "Compress": True,
+            "CachePolicyId": CF_CACHE_POLICY_DISABLED,
+            "OriginRequestPolicyId": CF_ORIGIN_REQUEST_ALL_VIEWER,
+            "SmoothStreaming": False,
+            "FieldLevelEncryptionId": "",
+            "LambdaFunctionAssociations": {"Quantity": 0, "Items": []},
+            "TrustedSigners": {"Enabled": False, "Quantity": 0},
+            "TrustedKeyGroups": {"Enabled": False, "Quantity": 0},
+        }
+
     def _normalize_behavior_for_update(self, behavior: Dict) -> Dict:
         """Ensure required CloudFront UpdateDistribution fields are present."""
         if "SmoothStreaming" not in behavior:
@@ -982,6 +1018,42 @@ class EcsWebDeployer:
 
         cache_behaviors = cfg.get("CacheBehaviors") or {"Quantity": 0, "Items": []}
         items = list(cache_behaviors.get("Items") or [])
+        by_path = {item.get("PathPattern"): item for item in items}
+        alb_origin_id = f"alb-{self.project_name}"
+
+        # /api/* must precede /*/artifacts/* or viewer URLs hit S3 signed-cookie 403.
+        if CLOUDFRONT_ALB_API_PATH not in by_path:
+            items.insert(0, self._alb_api_cache_behavior(alb_origin_id))
+            changed = True
+            self.logger.info(
+                f"  + CloudFront behavior {CLOUDFRONT_ALB_API_PATH} (ALB, before S3)"
+            )
+        else:
+            api_idx = next(
+                i
+                for i, it in enumerate(items)
+                if it.get("PathPattern") == CLOUDFRONT_ALB_API_PATH
+            )
+            first_s3_idx = min(
+                (
+                    i
+                    for i, it in enumerate(items)
+                    if it.get("PathPattern") in CLOUDFRONT_S3_SIGNED_PATHS
+                ),
+                default=None,
+            )
+            api_item = items[api_idx]
+            if api_item.get("TargetOriginId") != alb_origin_id:
+                api_item["TargetOriginId"] = alb_origin_id
+                changed = True
+            if first_s3_idx is not None and api_idx > first_s3_idx:
+                items.insert(first_s3_idx, items.pop(api_idx))
+                changed = True
+                self.logger.info(
+                    f"  ✓ CloudFront behavior {CLOUDFRONT_ALB_API_PATH}: "
+                    "moved before S3 paths"
+                )
+
         by_path = {item.get("PathPattern"): item for item in items}
         for path_pattern in CLOUDFRONT_S3_SIGNED_PATHS:
             existing = by_path.get(path_pattern)
@@ -1138,10 +1210,13 @@ class EcsWebDeployer:
                 "OriginRequestPolicyId": CF_ORIGIN_REQUEST_ALL_VIEWER,
             },
             "CacheBehaviors": {
-                "Quantity": len(CLOUDFRONT_S3_SIGNED_PATHS),
+                "Quantity": len(CLOUDFRONT_S3_SIGNED_PATHS) + 1,
                 "Items": [
-                    self._s3_cache_behavior(path, s3_origin_id, key_group_id)
-                    for path in CLOUDFRONT_S3_SIGNED_PATHS
+                    self._alb_api_cache_behavior(alb_origin_id),
+                    *[
+                        self._s3_cache_behavior(path, s3_origin_id, key_group_id)
+                        for path in CLOUDFRONT_S3_SIGNED_PATHS
+                    ],
                 ],
             },
             "PriceClass": "PriceClass_All",
@@ -1155,7 +1230,7 @@ class EcsWebDeployer:
             f"✓ CloudFront created (ALB + S3): {dist['DomainName']}"
         )
         self.logger.info(
-            "  /images/*, /docs/*, /artifacts/* → S3 (signed cookies required)"
+            "  /api/* → ALB; /images|/docs|/artifacts → S3 (signed cookies)"
         )
         return {
             "id": dist["Id"],
