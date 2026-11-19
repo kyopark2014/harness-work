@@ -1024,6 +1024,46 @@ def _find_agent_runtime_by_name(runtime_name: str) -> Optional[Dict]:
             return None
 
 
+def _wait_agent_runtime_ready(
+    agent_runtime_id: str, timeout_seconds: int = 600
+) -> None:
+    """Poll until AgentCore Runtime is READY (invocable).
+
+    create/update_agent_runtime return while status is still CREATING/UPDATING.
+    Gateway targets that fetch MCP tools fail if the runtime is not yet invocable.
+    """
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        runtime = agentcore_control_client.get_agent_runtime(
+            agentRuntimeId=agent_runtime_id
+        )
+        status = runtime.get("status", "")
+        if status == "READY":
+            logger.info(f"  Agent runtime ready: {agent_runtime_id}")
+            return
+        if status in (
+            "CREATE_FAILED",
+            "UPDATE_FAILED",
+            "FAILED",
+            "DELETING",
+            "DELETE_FAILED",
+        ):
+            reason = (
+                runtime.get("failureReason")
+                or runtime.get("statusReason")
+                or ""
+            )
+            raise RuntimeError(
+                f"Agent runtime {agent_runtime_id} terminal status: {status}"
+                + (f" — {reason}" if reason else "")
+            )
+        logger.info(f"  Waiting for agent runtime {agent_runtime_id}: {status}")
+        time.sleep(8)
+    raise TimeoutError(
+        f"Timed out waiting for agent runtime {agent_runtime_id}"
+    )
+
+
 def create_or_update_knowledge_base_mcp_runtime(
     role_arn: str,
     repository: str,
@@ -1078,6 +1118,11 @@ def create_or_update_knowledge_base_mcp_runtime(
             platformVersion="V2",
         )
         agent_runtime_arn = response["agentRuntimeArn"]
+        runtime_id = response.get("agentRuntimeId") or agent_runtime_arn.rsplit(
+            "/", 1
+        )[-1]
+
+    _wait_agent_runtime_ready(runtime_id)
 
     mcp_url = knowledge_base_mcp_url(agent_runtime_arn)
     logger.info(f"✓ Knowledge Base MCP Runtime: {agent_runtime_arn}")
@@ -2379,8 +2424,12 @@ def ensure_harness_memory_binding(harness_id: str, agent_memory_arn: str) -> Non
     )
 
 
-def wait_for_harness_ready(harness_id: str, timeout_seconds: int = 300) -> str:
-    """Poll until harness reaches READY; return harness ARN."""
+def wait_for_harness_ready(harness_id: str, timeout_seconds: int = 900) -> str:
+    """Poll until harness reaches READY; return harness ARN.
+
+    VPC + S3 Files harness create can take ~9+ minutes for the backing
+    AgentCore Runtime to become READY, so default wait is 15 minutes.
+    """
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         res = agentcore_control_client.get_harness(harnessId=harness_id)
@@ -2403,9 +2452,25 @@ def wait_for_harness_ready(harness_id: str, timeout_seconds: int = 300) -> str:
                 f"Harness {harness_id} entered terminal status: {status}"
                 + (f" — {reason}" if reason else "")
             )
-        logger.info(f"  Waiting for harness ({harness_id}) status: {status}")
+        elapsed = int(timeout_seconds - (deadline - time.time()))
+        logger.info(
+            f"  Waiting for harness ({harness_id}) status: {status} "
+            f"({elapsed}s / {timeout_seconds}s)"
+        )
         time.sleep(5)
-    raise TimeoutError(f"Harness {harness_id} did not reach READY within {timeout_seconds}s")
+    # Include last-known status in the timeout for easier diagnosis.
+    try:
+        last = agentcore_control_client.get_harness(harnessId=harness_id)["harness"]
+        last_status = last.get("status", "unknown")
+        reason = last.get("failureReason") or last.get("statusReason") or ""
+    except Exception:
+        last_status, reason = "unknown", ""
+    raise TimeoutError(
+        f"Harness {harness_id} did not reach READY within {timeout_seconds}s "
+        f"(last status={last_status}"
+        + (f", reason={reason}" if reason else "")
+        + ")"
+    )
 
 
 def get_harness_runtime_arn(harness_id: str) -> Optional[str]:
@@ -2422,7 +2487,7 @@ def get_harness_runtime_arn(harness_id: str) -> Optional[str]:
     return None
 
 
-def update_harness_safe(harness_id: str, *, timeout_seconds: int = 600, **kwargs) -> None:
+def update_harness_safe(harness_id: str, *, timeout_seconds: int = 900, **kwargs) -> None:
     """UpdateHarness only when READY; retry on ConflictException (still UPDATING)."""
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
