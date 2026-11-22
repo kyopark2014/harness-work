@@ -2000,7 +2000,7 @@ class EcsWebDeployer:
                 forceNewDeployment=True,
                 deploymentConfiguration={
                     "minimumHealthyPercent": 0,
-                    "maximumPercent": 100,
+                    "maximumPercent": 200,
                 },
                 networkConfiguration={
                     "awsvpcConfiguration": {
@@ -2019,7 +2019,7 @@ class EcsWebDeployer:
                 launchType="FARGATE",
                 deploymentConfiguration={
                     "minimumHealthyPercent": 0,
-                    "maximumPercent": 100,
+                    "maximumPercent": 200,
                 },
                 networkConfiguration={
                     "awsvpcConfiguration": {
