@@ -336,7 +336,10 @@ def list_tasks(user_id: str, limit: int = 100) -> list[dict[str, Any]]:
         ConsistentRead=True,
     )
     tasks = [_item_to_task(i) for i in items]
-    tasks.sort(key=lambda t: (t["pinned"], t["updated_at"] or ""), reverse=True)
+    tasks.sort(
+        key=lambda t: (t["pinned"], t["updated_at"] or "", t["created_at"] or ""),
+        reverse=True,
+    )
     return tasks[:limit]
 
 
@@ -392,32 +395,44 @@ def create_task(
 
 
 def _update_task_fields(
-    user_id: str, task_id: str, fields: dict[str, Any], *, now: str | None = None
+    user_id: str,
+    task_id: str,
+    fields: dict[str, Any],
+    *,
+    now: str | None = None,
+    touch_updated_at: bool = True,
 ) -> bool:
+    """Update task attributes. ``touch_updated_at=False`` keeps sidebar order stable
+    when applying shared settings (model / flags) that are not user activity."""
+    if not fields and not touch_updated_at:
+        return False
     names: dict[str, str] = {}
-    values: dict[str, Any] = {":updated_at": now or _now_iso()}
-    sets = ["updated_at = :updated_at"]
+    values: dict[str, Any] = {}
+    sets: list[str] = []
+    if touch_updated_at:
+        values[":updated_at"] = now or _now_iso()
+        sets.append("updated_at = :updated_at")
     for idx, (attr, value) in enumerate(fields.items()):
         names[f"#f{idx}"] = attr
         values[f":v{idx}"] = value
         sets.append(f"#f{idx} = :v{idx}")
-    kwargs: dict[str, Any] = {}
+    if not sets:
+        return False
+    kwargs: dict[str, Any] = {
+        "Key": {"user_id": user_id, "task_id": task_id},
+        "UpdateExpression": "SET " + ", ".join(sets),
+        "ExpressionAttributeValues": values,
+        "ConditionExpression": "attribute_exists(task_id)",
+    }
     if names:
         kwargs["ExpressionAttributeNames"] = names
     try:
-        _tasks().update_item(
-            Key={"user_id": user_id, "task_id": task_id},
-            UpdateExpression="SET " + ", ".join(sets),
-            ExpressionAttributeValues=values,
-            ConditionExpression="attribute_exists(task_id)",
-            **kwargs,
-        )
+        _tasks().update_item(**kwargs)
         return True
     except ClientError as exc:
         if _is_conditional_failure(exc):
             return False
         raise
-
 
 def update_all_tasks(
     user_id: str,
@@ -426,7 +441,11 @@ def update_all_tasks(
     guardrail_enabled: bool | None = None,
     memory_enabled: bool | None = None,
 ) -> int:
-    """Apply shared settings to every task for ``user_id``. Returns rows updated."""
+    """Apply shared settings to every task for ``user_id``. Returns rows updated.
+
+    Does **not** bump ``updated_at`` — model/flag sync is not conversation activity,
+    and stamping every row with the same timestamp collapses sidebar sort order.
+    """
     fields: dict[str, Any] = {}
     if model_name is not None:
         fields["model_name"] = str(model_name).strip() or DEFAULT_MODEL
@@ -437,7 +456,6 @@ def update_all_tasks(
     if not fields:
         return 0
 
-    now = _now_iso()
     updated = 0
     items = _query_all(
         _tasks(),
@@ -446,9 +464,57 @@ def update_all_tasks(
         ConsistentRead=True,
     )
     for item in items:
-        if _update_task_fields(user_id, item["task_id"], fields, now=now):
+        if _update_task_fields(
+            user_id, item["task_id"], fields, touch_updated_at=False
+        ):
             updated += 1
     return updated
+
+
+def repair_updated_at_from_messages(user_id: str) -> dict[str, int]:
+    """Restore ``updated_at`` from each task's latest message (else ``created_at``).
+
+    Recovers sidebar order after a bulk settings sync stamped every task with the
+    same ``updated_at``. Returns ``{checked, updated, unchanged}``.
+    """
+    checked = updated = unchanged = 0
+    items = _query_all(
+        _tasks(),
+        KeyConditionExpression=Key("user_id").eq(user_id),
+        ProjectionExpression="task_id, created_at, updated_at",
+        ConsistentRead=True,
+    )
+    for item in items:
+        checked += 1
+        task_id = item["task_id"]
+        created_at = str(item.get("created_at") or "")
+        current = str(item.get("updated_at") or "")
+        latest = _latest_message_item(task_id, user_id)
+        desired = str((latest or {}).get("created_at") or created_at or current)
+        if not desired or desired == current:
+            unchanged += 1
+            continue
+        try:
+            _tasks().update_item(
+                Key={"user_id": user_id, "task_id": task_id},
+                UpdateExpression="SET updated_at = :u",
+                ExpressionAttributeValues={":u": desired},
+                ConditionExpression="attribute_exists(task_id)",
+            )
+            updated += 1
+        except ClientError as exc:
+            if _is_conditional_failure(exc):
+                unchanged += 1
+                continue
+            raise
+    logger.info(
+        "repair_updated_at_from_messages user=%s checked=%s updated=%s unchanged=%s",
+        user_id,
+        checked,
+        updated,
+        unchanged,
+    )
+    return {"checked": checked, "updated": updated, "unchanged": unchanged}
 
 
 def update_all_task_flags(

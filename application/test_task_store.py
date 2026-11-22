@@ -88,5 +88,41 @@ class TaskStoreTests(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 2)
 
 
+    def test_update_all_tasks_preserves_updated_at(self):
+        older = self.ts.create_task(self.user, title="older")
+        newer = self.ts.create_task(self.user, title="newer")
+        self.ts.add_message(newer["id"], "user", "hello", user_id=self.user)
+        before_older = self.ts.get_task(older["id"], self.user)["updated_at"]
+        before_newer = self.ts.get_task(newer["id"], self.user)["updated_at"]
+
+        n = self.ts.update_all_tasks(self.user, model_name="Claude 5.5 Sonnet")
+        self.assertEqual(n, 2)
+
+        after_older = self.ts.get_task(older["id"], self.user)
+        after_newer = self.ts.get_task(newer["id"], self.user)
+        self.assertEqual(after_older["updated_at"], before_older)
+        self.assertEqual(after_newer["updated_at"], before_newer)
+        self.assertEqual(after_older["model_name"], "Claude 5.5 Sonnet")
+        self.assertEqual(after_newer["model_name"], "Claude 5.5 Sonnet")
+
+        ordered = self.ts.list_tasks(self.user)
+        self.assertEqual([t["id"] for t in ordered[:2]], [newer["id"], older["id"]])
+
+    def test_repair_updated_at_from_messages(self):
+        t = self.ts.create_task(self.user, title="repair-me")
+        self.ts.add_message(t["id"], "user", "activity", user_id=self.user)
+        # Simulate the bulk-settings bug: stamp an unrelated updated_at.
+        self.ts._tasks().update_item(
+            Key={"user_id": self.user, "task_id": t["id"]},
+            UpdateExpression="SET updated_at = :u",
+            ExpressionAttributeValues={":u": "2000-01-01T00:00:00+00:00"},
+        )
+        stats = self.ts.repair_updated_at_from_messages(self.user)
+        self.assertGreaterEqual(stats["updated"], 1)
+        got = self.ts.get_task(t["id"], self.user)
+        self.assertNotEqual(got["updated_at"], "2000-01-01T00:00:00+00:00")
+        self.assertTrue(got["updated_at"] >= got["created_at"])
+
+
 if __name__ == "__main__":
     unittest.main()
